@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyeztrace"
+version = "0.0.1"
+description = "A powerful, lightweight Python tracing and logging library"
+readme = "README.md"
+authors = [{ name = "Jefferson Nelsson", email = "jefferson.nelsson@gmail.com" }]
+license = { file = "LICENSE" }
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: OS Independent",
+]
+keywords = ["logging", "tracing", "monitoring", "debugging", "performance"]
+dependencies = [
+    "pydantic-core >= 2.33.2",
+    "pydantic-settings >= 2.9.1",
+]
+requires-python = ">=3.7"
+
+[tool.setuptools.packages.find]
+include = ["pyeztrace*"]
+exclude = ["tests*"]
