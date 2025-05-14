@@ -170,7 +170,7 @@ def trace(
 
     def make_child_decorator(orig_decorator):
         def selective_decorator(func):
-            if '__name__' in func.__dict__ and _should_trace(func.__name__):
+            if hasattr(func, "__name__") and _should_trace(func.__name__):
                 return orig_decorator(func)
             return func
         return selective_decorator

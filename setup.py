@@ -6,6 +6,6 @@ setup(
     description="Python tracing and logging library",
     author="Jefferson Nelsson",
     packages=find_packages(),
-    install_requires=["pydantic-core>=2.33.2", "pydantic-settings>=2.9.1"],
+    install_requires=[],
     python_requires=">=3.7",
 )
