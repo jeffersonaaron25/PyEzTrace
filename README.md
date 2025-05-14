@@ -59,7 +59,7 @@ Output example:
 2025-05-13T10:00:01 - INFO - [MyApp] ├── process_order Ok. (took 1.23456 seconds)
 ```
 
-## Features
+## Usage
 
 ### 1. Tracing with Fine-grained Control
 
