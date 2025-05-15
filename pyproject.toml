@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyeztrace"
-version = "0.0.1"
+version = "0.0.3"
 description = "A powerful, lightweight Python tracing and logging library"
 readme = "README.md"
 authors = [{ name = "Jefferson Nelsson", email = "jefferson.nelsson@gmail.com" }]

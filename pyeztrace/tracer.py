@@ -11,39 +11,23 @@ from typing import Any, Callable, Optional, Sequence, Union, Dict, List
 from pyeztrace.setup import Setup
 from pyeztrace.custom_logging import Logging
 
-if not Setup.is_setup_done():
-    Setup.initialize("EzTrace")
-    Setup.set_setup_done()
+def ensure_initialized():
+    """Ensure EzTrace is initialized with sensible defaults if not already done."""
+    if not Setup.is_setup_done():
+        project_name = sys.argv[0].split('/')[-1].replace('.py', '') if sys.argv else "EzTrace"
+        Setup.initialize(project_name)
+        Setup.set_setup_done()
+    return Logging()
 
+logging = ensure_initialized()
 
-logging = Logging()
-
-# --- Performance Metrics ---
-_metrics_lock = threading.Lock()
-_metrics: Dict[str, Dict[str, Any]] = {}
-
-def _record_metric(func_name: str, duration: float) -> None:
-    with _metrics_lock:
-        m = _metrics.setdefault(func_name, {"count": 0, "total": 0.0})
-        m["count"] += 1
-        m["total"] += duration
-
-def _log_metrics_summary() -> None:
-    if not _metrics:
-        Logging.log_warning("No performance metrics collected.")
-        return
-    Logging.log_info("\n=== Tracing Performance Metrics Summary ===")
-    Logging.log_info(f"{'Function':40} {'Calls':>8} {'Total(s)':>12} {'Avg(s)':>12}")
-    Logging.log_info("-" * 76)
-    for func, m in sorted(_metrics.items()):
-        count = m["count"]
-        total = m["total"]
-        avg = total / count if count else 0.0
-        Logging.log_info(f"{func:40} {count:8d} {total:12.5f} {avg:12.5f}")
-    Logging.log_info("=" * 76)
-
-if Setup.get_show_metrics():
-    atexit.register(_log_metrics_summary)
+def _safe_to_wrap(obj):
+    # Only wrap python-level functions / coroutines / builtins, skip everything else
+    return (
+        inspect.isfunction(obj)
+        or inspect.iscoroutinefunction(obj)
+        or (inspect.isbuiltin(obj) and getattr(obj, "__module__", "").startswith("builtins"))
+    )
 
 # ContextVar to indicate tracing is active
 tracing_active = contextvars.ContextVar("tracing_active", default=False)
@@ -92,7 +76,9 @@ class trace_children_in_module:
             else:
                 items = self.module_or_class.__dict__.items()
             for name, obj in items:
-                if callable(obj) and not name.startswith("__"):
+                if not _safe_to_wrap(obj):          # skip early
+                    continue
+                if callable(obj) and not (name.startswith("__") and not name in ["__call__", "__init__"]):
                     self.originals[name] = obj
                     setattr(self.module_or_class, name, self.child_decorator(obj))
         else:
@@ -122,28 +108,52 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
     Decorator for child functions: only logs if tracing_active is True.
     """
     import functools
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        if tracing_active.get():
-            Setup.increment_level()
-            logging.log_info(f"called...", type="child", function=f"{func.__module__}.{func.__name__}")
-            start = time.time()
-            try:
-                result = func(*args, **kwargs)
-                end = time.time()
-                duration = end - start
-                logging.log_info(f"Ok.", type="child", function=f"{func.__module__}.{func.__name__}", duration=duration)
-                _record_metric(f"{func.__module__}.{func.__name__}", duration)
-                return result
-            except Exception as e:
-                logging.log_error(f"Error: {str(e)}", type="child", function=f"{func.__module__}.{func.__name__}")
-                logging.raise_exception_to_log(e, str(e), stack=False)
-                raise
-            finally:
-                Setup.decrement_level()
-        else:
-            return func(*args, **kwargs)
-    return wrapper
+    if inspect.iscoroutinefunction(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            if tracing_active.get():
+                Setup.increment_level()
+                logging.log_info(f"called...", type="child", function=func.__qualname__)
+                start = time.time()
+                try:
+                    result = await func(*args, **kwargs)
+                    end = time.time()
+                    duration = end - start
+                    logging.log_info(f"Ok.", type="child", function=func.__qualname__, duration=duration)
+                    logging.record_metric(f"{func.__qualname__}", duration)
+                    return result
+                except Exception as e:
+                    logging.log_error(f"Error: {str(e)}", type="child", function=func.__qualname__)
+                    logging.raise_exception_to_log(e, str(e), stack=False)
+                    raise
+                finally:
+                    Setup.decrement_level()
+            else:
+                return func(*args, **kwargs)
+        return wrapper
+    else:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if tracing_active.get():
+                Setup.increment_level()
+                logging.log_info(f"called...", type="child", function=func.__qualname__)
+                start = time.time()
+                try:
+                    result = func(*args, **kwargs)
+                    end = time.time()
+                    duration = end - start
+                    logging.log_info(f"Ok.", type="child", function=func.__qualname__, duration=duration)
+                    logging.record_metric(f"{func.__qualname__}", duration)
+                    return result
+                except Exception as e:
+                    logging.log_error(f"Error: {str(e)}", type="child", function=func.__qualname__)
+                    logging.raise_exception_to_log(e, str(e), stack=False)
+                    raise
+                finally:
+                    Setup.decrement_level()
+            else:
+                return func(*args, **kwargs)
+        return wrapper
 
 def trace(
     message: Optional[str] = None,
@@ -170,7 +180,7 @@ def trace(
 
     def make_child_decorator(orig_decorator):
         def selective_decorator(func):
-            if hasattr(func, "__name__") and _should_trace(func.__name__):
+            if _safe_to_wrap(func) and hasattr(func, "__name__") and _should_trace(func.__name__):
                 return orig_decorator(func)
             return func
         return selective_decorator
@@ -195,7 +205,7 @@ def trace(
             async def async_wrapper(*args, **kwargs):
                 token = tracing_active.set(True)
                 Setup.increment_level()
-                logging.log_info(f"called...", type="parent", function=f"{func.__module__}.{func.__name__}")
+                logging.log_info(f"called...", type="parent", function=func.__qualname__)
                 start = time.time()
                 try:
                     targets = _get_targets()
@@ -212,11 +222,11 @@ def trace(
                         result = await func(*args, **kwargs)
                     end = time.time()
                     duration = end - start
-                    logging.log_info(f"Ok.", type="parent", function=func.__name__, duration=duration)
-                    _record_metric(f"{func.__module__}.{func.__name__}", duration)
+                    logging.log_info(f"Ok.", type="parent", function=func.__qualname__, duration=duration)
+                    logging.record_metric(f"{func.__qualname__}", duration)
                     return result
                 except Exception as e:
-                    logging.log_error(f"Error: {str(e)}", type="parent", function=func.__name__)
+                    logging.log_error(f"Error: {str(e)}", type="parent", function=func.__qualname__)
                     error_message = f"{message} -> {str(e)}" if message else str(e)
                     logging.raise_exception_to_log(e, error_message, stack)
                     raise
@@ -246,11 +256,11 @@ def trace(
                         result = func(*args, **kwargs)
                     end = time.time()
                     duration = end - start
-                    logging.log_info(f"Ok.", type="parent", function=f"{func.__module__}.{func.__name__}", duration=duration)
-                    _record_metric(f"{func.__module__}.{func.__name__}", duration)
+                    logging.log_info(f"Ok.", type="parent", function=f"{func.__qualname__}", duration=duration)
+                    logging.record_metric(f"{func.__qualname__}", duration)
                     return result
                 except Exception as e:
-                    logging.log_error(f"Error: {str(e)}", type="parent", function=f"{func.__module__}.{func.__name__}")
+                    logging.log_error(f"Error: {str(e)}", type="parent", function=f"{func.__qualname__}")
                     error_message = f"{message} -> {str(e)}" if message else str(e)
                     logging.raise_exception_to_log(e, error_message, stack)
                     raise

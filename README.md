@@ -24,9 +24,6 @@ pip install pyeztrace
 ## Quick Start
 
 ```python
-from pyeztrace.setup import Setup
-Setup.initialize("MyApp") # Setup First! Make sure you initialize (optional) with your App Name before importing other modules. Default: EZTRACE
-
 from pyeztrace.tracer import trace
 from pyeztrace.custom_logging import Logging
 
@@ -61,7 +58,19 @@ Output example:
 
 ## Usage
 
-### 1. Tracing with Fine-grained Control
+### 1. Setup and Configuration
+
+```python
+# Auto-initialization
+from pyeztrace.tracer import trace  # Automatically initializes with script name
+
+# Optional: customize settings
+from pyeztrace.setup import Setup
+Setup.set_project("MyApp")          # Change project name
+Setup.set_show_metrics(True)        # Enable performance metrics
+```
+
+### 2. Tracing with Fine-grained Control
 
 ```python
 @trace(
@@ -83,7 +92,7 @@ def function():
     pass
 ```
 
-### 2. Context Management
+### 3. Context Management
 
 Thread-safe context propagation for structured logging:
 
@@ -96,7 +105,7 @@ with log.with_context(user_id="123", action="login"):
         log.log_info("Session started")  # Includes both user_id and session
 ```
 
-### 3. Multiple Output Formats
+### 4. Multiple Output Formats
 
 ```python
 # Color-coded console output with hierarchical visualization
@@ -117,7 +126,7 @@ log = Logging(log_format="logfmt")
 # Output: time=2025-05-13T10:00:00 level=INFO message="Log message" data.context=value
 ```
 
-### 4. Async Support
+### 5. Async Support
 
 ```python
 @trace()
@@ -126,12 +135,16 @@ async def async_function():
     log.log_info("Async operation completed")
 ```
 
-### 5. Performance Metrics
+### 6. Performance Metrics
 
-Automatic performance tracking is enabled with `show_metrics=True`:
+Enable automatic performance tracking:
 
 ```python
+# Either during initialization
 Setup.initialize("MyApp", show_metrics=True)
+
+# Or anytime using
+Setup.set_show_metrics(True)
 
 @trace()
 def monitored_function():
@@ -145,7 +158,7 @@ def monitored_function():
 # my_module.monitored_function                   10      1.23456      0.12346
 ```
 
-### 6. Log Rotation
+### 7. Log Rotation
 
 Configure automatic log rotation based on file size:
 
@@ -158,7 +171,7 @@ config.log_dir = "logs"  # Custom log directory
 config.log_file = "app.log"  # Custom log filename
 ```
 
-### 7. Error Handling and Debug Support
+### 8. Error Handling and Debug Support
 
 ```python
 # Different log levels
@@ -174,7 +187,7 @@ except Exception as e:
     log.raise_exception_to_log(e, "Custom error message", stack=True)
 ```
 
-### 8. Thread-Safe High-Volume Logging
+### 9. Thread-Safe High-Volume Logging
 
 The logging system is designed for high-volume scenarios with thread-safe implementation:
 

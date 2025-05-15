@@ -80,7 +80,9 @@ class Logging:
 
     _configured = False
     _format = os.environ.get("EZTRACE_LOG_FORMAT", "color")  # color, plain, json, csv, logfmt
-
+    _metrics_lock = threading.Lock()
+    _metrics: Dict[str, Dict[str, Any]] = {}
+    
     COLOR_CODES = {
         'DEBUG': '\033[36m',  # Cyan
         'INFO': '\033[32m',   # Green
@@ -172,7 +174,7 @@ class Logging:
         elif level_indent == 1:
             tree = "├──"
         else:
-            tree = "├──" + "────"  * (level_indent - 1)
+            tree = "│    " * (level_indent - 1) + "├───"  
         color = Logging.COLOR_CODES.get(level_str, '')
         reset = Logging.COLOR_CODES['RESET']
         if log_format == "color":
@@ -306,3 +308,25 @@ class Logging:
             logging.error(traceback.format_exc())
         else:
             raise Exception("Setup is not done. Cannot show full traceback.")
+
+    @staticmethod
+    def record_metric(func_name: str, duration: float) -> None:
+        with Logging._metrics_lock:
+            m = Logging._metrics.setdefault(func_name, {"count": 0, "total": 0.0})
+            m["count"] += 1
+            m["total"] += duration
+
+    @staticmethod
+    def log_metrics_summary() -> None:
+        if not Logging._metrics:
+            Logging.log_warning("No performance metrics collected.")
+            return
+        Logging.log_info("\n=== Tracing Performance Metrics Summary ===")
+        Logging.log_info(f"{'Function':40} {'Calls':>8} {'Total(s)':>12} {'Avg(s)':>12}")
+        Logging.log_info("-" * 76)
+        for func, m in sorted(Logging._metrics.items()):
+            count = m["count"]
+            total = m["total"]
+            avg = total / count if count else 0.0
+            Logging.log_info(f"{func:40} {count:8d} {total:12.5f} {avg:12.5f}")
+        Logging.log_info("=" * 76)
