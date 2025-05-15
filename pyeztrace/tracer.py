@@ -5,7 +5,6 @@ import types
 import inspect
 import sys
 import threading
-import atexit
 import fnmatch
 from typing import Any, Callable, Optional, Sequence, Union, Dict, List
 from pyeztrace.setup import Setup

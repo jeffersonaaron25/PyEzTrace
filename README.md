@@ -2,8 +2,6 @@
 
 A powerful, lightweight Python tracing and logging library with hierarchical logging, context management, and performance metrics.
 
-**Note:** This was a fun, 3 hour experiment for one of my local projects. I'm happy to continue building this out if the community finds it useful and thinks it's a good idea!
-
 ## Features
 
 - 🌳 **Hierarchical Logging**: Visualize nested operations with tree-style output
