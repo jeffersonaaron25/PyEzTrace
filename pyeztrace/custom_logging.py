@@ -91,7 +91,7 @@ class Logging:
         'RESET': '\033[0m',
     }
 
-    def __init__(self, log_format: Optional[Union[str, Callable[..., str]]] = None) -> None:
+    def __init__(self, log_format: Optional[Union[str, Callable[..., str]]] = config.format) -> None:
         """
         Initialize the Logging class and set up the logger (only once).
         log_format: 'color', 'plain', 'json', 'csv', 'logfmt', or a callable
@@ -101,29 +101,30 @@ class Logging:
         if log_format:
             Logging._format = log_format
         if not Logging._configured:
-            root_logger = logging.getLogger()
-            root_logger.setLevel(getattr(logging, config.log_level))
+            logger = logging.getLogger("pyeztrace")
+            logger.setLevel(getattr(logging, config.log_level))
+            logger.propagate = False  # Prevent logs from propagating to root logger
             formatter = logging.Formatter('%(message)s')
 
-            # Remove all handlers associated with the root logger object (avoid duplicate logs)
-            for handler in root_logger.handlers[:]:
-                root_logger.removeHandler(handler)
+            # Remove all handlers associated with the named logger (avoid duplicate logs)
+            for handler in logger.handlers[:]:
+                logger.removeHandler(handler)
 
             # Set up console handler
-            stream_handler = logging.StreamHandler(sys.stdout)
+            stream_handler = logging.StreamHandler(sys.__stdout__)
             stream_handler.setFormatter(formatter)
-            root_logger.addHandler(stream_handler)
+            logger.addHandler(stream_handler)
 
             # Set up rotating file handler
             log_path = config.get_log_path()
             os.makedirs(log_path.parent, exist_ok=True)
-            
+
             # Close and remove any existing handlers for this file
-            for handler in root_logger.handlers:
+            for handler in logger.handlers[:]:
                 if isinstance(handler, logging.FileHandler) and handler.baseFilename == str(log_path):
                     handler.close()
-                    root_logger.removeHandler(handler)
-            
+                    logger.removeHandler(handler)
+
             file_handler = RotatingFileHandler(
                 filename=str(log_path),
                 maxBytes=config.max_size,
@@ -131,8 +132,8 @@ class Logging:
                 encoding='utf-8'
             )
             file_handler.setFormatter(formatter)
-            root_logger.addHandler(file_handler)
-            
+            logger.addHandler(file_handler)
+
             Logging._configured = True
 
     @staticmethod
@@ -240,7 +241,8 @@ class Logging:
     ) -> None:
         if Setup.is_setup_done():
             msg = Logging._format_message("INFO", message, type, function, duration, **kwargs)
-            logging.info(msg)
+            logger = logging.getLogger("pyeztrace")
+            logger.info(msg)
         else:
             raise Exception("Setup is not done. Cannot log info.")
         
@@ -254,7 +256,8 @@ class Logging:
     ) -> None:
         if Setup.is_setup_done():
             msg = Logging._format_message("ERROR", message, type, function, duration, **kwargs)
-            logging.error(msg)
+            logger = logging.getLogger("pyeztrace")
+            logger.error(msg)
         else:
             raise Exception("Setup is not done. Cannot log error.")
         
@@ -268,7 +271,8 @@ class Logging:
     ) -> None:
         if Setup.is_setup_done():
             msg = Logging._format_message("WARNING", message, type, function, duration, **kwargs)
-            logging.warning(msg)
+            logger = logging.getLogger("pyeztrace")
+            logger.warning(msg)
         else:
             raise Exception("Setup is not done. Cannot log warning.")
         
@@ -282,7 +286,8 @@ class Logging:
     ) -> None:
         if Setup.is_setup_done():
             msg = Logging._format_message("DEBUG", message, type, function, duration, **kwargs)
-            logging.debug(msg)
+            logger = logging.getLogger("pyeztrace")
+            logger.debug(msg)
         else:
             raise Exception("Setup is not done. Cannot log debug.")
         
@@ -296,7 +301,8 @@ class Logging:
             msg = message if message else str(exception)
             Logging.log_error(msg)
             if stack:
-                logging.error(traceback.format_exc())
+                logger = logging.getLogger("pyeztrace")
+                logger.error(traceback.format_exc())
             raise exception
         else:
             raise Exception("Setup is not done. Cannot raise exception.")
@@ -305,7 +311,8 @@ class Logging:
     def show_full_traceback() -> None:
         if Setup.is_setup_done():
             Logging.log_error("Full traceback:")
-            logging.error(traceback.format_exc())
+            logger = logging.getLogger("pyeztrace")
+            logger.error(traceback.format_exc())
         else:
             raise Exception("Setup is not done. Cannot show full traceback.")
 

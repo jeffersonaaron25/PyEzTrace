@@ -47,9 +47,9 @@ Output example:
 ```
 2025-05-13T10:00:00 - INFO - [MyApp] ├── process_order called...
 2025-05-13T10:00:00 - INFO - [MyApp] ├── Processing order Data: {order_id: "123"}
-2025-05-13T10:00:00 - INFO - [MyApp] ├────── validate_order called... 
-2025-05-13T10:00:00 - INFO - [MyApp] ├────── Validating order
-2025-05-13T10:00:00 - INFO - [MyApp] ├────── validate_order Ok. (took 0.50010 seconds)
+2025-05-13T10:00:00 - INFO - [MyApp] │    ├─── validate_order called... 
+2025-05-13T10:00:00 - INFO - [MyApp] │    ├─── Validating order
+2025-05-13T10:00:00 - INFO - [MyApp] │    ├─── validate_order Ok. (took 0.50010 seconds)
 2025-05-13T10:00:01 - INFO - [MyApp] ├── Order processed successfully
 2025-05-13T10:00:01 - INFO - [MyApp] ├── process_order Ok. (took 1.23456 seconds)
 ```
@@ -167,6 +167,7 @@ config.max_size = 10 * 1024 * 1024  # 10MB
 config.backup_count = 5  # Keep 5 backup files
 config.log_dir = "logs"  # Custom log directory
 config.log_file = "app.log"  # Custom log filename
+# must be setup before importing trace
 ```
 
 ### 8. Error Handling and Debug Support
@@ -215,7 +216,8 @@ export EZTRACE_LOG_FILE="custom.log"
 export EZTRACE_MAX_SIZE="10485760"  # 10MB
 export EZTRACE_BACKUP_COUNT="5"
 
-# Via code
+# Via code - must be setup before importing trace
+
 from pyeztrace.config import config
 config.format = "json"
 config.log_level = "DEBUG"
