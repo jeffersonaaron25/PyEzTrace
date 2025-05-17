@@ -1,6 +1,6 @@
 # PyEzTrace
 
-A powerful, lightweight Python tracing and logging library with hierarchical logging, context management, and performance metrics.
+A dependency-free, lightweight Python tracing and logging library with hierarchical logging, context management, and performance metrics.
 
 ## Features
 
@@ -76,19 +76,41 @@ Setup.set_show_metrics(True)        # Enable performance metrics
     stack=True,  # Include stack trace on errors
     modules_or_classes=[my_module],  # Trace specific modules
     include=["specific_function_*"],  # Include only specific functions
-    exclude=["ignored_function_*"]  # Exclude specific functions
+    exclude=["ignored_function_*"],  # Exclude specific functions
+    recursive_depth=2,  # How many levels of imports to trace (0 = only direct module)
+    module_pattern="myapp.*"  # Pattern to match module names for recursive tracing
 )
-"""
-Decorator for parent function. Enables tracing for all child functions in the given modules or classes.
-If modules_or_classes is None, it will automatically patch the module where the parent function is defined.
-Accepts a single module/class or a list of modules/classes for cross-module tracing.
-Handles both sync and async parent functions.
-Supports selective tracing via include/exclude patterns (function names).
-"""
 def function():
     # Your code here
     pass
 ```
+
+#### Recursive Tracing
+
+PyEzTrace supports recursive tracing of imported modules:
+
+```python
+# Basic function tracing (only traces the function itself)
+@trace()
+def basic_function():
+    pass
+
+# Trace function plus all functions in directly imported modules (depth=1)
+@trace(recursive_depth=1, module_pattern="myapp.*")
+def app_function():
+    # This will trace any imported modules that match "myapp.*"
+    pass
+
+# Deep recursive tracing (caution: can be performance-intensive)
+@trace(recursive_depth=3, module_pattern="myapp.services.*")
+def service_function():
+    # This will trace the function, direct imports, imports of imports, 
+    # and imports of imports of imports that match the pattern
+    pass
+```
+
+Using `module_pattern` is strongly recommended when enabling recursive tracing to prevent tracing system libraries or third-party packages. Be sure to limit recursive tracing to avoid unexpected issues
+and unnecessary traces.
 
 ### 3. Context Management
 
@@ -203,6 +225,64 @@ def concurrent_operation(worker_id):
 with ThreadPoolExecutor(max_workers=5) as executor:
     executor.map(concurrent_operation, range(5))
 ```
+
+## Advanced Usage
+
+### 1. Applying to Classes
+
+You can apply the `@trace` decorator directly to a class, which will automatically trace all methods:
+
+```python
+from pyeztrace import trace
+
+@trace()
+class MyService:
+    def __init__(self, name):
+        self.name = name
+    
+    def process(self, data):
+        # This method will be traced
+        return data.upper()
+    
+    def analyze(self, data):
+        # This method will also be traced
+        return len(data)
+```
+
+When applied to a class, all methods (including `__init__`) will be traced with full tracing capabilities.
+
+### 2. Recursive Tracing
+
+For comprehensive application-wide tracing, you can use recursive tracing to automatically trace functions in imported modules:
+
+```python
+from pyeztrace import trace
+
+@trace(
+    recursive_depth=2,  # Trace this module and modules it imports (up to 2 levels deep)
+    module_pattern="myapp.*"  # Only trace modules matching this pattern
+)
+def main():
+    # All functions called directly or indirectly will be traced
+    # as long as they're in modules matching the pattern
+    result = process_data()
+    return result
+```
+
+#### Parameters
+
+- `recursive_depth`: How many levels of imports to trace (0 = only direct module)
+- `module_pattern`: Pattern to match module names for recursive tracing (e.g., "myapp.*")
+
+### 3. Double-Tracing Prevention
+
+PyEzTrace intelligently prevents double-tracing when functions are traced via multiple mechanisms:
+
+1. Functions directly decorated with `@trace` will not be traced again if they're called from another traced function
+2. When a class is decorated with `@trace` and also traced via recursive tracing from another function
+3. When the same function is traced via recursive tracing from multiple parent functions
+
+This ensures clean logs without duplicate entries while maintaining comprehensive tracing coverage.
 
 ## Configuration
 

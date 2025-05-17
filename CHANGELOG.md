@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.0.7
+- Fixed issue with class method tracing.
+- Added recursive tracing.
+- Added double tracing prevention.
 
 ## v0.0.6
 - Edge case fixes

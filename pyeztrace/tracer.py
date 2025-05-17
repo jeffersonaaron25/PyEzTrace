@@ -5,9 +5,15 @@ import inspect
 import sys
 import threading
 import fnmatch
-from typing import Any, Callable, Optional, Sequence, Union, Dict, List
+from typing import Any, Callable, Optional, Sequence, Union, Dict, List, Set
 from pyeztrace.setup import Setup
 from pyeztrace.custom_logging import Logging
+
+# Marker attribute for wrapped functions
+_TRACED_ATTRIBUTE = '_pyeztrace_wrapped'
+
+# ContextVar to track functions currently being traced in the execution path
+_currently_tracing = contextvars.ContextVar('_pyeztrace_currently_tracing', default=set())
 
 def ensure_initialized():
     """Ensure EzTrace is initialized with sensible defaults if not already done."""
@@ -50,11 +56,26 @@ def ensure_initialized():
 logging = ensure_initialized()
 
 def _safe_to_wrap(obj):
-    # Only wrap python-level functions / coroutines / builtins, skip everything else
+    """
+    Check if an object is safe to wrap with our tracer.
+    Returns False if:
+    1. It's not a callable function/method
+    2. It's already wrapped by our tracer
+    """
+    # Check if already wrapped
+    if hasattr(obj, _TRACED_ATTRIBUTE):
+        return False
+    
+    # Early return for None value
+    if obj is None:
+        return False
+        
+    # Only wrap python-level functions / coroutines / builtins / methods, skip everything else
     return (
         inspect.isfunction(obj)
         or inspect.iscoroutinefunction(obj)
-        or (inspect.isbuiltin(obj) and getattr(obj, "__module__", "").startswith("builtins"))
+        or inspect.ismethod(obj)  # Added support for methods
+        or (inspect.isbuiltin(obj) and getattr(obj, "__module__", "") and getattr(obj, "__module__", "").startswith("builtins"))
     )
 
 # ContextVar to indicate tracing is active
@@ -99,16 +120,37 @@ class trace_children_in_module:
         if key not in ref_counter:
             # First entry for this context: patch
             ref_counter[key] = 1
+            
+            # Different handling for modules vs classes
             if isinstance(self.module_or_class, types.ModuleType):
+                # For modules, use __dict__ directly
                 items = self.module_or_class.__dict__.items()
             else:
-                items = self.module_or_class.__dict__.items()
+                # For classes, we need to get all attributes including methods
+                items = []
+                # Add regular attributes
+                for name, obj in self.module_or_class.__dict__.items():
+                    items.append((name, obj))
+                
+                # Get all special methods we want to trace
+                special_methods = ["__call__", "__init__", "__str__", "__repr__", 
+                                  "__eq__", "__lt__", "__gt__", "__le__", "__ge__"]
+                
+                # Add any missing special methods
+                for name in special_methods:
+                    if hasattr(self.module_or_class, name) and name not in self.module_or_class.__dict__:
+                        items.append((name, getattr(self.module_or_class, name)))
+            
+            # Now patch all applicable items
             for name, obj in items:
-                if not _safe_to_wrap(obj):          # skip early
+                if not _safe_to_wrap(obj):
                     continue
-                if callable(obj) and not (name.startswith("__") and not name in ["__call__", "__init__"]):
-                    self.originals[name] = obj
-                    setattr(self.module_or_class, name, self.child_decorator(obj))
+                
+                if callable(obj):
+                    # For regular methods, just patch
+                    if not name.startswith("__") or name in ["__call__", "__init__", "__str__", "__eq__", "__lt__", "__gt__"]:
+                        self.originals[name] = obj
+                        setattr(self.module_or_class, name, self.child_decorator(obj))
         else:
             # Nested/concurrent: just increment
             ref_counter[key] += 1
@@ -148,6 +190,23 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             if not tracing_active.get():
                 return await func(*args, **kwargs)
                 
+            # Get the function ID
+            func_id = id(func)
+            
+            # Get the current set of functions being traced in this execution path
+            currently_tracing = _currently_tracing.get()
+            
+            # Check if already tracing this function in this execution path
+            if func_id in currently_tracing:
+                # Already being traced - avoid double tracing
+                return await func(*args, **kwargs)
+                
+            # Add to currently tracing set
+            new_tracing = currently_tracing.copy()
+            new_tracing.add(func_id)
+            token = _currently_tracing.set(new_tracing)
+            
+            # Normal tracing logic
             Setup.increment_level()
             logging.log_info(f"called...", fn_type="child", function=func.__qualname__)
             start = time.time()
@@ -164,6 +223,10 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
                 raise
             finally:
                 Setup.decrement_level()
+                _currently_tracing.reset(token)
+        
+        # Mark as wrapped
+        setattr(wrapper, _TRACED_ATTRIBUTE, True)
         return wrapper
     else:
         @functools.wraps(func)
@@ -171,6 +234,23 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             if not tracing_active.get():
                 return func(*args, **kwargs)
                 
+            # Get the function ID
+            func_id = id(func)
+            
+            # Get the current set of functions being traced in this execution path
+            currently_tracing = _currently_tracing.get()
+            
+            # Check if already tracing this function in this execution path
+            if func_id in currently_tracing:
+                # Already being traced - avoid double tracing
+                return func(*args, **kwargs)
+                
+            # Add to currently tracing set
+            new_tracing = currently_tracing.copy()
+            new_tracing.add(func_id)
+            token = _currently_tracing.set(new_tracing)
+            
+            # Normal tracing logic
             Setup.increment_level()
             logging.log_info(f"called...", fn_type="child", function=func.__qualname__)
             start = time.time()
@@ -187,6 +267,10 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
                 raise
             finally:
                 Setup.decrement_level()
+                _currently_tracing.reset(token)
+        
+        # Mark as wrapped
+        setattr(wrapper, _TRACED_ATTRIBUTE, True)
         return wrapper
 
 def trace(
@@ -194,14 +278,26 @@ def trace(
     stack: bool = False,
     modules_or_classes: Optional[Union[Any, Sequence[Any]]] = None,
     include: Optional[Sequence[str]] = None,
-    exclude: Optional[Sequence[str]] = None
+    exclude: Optional[Sequence[str]] = None,
+    recursive_depth: int = 0,  # 0 = only direct module, 1+ = levels of imports to trace
+    module_pattern: Optional[str] = None  # e.g., "myapp.*" to limit recursion scope
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """
     Decorator for parent function. Enables tracing for all child functions in the given modules or classes.
+    
     If modules_or_classes is None, it will automatically patch the module where the parent function is defined.
     Accepts a single module/class or a list of modules/classes for cross-module tracing.
     Handles both sync and async parent functions.
     Supports selective tracing via include/exclude patterns (function names).
+    
+    Parameters:
+        message: Optional message to include in error logs
+        stack: Whether to show stack trace for errors
+        modules_or_classes: Modules or classes to trace
+        include: Function names to include (glob patterns)
+        exclude: Function names to exclude (glob patterns)
+        recursive_depth: How many levels of imports to trace (0 = only direct module)
+        module_pattern: Pattern to match module names for recursive tracing (e.g., "myapp.*")
     """
     def _should_trace(func_name: str) -> bool:
         if include:
@@ -218,20 +314,133 @@ def trace(
                 return orig_decorator(func)
             return func
         return selective_decorator
+        
+    def _get_recursive_modules(module, depth, pattern=None, visited=None):
+        """Recursively collect modules based on depth and pattern."""
+        if visited is None:
+            visited = set()
+            
+        if depth <= 0 or id(module) in visited:
+            return []
+            
+        # Track visited modules to prevent circular references
+        visited.add(id(module))
+            
+        imported_modules = []
+        try:
+            # Look for imported modules
+            for name, obj in module.__dict__.items():
+                # Only process modules
+                if not isinstance(obj, types.ModuleType):
+                    continue
+                    
+                # Skip standard library and critical system modules
+                if obj.__name__.startswith(('_', 'builtins', 'sys', 'os', 'logging', 'asyncio', 'threading')):
+                    continue
+                    
+                # Skip the tracer module itself to prevent circular tracing
+                if obj.__name__ == 'pyeztrace.tracer':
+                    continue
+                    
+                # Apply pattern filter if provided
+                if pattern and not fnmatch.fnmatch(obj.__name__, pattern):
+                    continue
+                    
+                # Skip if already visited
+                if id(obj) in visited:
+                    continue
+                    
+                imported_modules.append(obj)
+                
+                # Recurse with reduced depth
+                if depth > 1:
+                    sub_modules = _get_recursive_modules(obj, depth-1, pattern, visited)
+                    imported_modules.extend(sub_modules)
+        except (AttributeError, ImportError) as e:
+            # Skip modules we can't process
+            logging.log_debug(f"Error processing module {getattr(module, '__name__', 'unknown')}: {str(e)}")
+            
+        return imported_modules
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         def _get_targets() -> List[Any]:
-            # Accepts a single module/class or a list/tuple
+            """Get modules to trace based on parameters and recursive settings."""
+            # Start with directly specified modules
             targets = []
+            base_modules = []
+            
+            # Handle directly specified modules
             if modules_or_classes is None:
+                # Default to the module containing the decorated function
                 mod = sys.modules.get(func.__module__)
                 if mod is not None:
-                    targets.append(mod)
+                    base_modules.append(mod)
             elif isinstance(modules_or_classes, (list, tuple, set)):
-                targets.extend(modules_or_classes)
+                base_modules.extend(modules_or_classes)
             else:
-                targets.append(modules_or_classes)
+                base_modules.append(modules_or_classes)
+                
+            # Always include directly specified modules
+            targets.extend(base_modules)
+            
+            # If recursive_depth > 0, add imports from the base modules
+            if recursive_depth > 0:
+                visited = set()  # Track modules we've seen to avoid duplicates
+                for base_module in base_modules:
+                    if isinstance(base_module, types.ModuleType):
+                        recursive_mods = _get_recursive_modules(
+                            base_module, 
+                            recursive_depth, 
+                            module_pattern,
+                            visited
+                        )
+                        # Add unique modules
+                        for mod in recursive_mods:
+                            if id(mod) not in [id(t) for t in targets]:
+                                targets.append(mod)
+                
+                # Log the modules being traced if in debug mode
+                if hasattr(logging, 'log_debug'):
+                    mod_names = [getattr(m, '__name__', str(m)) for m in targets]
+                    logging.log_debug(
+                        f"Recursive tracing activated with depth={recursive_depth}. "
+                        f"Tracing {len(targets)} modules: {', '.join(mod_names[:5])}" + 
+                        (f"... and {len(mod_names)-5} more" if len(mod_names) > 5 else "")
+                    )
+                    
             return targets
+
+        # Special case: decorator applied to a class
+        if inspect.isclass(func):
+            # For classes, we need to wrap all methods
+            class_name = func.__name__
+            
+            # Copy the class dictionary to avoid modifying during iteration
+            attrs = dict(func.__dict__)
+            
+            # Wrap each method with trace
+            for name, attr in attrs.items():
+                if callable(attr) and not hasattr(attr, _TRACED_ATTRIBUTE):
+                    # Skip special methods that shouldn't be traced
+                    if name.startswith('__') and name not in ['__init__', '__call__']:
+                        continue
+                    
+                    # When a method is called, we need to make sure the method name includes the class name
+                    method_trace = trace(
+                        message=message,
+                        stack=stack,
+                        include=include,
+                        exclude=exclude
+                    )
+                    
+                    # Apply trace to the method and update it in the class
+                    wrapped_method = method_trace(attr)
+                    setattr(func, name, wrapped_method)
+            
+            # Mark the class as traced
+            setattr(func, _TRACED_ATTRIBUTE, True)
+            
+            return func
 
         import functools
         if inspect.iscoroutinefunction(func):
@@ -242,6 +451,18 @@ def trace(
                     ensure_initialized()
                     token = tracing_active.set(True)
                     Setup.increment_level()
+                    
+                    # Get the function ID
+                    func_id = id(func)
+                    
+                    # Get the current set of functions being traced
+                    currently_tracing = _currently_tracing.get()
+                    
+                    # Add to currently tracing set
+                    new_tracing = currently_tracing.copy()
+                    new_tracing.add(func_id)
+                    tracing_token = _currently_tracing.set(new_tracing)
+                    
                     logging.log_info(f"called...", fn_type="parent", function=func.__qualname__)
                     start = time.time()
                     
@@ -280,8 +501,13 @@ def trace(
                     try:
                         Setup.decrement_level()
                         tracing_active.reset(token)
+                        if 'tracing_token' in locals():
+                            _currently_tracing.reset(tracing_token)
                     except Exception:
                         pass  # Last-resort exception handling
+            
+            # Mark as wrapped            
+            setattr(async_wrapper, _TRACED_ATTRIBUTE, True)
             return async_wrapper
         else:
             @functools.wraps(func)
@@ -291,7 +517,19 @@ def trace(
                     ensure_initialized()
                     token = tracing_active.set(True)
                     Setup.increment_level()
-                    logging.log_info(f"called...", fn_type="parent", function=func.__name__)
+                    
+                    # Get the function ID
+                    func_id = id(func)
+                    
+                    # Get the current set of functions being traced
+                    currently_tracing = _currently_tracing.get()
+                    
+                    # Add to currently tracing set
+                    new_tracing = currently_tracing.copy()
+                    new_tracing.add(func_id)
+                    tracing_token = _currently_tracing.set(new_tracing)
+                    
+                    logging.log_info(f"called...", fn_type="parent", function=func.__qualname__)
                     start = time.time()
                     
                     targets = _get_targets()
@@ -329,7 +567,12 @@ def trace(
                     try:
                         Setup.decrement_level()
                         tracing_active.reset(token)
+                        if 'tracing_token' in locals():
+                            _currently_tracing.reset(tracing_token)
                     except Exception:
                         pass  # Last-resort exception handling
+            
+            # Mark as wrapped
+            setattr(wrapper, _TRACED_ATTRIBUTE, True)
             return wrapper
     return decorator
