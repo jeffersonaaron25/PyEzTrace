@@ -13,7 +13,6 @@ from pyeztrace.setup import Setup
 from pyeztrace.config import config
 
 from typing import Any, Callable, Optional, Union, Dict
-from contextlib import contextmanager
 
 class LogContext:
     """Thread-safe context management for logging."""
@@ -82,6 +81,7 @@ class Logging:
     _format = os.environ.get("EZTRACE_LOG_FORMAT", "color")  # color, plain, json, csv, logfmt
     _metrics_lock = threading.Lock()
     _metrics: Dict[str, Dict[str, Any]] = {}
+    _buffer_enabled = True  # Enable buffering by default
     
     COLOR_CODES = {
         'DEBUG': '\033[36m',  # Cyan
@@ -113,8 +113,7 @@ class Logging:
             # Set up console handler
             stream_handler = logging.StreamHandler(sys.__stdout__)
             stream_handler.setFormatter(formatter)
-            logger.addHandler(stream_handler)
-
+            
             # Set up rotating file handler
             log_path = config.get_log_path()
             os.makedirs(log_path.parent, exist_ok=True)
@@ -132,7 +131,16 @@ class Logging:
                 encoding='utf-8'
             )
             file_handler.setFormatter(formatter)
-            logger.addHandler(file_handler)
+            
+            # Use buffered handlers for better performance
+            if Logging._buffer_enabled:
+                buffered_stream = BufferedHandler(stream_handler)
+                buffered_file = BufferedHandler(file_handler)
+                logger.addHandler(buffered_stream)
+                logger.addHandler(buffered_file)
+            else:
+                logger.addHandler(stream_handler)
+                logger.addHandler(file_handler)
 
             Logging._configured = True
 
@@ -150,7 +158,7 @@ class Logging:
     def _format_message(
         level: str,
         message: str,
-        type: Optional[str] = None,
+        fn_type: Optional[str] = None,
         function: Optional[str] = None,
         duration: Optional[float] = None,
         **kwargs: Any
@@ -161,7 +169,7 @@ class Logging:
         
         project = Setup.get_project() if Setup.is_setup_done() else "?"
         level_str = level.upper()
-        log_type = type or ""
+        log_type = fn_type or ""
         func = function or context.get('function', '')
         log_format = Logging._format
         data = f" Data: {merged_kwargs}" if merged_kwargs else ""
@@ -198,7 +206,7 @@ class Logging:
                 "timestamp": timestamp,
                 "level": level_str,
                 "project": project,
-                "type": log_type,
+                "fn_type": log_type,
                 "function": func,
                 "message": message,
                 "data": merged_kwargs,
@@ -217,13 +225,13 @@ class Logging:
             return output.getvalue().strip()
         # logfmt
         elif log_format == "logfmt":
-            msg = f"time={timestamp} level={level_str} project={project} type={log_type} function={func} message=\"{message}\" data={kwargs}"
+            msg = f"time={timestamp} level={level_str} project={project} fn_type={log_type} function={func} message=\"{message}\" data={kwargs}"
             if duration is not None:
                 msg += f" duration={duration:.5f}"
             return msg
         # Custom callable
         elif callable(log_format):
-            return log_format(level, message, type, function, duration, **kwargs)
+            return log_format(level, message, fn_type, function, duration, **kwargs)
         # Fallback
         else:
             msg = f"{timestamp} - {level_str} - [{project}]|{log_type} {func} {message} {data}"
@@ -234,13 +242,30 @@ class Logging:
     @staticmethod
     def log_info(
         message: str,
-        type: Optional[str] = None,
+        fn_type: Optional[str] = None,
         function: Optional[str] = None,
         duration: Optional[float] = None,
         **kwargs: Any
     ) -> None:
         if Setup.is_setup_done():
-            msg = Logging._format_message("INFO", message, type, function, duration, **kwargs)
+            # Get the current context and merge with kwargs
+            context = LogContext.get_current_context()
+            merged_kwargs = {**context, **kwargs}
+            
+            msg = Logging._format_message("INFO", message, fn_type, function, duration, **merged_kwargs)
+            # Capture logs in testing mode
+            if Setup.is_testing_mode():
+                Setup.capture_log({
+                    "level": "INFO",
+                    "message": message,
+                    "fn_type": fn_type,
+                    "function": function,
+                    "duration": duration,
+                    "formatted": msg,
+                    "kwargs": merged_kwargs  # Use merged kwargs here
+                })
+                return
+                
             logger = logging.getLogger("pyeztrace")
             logger.info(msg)
         else:
@@ -249,13 +274,31 @@ class Logging:
     @staticmethod
     def log_error(
         message: str,
-        type: Optional[str] = None,
+        fn_type: Optional[str] = None,
         function: Optional[str] = None,
         duration: Optional[float] = None,
         **kwargs: Any
     ) -> None:
         if Setup.is_setup_done():
-            msg = Logging._format_message("ERROR", message, type, function, duration, **kwargs)
+            # Get the current context and merge with kwargs
+            context = LogContext.get_current_context()
+            merged_kwargs = {**context, **kwargs}
+            
+            msg = Logging._format_message("ERROR", message, fn_type, function, duration, **merged_kwargs)
+            
+            # Capture logs in testing mode
+            if Setup.is_testing_mode():
+                Setup.capture_log({
+                    "level": "ERROR",
+                    "message": message,
+                    "fn_type": fn_type,
+                    "function": function,
+                    "duration": duration,
+                    "formatted": msg,
+                    "kwargs": merged_kwargs  # Use merged kwargs here
+                })
+                return
+                
             logger = logging.getLogger("pyeztrace")
             logger.error(msg)
         else:
@@ -264,13 +307,31 @@ class Logging:
     @staticmethod
     def log_warning(
         message: str,
-        type: Optional[str] = None,
+        fn_type: Optional[str] = None,
         function: Optional[str] = None,
         duration: Optional[float] = None,
         **kwargs: Any
     ) -> None:
         if Setup.is_setup_done():
-            msg = Logging._format_message("WARNING", message, type, function, duration, **kwargs)
+            # Get the current context and merge with kwargs
+            context = LogContext.get_current_context()
+            merged_kwargs = {**context, **kwargs}
+            
+            msg = Logging._format_message("WARNING", message, fn_type, function, duration, **merged_kwargs)
+            
+            # Capture logs in testing mode
+            if Setup.is_testing_mode():
+                Setup.capture_log({
+                    "level": "WARNING",
+                    "message": message,
+                    "fn_type": fn_type,
+                    "function": function,
+                    "duration": duration,
+                    "formatted": msg,
+                    "kwargs": merged_kwargs  # Use merged kwargs here
+                })
+                return
+                
             logger = logging.getLogger("pyeztrace")
             logger.warning(msg)
         else:
@@ -279,13 +340,31 @@ class Logging:
     @staticmethod
     def log_debug(
         message: str,
-        type: Optional[str] = None,
+        fn_type: Optional[str] = None,
         function: Optional[str] = None,
         duration: Optional[float] = None,
         **kwargs: Any
     ) -> None:
         if Setup.is_setup_done():
-            msg = Logging._format_message("DEBUG", message, type, function, duration, **kwargs)
+            # Get the current context and merge with kwargs
+            context = LogContext.get_current_context()
+            merged_kwargs = {**context, **kwargs}
+            
+            msg = Logging._format_message("DEBUG", message, fn_type, function, duration, **merged_kwargs)
+            
+            # Capture logs in testing mode
+            if Setup.is_testing_mode():
+                Setup.capture_log({
+                    "level": "DEBUG",
+                    "message": message,
+                    "fn_type": fn_type,
+                    "function": function,
+                    "duration": duration,
+                    "formatted": msg,
+                    "kwargs": merged_kwargs  # Use merged kwargs here
+                })
+                return
+                
             logger = logging.getLogger("pyeztrace")
             logger.debug(msg)
         else:
@@ -300,9 +379,25 @@ class Logging:
         if Setup.is_setup_done():
             msg = message if message else str(exception)
             Logging.log_error(msg)
+            
             if stack:
-                logger = logging.getLogger("pyeztrace")
-                logger.error(traceback.format_exc())
+                stack_trace = traceback.format_exc()
+                
+                # In testing mode, capture the stack trace too
+                if Setup.is_testing_mode():
+                    Setup.capture_log({
+                        "level": "ERROR",
+                        "message": "Stack trace",
+                        "fn_type": "",
+                        "function": "raise_exception_to_log",
+                        "formatted": stack_trace,
+                        "stack_trace": stack_trace,
+                        "exception": str(exception)
+                    })
+                else:
+                    logger = logging.getLogger("pyeztrace")
+                    logger.error(stack_trace)
+                    
             raise exception
         else:
             raise Exception("Setup is not done. Cannot raise exception.")
@@ -318,13 +413,49 @@ class Logging:
 
     @staticmethod
     def record_metric(func_name: str, duration: float) -> None:
+        # Use thread-local storage for temporary metrics to reduce lock contention
+        thread_id = threading.get_ident()
+        if not hasattr(Logging, '_thread_metrics'):
+            Logging._thread_metrics = {}
+        
+        if thread_id not in Logging._thread_metrics:
+            Logging._thread_metrics[thread_id] = {}
+            
+        thread_metrics = Logging._thread_metrics[thread_id]
+        
+        if func_name not in thread_metrics:
+            thread_metrics[func_name] = {"count": 0, "total": 0.0}
+            
+        thread_metrics[func_name]["count"] += 1
+        thread_metrics[func_name]["total"] += duration
+        
+        # Periodically flush to global metrics (every 10 records)
+        if thread_metrics[func_name]["count"] % 10 == 0:
+            Logging._flush_thread_metrics(thread_id)
+    
+    @staticmethod
+    def _flush_thread_metrics(thread_id):
+        """Flush thread-local metrics to global metrics."""
+        if not hasattr(Logging, '_thread_metrics') or thread_id not in Logging._thread_metrics:
+            return
+            
         with Logging._metrics_lock:
-            m = Logging._metrics.setdefault(func_name, {"count": 0, "total": 0.0})
-            m["count"] += 1
-            m["total"] += duration
+            for func_name, metrics in Logging._thread_metrics[thread_id].items():
+                if func_name not in Logging._metrics:
+                    Logging._metrics[func_name] = {"count": 0, "total": 0.0}
+                Logging._metrics[func_name]["count"] += metrics["count"]
+                Logging._metrics[func_name]["total"] += metrics["total"]
+            
+            # Clear thread metrics after flushing
+            Logging._thread_metrics[thread_id] = {}
 
     @staticmethod
     def log_metrics_summary() -> None:
+        # Flush any remaining thread-local metrics
+        if hasattr(Logging, '_thread_metrics'):
+            for thread_id in list(Logging._thread_metrics.keys()):
+                Logging._flush_thread_metrics(thread_id)
+                
         if not Logging._metrics:
             Logging.log_warning("No performance metrics collected.")
             return
@@ -337,3 +468,24 @@ class Logging:
             avg = total / count if count else 0.0
             Logging.log_info(f"{func:40} {count:8d} {total:12.5f} {avg:12.5f}")
         Logging.log_info("=" * 76)
+
+    @staticmethod
+    def disable_buffering():
+        """Disable log buffering for immediate writes."""
+        Logging._buffer_enabled = False
+        
+    @staticmethod
+    def enable_buffering():
+        """Enable log buffering for better performance."""
+        Logging._buffer_enabled = True
+        
+    @staticmethod
+    def flush_logs():
+        """Force flush all buffered logs."""
+        logger = logging.getLogger("pyeztrace")
+        for handler in logger.handlers:
+            if isinstance(handler, BufferedHandler):
+                handler.flush()
+            else:
+                if hasattr(handler, 'flush'):
+                    handler.flush()

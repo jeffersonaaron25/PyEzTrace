@@ -1,4 +1,3 @@
-
 import time
 import contextvars
 import types
@@ -12,10 +11,40 @@ from pyeztrace.custom_logging import Logging
 
 def ensure_initialized():
     """Ensure EzTrace is initialized with sensible defaults if not already done."""
-    if not Setup.is_setup_done():
-        project_name = sys.argv[0].split('/')[-1].replace('.py', '') if sys.argv else "EzTrace"
-        Setup.initialize(project_name)
-        Setup.set_setup_done()
+    try:
+        if not Setup.is_setup_done():
+            try:
+                # Try to get main script name
+                project_name = sys.argv[0].split('/')[-1].replace('.py', '') if sys.argv else None
+                
+                # If running in interactive mode or argv[0] is empty, try module name
+                if not project_name or project_name == '' or project_name == '-c':
+                    # Try to get calling module name
+                    frame = inspect.currentframe()
+                    if frame:
+                        try:
+                            frame = frame.f_back
+                            if frame and frame.f_globals:
+                                module_name = frame.f_globals.get('__name__')
+                                if module_name and module_name != '__main__':
+                                    project_name = module_name.split('.')[0]
+                        finally:
+                            del frame
+                
+                # Fallback 
+                if not project_name or project_name == '':
+                    project_name = "EzTrace"
+                    
+                Setup.initialize(project_name)
+                Setup.set_setup_done()
+            except Exception as e:
+                # Last resort fallback
+                Setup.initialize("EzTrace")
+                Setup.set_setup_done()
+                print(f"Warning: Error during tracer initialization: {str(e)}")
+    except Exception as e:
+        # Catastrophic failure - print and continue
+        print(f"Critical error in EzTrace initialization: {str(e)}")
     return Logging()
 
 logging = ensure_initialized()
@@ -88,10 +117,10 @@ class trace_children_in_module:
         self.__enter__()
         return self
 
-    async def __aexit__(self) -> None:
-        self.__exit__()
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.__exit__(None, None, None)
 
-    def __exit__(self) -> None:
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         ref_counter = self._get_ref_counter()
         key = id(self.module_or_class)
         if key in ref_counter:
@@ -107,51 +136,57 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
     Decorator for child functions: only logs if tracing_active is True.
     """
     import functools
+    
+    # Skip decoration entirely if we know we're not in a tracing context
+    # This avoids the additional function call overhead
+    if not tracing_active.get():
+        return func
+        
     if inspect.iscoroutinefunction(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            if tracing_active.get():
-                Setup.increment_level()
-                logging.log_info(f"called...", type="child", function=func.__qualname__)
-                start = time.time()
-                try:
-                    result = await func(*args, **kwargs)
-                    end = time.time()
-                    duration = end - start
-                    logging.log_info(f"Ok.", type="child", function=func.__qualname__, duration=duration)
-                    logging.record_metric(f"{func.__qualname__}", duration)
-                    return result
-                except Exception as e:
-                    logging.log_error(f"Error: {str(e)}", type="child", function=func.__qualname__)
-                    logging.raise_exception_to_log(e, str(e), stack=False)
-                    raise
-                finally:
-                    Setup.decrement_level()
-            else:
-                return func(*args, **kwargs)
+            if not tracing_active.get():
+                return await func(*args, **kwargs)
+                
+            Setup.increment_level()
+            logging.log_info(f"called...", fn_type="child", function=func.__qualname__)
+            start = time.time()
+            try:
+                result = await func(*args, **kwargs)
+                end = time.time()
+                duration = end - start
+                logging.log_info(f"Ok.", fn_type="child", function=func.__qualname__, duration=duration)
+                logging.record_metric(func.__qualname__, duration)
+                return result
+            except Exception as e:
+                logging.log_error(f"Error: {str(e)}", fn_type="child", function=func.__qualname__)
+                logging.raise_exception_to_log(e, str(e), stack=False)
+                raise
+            finally:
+                Setup.decrement_level()
         return wrapper
     else:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            if tracing_active.get():
-                Setup.increment_level()
-                logging.log_info(f"called...", type="child", function=func.__qualname__)
-                start = time.time()
-                try:
-                    result = func(*args, **kwargs)
-                    end = time.time()
-                    duration = end - start
-                    logging.log_info(f"Ok.", type="child", function=func.__qualname__, duration=duration)
-                    logging.record_metric(f"{func.__qualname__}", duration)
-                    return result
-                except Exception as e:
-                    logging.log_error(f"Error: {str(e)}", type="child", function=func.__qualname__)
-                    logging.raise_exception_to_log(e, str(e), stack=False)
-                    raise
-                finally:
-                    Setup.decrement_level()
-            else:
+            if not tracing_active.get():
                 return func(*args, **kwargs)
+                
+            Setup.increment_level()
+            logging.log_info(f"called...", fn_type="child", function=func.__qualname__)
+            start = time.time()
+            try:
+                result = func(*args, **kwargs)
+                end = time.time()
+                duration = end - start
+                logging.log_info(f"Ok.", fn_type="child", function=func.__qualname__, duration=duration)
+                logging.record_metric(func.__qualname__, duration)
+                return result
+            except Exception as e:
+                logging.log_error(f"Error: {str(e)}", fn_type="child", function=func.__qualname__)
+                logging.raise_exception_to_log(e, str(e), stack=False)
+                raise
+            finally:
+                Setup.decrement_level()
         return wrapper
 
 def trace(
@@ -202,69 +237,99 @@ def trace(
         if inspect.iscoroutinefunction(func):
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
-                token = tracing_active.set(True)
-                Setup.increment_level()
-                logging.log_info(f"called...", type="parent", function=func.__qualname__)
-                start = time.time()
                 try:
+                    # Initialize if not already done
+                    ensure_initialized()
+                    token = tracing_active.set(True)
+                    Setup.increment_level()
+                    logging.log_info(f"called...", fn_type="parent", function=func.__qualname__)
+                    start = time.time()
+                    
                     targets = _get_targets()
-                    if targets:
-                        managers = [trace_children_in_module(t, make_child_decorator(child_trace_decorator)) for t in targets]
-                        for m in managers:
-                            await m.__aenter__()
-                        try:
-                            result = await func(*args, **kwargs)
-                        finally:
-                            for m in reversed(managers):
-                                await m.__aexit__()
-                    else:
+                    managers = []
+                    try:
+                        if targets:
+                            managers = [trace_children_in_module(t, make_child_decorator(child_trace_decorator)) for t in targets]
+                            for m in managers:
+                                await m.__aenter__()
                         result = await func(*args, **kwargs)
-                    end = time.time()
-                    duration = end - start
-                    logging.log_info(f"Ok.", type="parent", function=func.__qualname__, duration=duration)
-                    logging.record_metric(f"{func.__qualname__}", duration)
-                    return result
+                        end = time.time()
+                        duration = end - start
+                        logging.log_info(f"Ok.", fn_type="parent", function=func.__qualname__, duration=duration)
+                        logging.record_metric(func.__qualname__, duration)
+                        return result
+                    except Exception as e:
+                        logging.log_error(f"Error: {str(e)}", fn_type="parent", function=func.__qualname__)
+                        error_message = f"{message} -> {str(e)}" if message else str(e)
+                        logging.raise_exception_to_log(e, error_message, stack)
+                        raise
+                    finally:
+                        # Clean up context managers even if an exception occurs
+                        for m in reversed(managers):
+                            try:
+                                await m.__aexit__(None, None, None)
+                            except Exception:
+                                pass  # Prevent cleanup exceptions from masking the original error
                 except Exception as e:
-                    logging.log_error(f"Error: {str(e)}", type="parent", function=func.__qualname__)
-                    error_message = f"{message} -> {str(e)}" if message else str(e)
-                    logging.raise_exception_to_log(e, error_message, stack)
-                    raise
+                    # Fallback for catastrophic failures in the tracing setup
+                    print(f"TRACE ERROR: {func.__qualname__} - {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return await func(*args, **kwargs)
                 finally:
-                    Setup.decrement_level()
-                    tracing_active.reset(token)
+                    try:
+                        Setup.decrement_level()
+                        tracing_active.reset(token)
+                    except Exception:
+                        pass  # Last-resort exception handling
             return async_wrapper
         else:
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
-                token = tracing_active.set(True)
-                Setup.increment_level()
-                logging.log_info(f"called...", type="parent", function=func.__name__)
-                start = time.time()
                 try:
+                    # Initialize if not already done
+                    ensure_initialized()
+                    token = tracing_active.set(True)
+                    Setup.increment_level()
+                    logging.log_info(f"called...", fn_type="parent", function=func.__name__)
+                    start = time.time()
+                    
                     targets = _get_targets()
-                    if targets:
-                        managers = [trace_children_in_module(t, make_child_decorator(child_trace_decorator)) for t in targets]
-                        for m in managers:
-                            m.__enter__()
-                        try:
-                            result = func(*args, **kwargs)
-                        finally:
-                            for m in reversed(managers):
-                                m.__exit__()
-                    else:
+                    managers = []
+                    try:
+                        if targets:
+                            managers = [trace_children_in_module(t, make_child_decorator(child_trace_decorator)) for t in targets]
+                            for m in managers:
+                                m.__enter__()
                         result = func(*args, **kwargs)
-                    end = time.time()
-                    duration = end - start
-                    logging.log_info(f"Ok.", type="parent", function=f"{func.__qualname__}", duration=duration)
-                    logging.record_metric(f"{func.__qualname__}", duration)
-                    return result
+                        end = time.time()
+                        duration = end - start
+                        logging.log_info(f"Ok.", fn_type="parent", function=func.__qualname__, duration=duration)
+                        logging.record_metric(func.__qualname__, duration)
+                        return result
+                    except Exception as e:
+                        logging.log_error(f"Error: {str(e)}", function=func.__qualname__)
+                        error_message = f"{message} -> {str(e)}" if message else str(e)
+                        logging.raise_exception_to_log(e, error_message, stack)
+                        raise
+                    finally:
+                        # Clean up context managers even if an exception occurs
+                        for m in reversed(managers):
+                            try:
+                                m.__exit__(None, None, None)
+                            except Exception:
+                                pass  # Prevent cleanup exceptions from masking the original error
                 except Exception as e:
-                    logging.log_error(f"Error: {str(e)}", type="parent", function=f"{func.__qualname__}")
-                    error_message = f"{message} -> {str(e)}" if message else str(e)
-                    logging.raise_exception_to_log(e, error_message, stack)
-                    raise
+                    # Fallback for catastrophic failures in the tracing setup
+                    print(f"TRACE ERROR: {func.__qualname__} - {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return func(*args, **kwargs)
                 finally:
-                    Setup.decrement_level()
-                    tracing_active.reset(token)
+                    try:
+                        Setup.decrement_level()
+                        tracing_active.reset(token)
+                    except Exception:
+                        pass  # Last-resort exception handling
             return wrapper
     return decorator

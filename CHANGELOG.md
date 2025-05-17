@@ -1,7 +1,10 @@
 # Changelog
 
 
-## v0.0.5 (2025-05-15)
+## v0.0.6
+- Edge case fixes
+
+## v0.0.5
 - Fixed I/O error from logging library
 - Cleaned up background logs
 

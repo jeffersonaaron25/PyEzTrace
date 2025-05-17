@@ -16,7 +16,56 @@ class Setup:
     __lock = threading.Lock()
     __async_lock = asyncio.Lock()
     __metrics_registered = False
+    __testing_mode = False
 
+    # Methods for testing
+    @classmethod
+    def enable_testing_mode(cls):
+        """
+        Enable testing mode. In testing mode:
+        - Logging doesn't write to files
+        - Log messages are captured for inspection
+        - No side effects to real application monitoring
+        """
+        with cls.__lock:
+            cls.__testing_mode = True
+            cls._captured_logs = []
+
+    @classmethod
+    def disable_testing_mode(cls):
+        """Disable testing mode."""
+        with cls.__lock:
+            cls.__testing_mode = False
+            if hasattr(cls, '_captured_logs'):
+                delattr(cls, '_captured_logs')
+
+    @classmethod
+    def is_testing_mode(cls):
+        """Check if testing mode is enabled."""
+        with cls.__lock:
+            return cls.__testing_mode
+
+    @classmethod
+    def get_captured_logs(cls):
+        """Get logs captured in testing mode."""
+        with cls.__lock:
+            if not cls.__testing_mode:
+                raise exceptions.SetupError("Not in testing mode. No logs captured.")
+            return cls._captured_logs.copy() if hasattr(cls, '_captured_logs') else []
+
+    @classmethod
+    def capture_log(cls, log_entry):
+        """Capture a log entry in testing mode."""
+        with cls.__lock:
+            if cls.__testing_mode and hasattr(cls, '_captured_logs'):
+                cls._captured_logs.append(log_entry)
+
+    @classmethod
+    def clear_captured_logs(cls):
+        """Clear captured logs in testing mode."""
+        with cls.__lock:
+            if cls.__testing_mode and hasattr(cls, '_captured_logs'):
+                cls._captured_logs.clear()
 
     # Synchronous methods (thread-safe)
     @classmethod
