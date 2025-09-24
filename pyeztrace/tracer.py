@@ -6,6 +6,11 @@ import sys
 import threading
 import fnmatch
 from typing import Any, Callable, Optional, Sequence, Union, Dict, List, Set
+import uuid
+try:
+    import resource  # Unix-specific
+except Exception:
+    resource = None  # type: ignore
 from pyeztrace.setup import Setup
 from pyeztrace.custom_logging import Logging
 from pyeztrace.otel import start_span, record_exception
@@ -15,6 +20,9 @@ _TRACED_ATTRIBUTE = '_pyeztrace_wrapped'
 
 # ContextVar to track functions currently being traced in the execution path
 _currently_tracing = contextvars.ContextVar('_pyeztrace_currently_tracing', default=set())
+
+# ContextVar to maintain parent-child relationship for call hierarchy
+_call_stack_ids = contextvars.ContextVar('_pyeztrace_call_stack_ids', default=tuple())
 
 def ensure_initialized():
     """Ensure EzTrace is initialized with sensible defaults if not already done."""
@@ -78,6 +86,57 @@ def _safe_to_wrap(obj):
         or inspect.ismethod(obj)  # Added support for methods
         or (inspect.isbuiltin(obj) and getattr(obj, "__module__", "") and getattr(obj, "__module__", "").startswith("builtins"))
     )
+
+def _safe_preview_value(value: Any, max_len: int = 200) -> Any:
+    """
+    Produce a JSON-serializable, size-bounded preview of a value.
+    Falls back to type name and truncated repr for complex objects.
+    """
+    try:
+        # Primitive types pass through
+        if value is None or isinstance(value, (bool, int, float, str)):
+            if isinstance(value, str) and len(value) > max_len:
+                return value[:max_len] + "…"
+            return value
+        # Simple containers: preview recursively but bounded
+        if isinstance(value, (list, tuple)):
+            preview = [_safe_preview_value(v, max_len=max_len // 2) for v in list(value)[:5]]
+            if len(value) > 5:
+                preview.append("…")
+            return preview
+        if isinstance(value, dict):
+            preview_items = {}
+            for i, (k, v) in enumerate(list(value.items())[:5]):
+                preview_items[str(k)] = _safe_preview_value(v, max_len=max_len // 2)
+            if len(value) > 5:
+                preview_items["…"] = "…"
+            return preview_items
+        # Fallback: type name and truncated repr
+        text = repr(value)
+        if len(text) > max_len:
+            text = text[:max_len] + "…"
+        return {"type": type(value).__name__, "repr": text}
+    except Exception:
+        try:
+            return {"type": type(value).__name__}
+        except Exception:
+            return "<unrepr>"
+
+def _preview_args_kwargs(args: tuple, kwargs: dict) -> Dict[str, Any]:
+    """Return safe previews for args and kwargs."""
+    try:
+        args_preview = [_safe_preview_value(a) for a in list(args)[:5]]
+        if len(args) > 5:
+            args_preview.append("…")
+    except Exception:
+        args_preview = ["<args_unavailable>"]
+    try:
+        kwargs_preview = {str(k): _safe_preview_value(v) for k, v in list(kwargs.items())[:8]}
+        if len(kwargs) > 8:
+            kwargs_preview["…"] = "…"
+    except Exception:
+        kwargs_preview = {"<kwargs_unavailable>": True}
+    return {"args_preview": args_preview, "kwargs_preview": kwargs_preview}
 
 # ContextVar to indicate tracing is active
 tracing_active = contextvars.ContextVar("tracing_active", default=False)
@@ -206,27 +265,88 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             new_tracing = currently_tracing.copy()
             new_tracing.add(func_id)
             token = _currently_tracing.set(new_tracing)
+            # Manage call stack for parent-child linking
+            stack_before = _call_stack_ids.get()
+            new_stack = tuple(list(stack_before) + [uuid.uuid4().hex])
+            call_id = new_stack[-1]
+            parent_id = stack_before[-1] if stack_before else None
+            stack_token = _call_stack_ids.set(new_stack)
             
             # Normal tracing logic
             Setup.increment_level()
-            logging.log_info(f"called...", fn_type="child", function=func.__qualname__)
+            previews = _preview_args_kwargs(args, kwargs)
+            start_ts = time.time()
+            # Resource snapshots
+            start_cpu = time.process_time()
+            mem_before = None
+            if resource is not None:
+                try:
+                    mem_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                except Exception:
+                    mem_before = None
+            logging.log_info(
+                f"called...",
+                fn_type="child",
+                function=func.__qualname__,
+                event="start",
+                call_id=call_id,
+                parent_id=parent_id,
+                time_epoch=start_ts,
+                **previews
+            )
             start = time.time()
             with start_span(func.__qualname__, {"fn.type": "child"}) as _span:
                 try:
                     result = await func(*args, **kwargs)
                     end = time.time()
                     duration = end - start
-                    logging.log_info(f"Ok.", fn_type="child", function=func.__qualname__, duration=duration)
+                    # Metrics capture
+                    cpu_time = time.process_time() - start_cpu
+                    mem_after = None
+                    mem_delta = None
+                    if resource is not None:
+                        try:
+                            mem_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                            if mem_before is not None:
+                                mem_delta = mem_after - mem_before
+                        except Exception:
+                            mem_after = None
+                    logging.log_info(
+                        f"Ok.",
+                        fn_type="child",
+                        function=func.__qualname__,
+                        duration=duration,
+                        event="end",
+                        call_id=call_id,
+                        parent_id=parent_id,
+                        time_epoch=time.time(),
+                        cpu_time=cpu_time,
+                        mem_peak_kb=mem_after,
+                        mem_delta_kb=mem_delta,
+                        result_preview=_safe_preview_value(result)
+                    )
                     logging.record_metric(func.__qualname__, duration)
                     return result
                 except Exception as e:
-                    logging.log_error(f"Error: {str(e)}", fn_type="child", function=func.__qualname__)
+                    logging.log_error(
+                        f"Error: {str(e)}",
+                        fn_type="child",
+                        function=func.__qualname__,
+                        event="error",
+                        call_id=call_id,
+                        parent_id=parent_id,
+                        time_epoch=time.time()
+                    )
                     record_exception(_span, e)
                     logging.raise_exception_to_log(e, str(e), stack=False)
                     raise
                 finally:
                     Setup.decrement_level()
                     _currently_tracing.reset(token)
+                    try:
+                        _call_stack_ids.reset(stack_token)
+                    except Exception:
+                        pass
         
         # Mark as wrapped
         setattr(wrapper, _TRACED_ATTRIBUTE, True)
@@ -252,27 +372,88 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             new_tracing = currently_tracing.copy()
             new_tracing.add(func_id)
             token = _currently_tracing.set(new_tracing)
+            # Manage call stack for parent-child linking
+            stack_before = _call_stack_ids.get()
+            new_stack = tuple(list(stack_before) + [uuid.uuid4().hex])
+            call_id = new_stack[-1]
+            parent_id = stack_before[-1] if stack_before else None
+            stack_token = _call_stack_ids.set(new_stack)
             
             # Normal tracing logic
             Setup.increment_level()
-            logging.log_info(f"called...", fn_type="child", function=func.__qualname__)
+            previews = _preview_args_kwargs(args, kwargs)
+            start_ts = time.time()
+            # Resource snapshots
+            start_cpu = time.process_time()
+            mem_before = None
+            if resource is not None:
+                try:
+                    mem_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                except Exception:
+                    mem_before = None
+            logging.log_info(
+                f"called...",
+                fn_type="child",
+                function=func.__qualname__,
+                event="start",
+                call_id=call_id,
+                parent_id=parent_id,
+                time_epoch=start_ts,
+                **previews
+            )
             start = time.time()
             with start_span(func.__qualname__, {"fn.type": "child"}) as _span:
                 try:
                     result = func(*args, **kwargs)
                     end = time.time()
                     duration = end - start
-                    logging.log_info(f"Ok.", fn_type="child", function=func.__qualname__, duration=duration)
+                    # Metrics capture
+                    cpu_time = time.process_time() - start_cpu
+                    mem_after = None
+                    mem_delta = None
+                    if resource is not None:
+                        try:
+                            mem_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                            if mem_before is not None:
+                                mem_delta = mem_after - mem_before
+                        except Exception:
+                            mem_after = None
+                    logging.log_info(
+                        f"Ok.",
+                        fn_type="child",
+                        function=func.__qualname__,
+                        duration=duration,
+                        event="end",
+                        call_id=call_id,
+                        parent_id=parent_id,
+                        time_epoch=time.time(),
+                        cpu_time=cpu_time,
+                        mem_peak_kb=mem_after,
+                        mem_delta_kb=mem_delta,
+                        result_preview=_safe_preview_value(result)
+                    )
                     logging.record_metric(func.__qualname__, duration)
                     return result
                 except Exception as e:
-                    logging.log_error(f"Error: {str(e)}", fn_type="child", function=func.__qualname__)
+                    logging.log_error(
+                        f"Error: {str(e)}",
+                        fn_type="child",
+                        function=func.__qualname__,
+                        event="error",
+                        call_id=call_id,
+                        parent_id=parent_id,
+                        time_epoch=time.time()
+                    )
                     record_exception(_span, e)
                     logging.raise_exception_to_log(e, str(e), stack=False)
                     raise
                 finally:
                     Setup.decrement_level()
                     _currently_tracing.reset(token)
+                    try:
+                        _call_stack_ids.reset(stack_token)
+                    except Exception:
+                        pass
         
         # Mark as wrapped
         setattr(wrapper, _TRACED_ATTRIBUTE, True)
@@ -467,8 +648,33 @@ def trace(
                     new_tracing = currently_tracing.copy()
                     new_tracing.add(func_id)
                     tracing_token = _currently_tracing.set(new_tracing)
+                    # Manage call stack for parent-child linking
+                    stack_before = _call_stack_ids.get()
+                    new_stack = tuple(list(stack_before) + [uuid.uuid4().hex])
+                    call_id = new_stack[-1]
+                    parent_id = stack_before[-1] if stack_before else None
+                    stack_token = _call_stack_ids.set(new_stack)
                     
-                    logging.log_info(f"called...", fn_type="parent", function=func.__qualname__)
+                    previews = _preview_args_kwargs(args, kwargs)
+                    start_ts = time.time()
+                    # Resource snapshots
+                    start_cpu = time.process_time()
+                    mem_before = None
+                    if resource is not None:
+                        try:
+                            mem_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                        except Exception:
+                            mem_before = None
+                    logging.log_info(
+                        f"called...",
+                        fn_type="parent",
+                        function=func.__qualname__,
+                        event="start",
+                        call_id=call_id,
+                        parent_id=parent_id,
+                        time_epoch=start_ts,
+                        **previews
+                    )
                     start = time.time()
                     
                     targets = _get_targets()
@@ -483,11 +689,43 @@ def trace(
                                 result = await func(*args, **kwargs)
                                 end = time.time()
                                 duration = end - start
-                                logging.log_info(f"Ok.", fn_type="parent", function=func.__qualname__, duration=duration)
+                                # Metrics capture
+                                cpu_time = time.process_time() - start_cpu
+                                mem_after = None
+                                mem_delta = None
+                                if resource is not None:
+                                    try:
+                                        mem_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                                        if mem_before is not None:
+                                            mem_delta = mem_after - mem_before
+                                    except Exception:
+                                        mem_after = None
+                                logging.log_info(
+                                    f"Ok.",
+                                    fn_type="parent",
+                                    function=func.__qualname__,
+                                    duration=duration,
+                                    event="end",
+                                    call_id=call_id,
+                                    parent_id=parent_id,
+                                    time_epoch=time.time(),
+                                    cpu_time=cpu_time,
+                                    mem_peak_kb=mem_after,
+                                    mem_delta_kb=mem_delta,
+                                    result_preview=_safe_preview_value(result)
+                                )
                                 logging.record_metric(func.__qualname__, duration)
                                 return result
                             except Exception as e:
-                                logging.log_error(f"Error: {str(e)}", fn_type="parent", function=func.__qualname__)
+                                logging.log_error(
+                                    f"Error: {str(e)}",
+                                    fn_type="parent",
+                                    function=func.__qualname__,
+                                    event="error",
+                                    call_id=call_id,
+                                    parent_id=parent_id,
+                                    time_epoch=time.time()
+                                )
                                 error_message = f"{message} -> {str(e)}" if message else str(e)
                                 record_exception(_span, e)
                                 logging.raise_exception_to_log(e, error_message, stack)
@@ -511,6 +749,8 @@ def trace(
                         tracing_active.reset(token)
                         if 'tracing_token' in locals():
                             _currently_tracing.reset(tracing_token)
+                        if 'stack_token' in locals():
+                            _call_stack_ids.reset(stack_token)
                     except Exception:
                         pass  # Last-resort exception handling
             
@@ -536,8 +776,33 @@ def trace(
                     new_tracing = currently_tracing.copy()
                     new_tracing.add(func_id)
                     tracing_token = _currently_tracing.set(new_tracing)
+                    # Manage call stack for parent-child linking
+                    stack_before = _call_stack_ids.get()
+                    new_stack = tuple(list(stack_before) + [uuid.uuid4().hex])
+                    call_id = new_stack[-1]
+                    parent_id = stack_before[-1] if stack_before else None
+                    stack_token = _call_stack_ids.set(new_stack)
                     
-                    logging.log_info(f"called...", fn_type="parent", function=func.__qualname__)
+                    previews = _preview_args_kwargs(args, kwargs)
+                    start_ts = time.time()
+                    # Resource snapshots
+                    start_cpu = time.process_time()
+                    mem_before = None
+                    if resource is not None:
+                        try:
+                            mem_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                        except Exception:
+                            mem_before = None
+                    logging.log_info(
+                        f"called...",
+                        fn_type="parent",
+                        function=func.__qualname__,
+                        event="start",
+                        call_id=call_id,
+                        parent_id=parent_id,
+                        time_epoch=start_ts,
+                        **previews
+                    )
                     start = time.time()
                     
                     targets = _get_targets()
@@ -552,11 +817,43 @@ def trace(
                                 result = func(*args, **kwargs)
                                 end = time.time()
                                 duration = end - start
-                                logging.log_info(f"Ok.", fn_type="parent", function=func.__qualname__, duration=duration)
+                                # Metrics capture
+                                cpu_time = time.process_time() - start_cpu
+                                mem_after = None
+                                mem_delta = None
+                                if resource is not None:
+                                    try:
+                                        mem_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                                        if mem_before is not None:
+                                            mem_delta = mem_after - mem_before
+                                    except Exception:
+                                        mem_after = None
+                                logging.log_info(
+                                    f"Ok.",
+                                    fn_type="parent",
+                                    function=func.__qualname__,
+                                    duration=duration,
+                                    event="end",
+                                    call_id=call_id,
+                                    parent_id=parent_id,
+                                    time_epoch=time.time(),
+                                    cpu_time=cpu_time,
+                                    mem_peak_kb=mem_after,
+                                    mem_delta_kb=mem_delta,
+                                    result_preview=_safe_preview_value(result)
+                                )
                                 logging.record_metric(func.__qualname__, duration)
                                 return result
                             except Exception as e:
-                                logging.log_error(f"Error: {str(e)}", function=func.__qualname__)
+                                logging.log_error(
+                                    f"Error: {str(e)}",
+                                    function=func.__qualname__,
+                                    fn_type="parent",
+                                    event="error",
+                                    call_id=call_id,
+                                    parent_id=parent_id,
+                                    time_epoch=time.time()
+                                )
                                 error_message = f"{message} -> {str(e)}" if message else str(e)
                                 record_exception(_span, e)
                                 logging.raise_exception_to_log(e, error_message, stack)
@@ -580,6 +877,8 @@ def trace(
                         tracing_active.reset(token)
                         if 'tracing_token' in locals():
                             _currently_tracing.reset(tracing_token)
+                        if 'stack_token' in locals():
+                            _call_stack_ids.reset(stack_token)
                     except Exception:
                         pass  # Last-resort exception handling
             
