@@ -12,11 +12,28 @@ A dependency-free, lightweight Python tracing and logging library with hierarchi
 - 🎯 **Decorator-based Tracing**: Easy function and method tracing
 - 💪 **Thread-Safe**: Fully thread-safe implementation
 - 🚀 **High Performance**: Buffered logging and optimized output
+ - 🌐 **OpenTelemetry Bridge (optional)**: Emit spans to OTLP/console, or export batches to S3/Azure Blob
 
 ## Installation
 
 ```bash
 pip install pyeztrace
+```
+
+Optional extras (keep default dependency-free):
+
+```bash
+# OpenTelemetry SDK and OTLP exporter
+pip install "pyeztrace[otel]"
+
+# S3 exporter
+pip install "pyeztrace[s3]"
+
+# Azure Blob exporter
+pip install "pyeztrace[azure]"
+
+# Everything
+pip install "pyeztrace[all]"
 ```
 
 ## Quick Start
@@ -225,6 +242,62 @@ def concurrent_operation(worker_id):
 with ThreadPoolExecutor(max_workers=5) as executor:
     executor.map(concurrent_operation, range(5))
 ```
+
+### 10. OpenTelemetry Spans (Optional)
+
+PyEzTrace can emit OpenTelemetry spans alongside its logs using a lazy bridge.
+By default it is disabled; enable it with environment variables at runtime.
+
+Enable OTEL with OTLP HTTP (default) to a collector:
+
+```bash
+export EZTRACE_OTEL_ENABLED=true
+export EZTRACE_OTEL_EXPORTER=otlp            # or omit to use 'otlp' by default
+export EZTRACE_OTLP_ENDPOINT="http://localhost:4318/v1/traces"
+# optional: comma-separated headers like "api-key=xyz,x-tenant=abc"
+export EZTRACE_OTLP_HEADERS=""
+
+# Optional: override service name (defaults to Setup project)
+export EZTRACE_SERVICE_NAME="my-service"
+```
+
+Use console exporter for local development:
+
+```bash
+export EZTRACE_OTEL_ENABLED=true
+export EZTRACE_OTEL_EXPORTER=console
+```
+
+Export span batches to S3 as JSONL (gzipped by default) without a collector:
+
+```bash
+pip install "pyeztrace[s3]"
+export EZTRACE_OTEL_ENABLED=true
+export EZTRACE_OTEL_EXPORTER=s3
+export EZTRACE_S3_BUCKET="my-trace-bucket"
+export EZTRACE_S3_PREFIX="traces/"               # optional, default traces/
+export EZTRACE_S3_REGION="us-east-1"             # optional
+export EZTRACE_COMPRESS=true                      # optional, default true
+```
+
+Export span batches to Azure Blob Storage:
+
+```bash
+pip install "pyeztrace[azure]"
+export EZTRACE_OTEL_ENABLED=true
+export EZTRACE_OTEL_EXPORTER=azure
+export EZTRACE_AZURE_CONTAINER="trace-container"
+export EZTRACE_AZURE_PREFIX="traces/"            # optional, default traces/
+# One of the following must be provided:
+export EZTRACE_AZURE_CONNECTION_STRING="<connection-string>"
+# or
+export EZTRACE_AZURE_ACCOUNT_URL="https://<account>.blob.core.windows.net"
+```
+
+Notes:
+- The bridge is lazy-loaded; if OTEL packages are missing, the library remains functional without spans.
+- Spans are created for both parent and child wrappers using function `__qualname__` as span names.
+- Exceptions are recorded on the active span when OTEL is enabled.
 
 ## Advanced Usage
 

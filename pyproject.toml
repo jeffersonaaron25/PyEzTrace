@@ -27,3 +27,20 @@ requires-python = ">=3.7"
 [tool.setuptools.packages.find]
 include = ["pyeztrace*"]
 exclude = ["tests*"]
+
+[project.optional-dependencies]
+# Keep default install dependency-free. Users can opt-in to extras below.
+otel = [
+    "opentelemetry-api>=1.23.0",
+    "opentelemetry-sdk>=1.23.0",
+    "opentelemetry-exporter-otlp>=1.23.0",
+]
+s3 = [
+    "boto3>=1.28.0",
+]
+azure = [
+    "azure-storage-blob>=12.14.0",
+]
+all = [
+    "pyeztrace[otel,s3,azure]",
+]
