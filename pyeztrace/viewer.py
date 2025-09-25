@@ -49,6 +49,7 @@ class _TraceTreeBuilder:
         lines = self._read_lines()
         entries = self._parse_json_lines(lines)
         nodes: Dict[str, Dict[str, Any]] = {}
+        metrics_entries: List[Dict[str, Any]] = []
         roots: List[str] = []
 
         for e in entries:
@@ -58,6 +59,18 @@ class _TraceTreeBuilder:
             event = data.get('event')  # 'start' | 'end' | 'error' | None
             function = e.get('function') or data.get('function')
             fn_type = e.get('fn_type') or data.get('fn_type')
+            status = data.get('status')
+
+            if event == 'metrics_summary':
+                metrics_entries.append({
+                    'timestamp': e.get('timestamp'),
+                    'status': status or e.get('level'),
+                    'metrics': data.get('metrics', []),
+                    'total_functions': data.get('total_functions'),
+                    'total_calls': data.get('total_calls'),
+                    'generated_at': data.get('generated_at') or self._to_epoch(e.get('timestamp', ''))
+                })
+                continue
 
             if not call_id:
                 # Not a structured trace entry; skip from tree but include as loose log?
@@ -78,6 +91,7 @@ class _TraceTreeBuilder:
                     'args_preview': None,
                     'kwargs_preview': None,
                     'result_preview': None,
+                    'status': status,
                     'level': e.get('level'),
                     'project': e.get('project'),
                     'children': []  # child call_ids
@@ -98,6 +112,7 @@ class _TraceTreeBuilder:
                 node['start_time'] = data.get('time_epoch') or self._to_epoch(e.get('timestamp', ''))
                 node['args_preview'] = data.get('args_preview')
                 node['kwargs_preview'] = data.get('kwargs_preview')
+                node['status'] = status or 'running'
             elif event == 'end':
                 node['end_time'] = data.get('time_epoch') or self._to_epoch(e.get('timestamp', ''))
                 node['duration'] = e.get('duration')
@@ -105,9 +120,11 @@ class _TraceTreeBuilder:
                 node['mem_peak_kb'] = data.get('mem_peak_kb')
                 node['mem_delta_kb'] = data.get('mem_delta_kb')
                 node['result_preview'] = data.get('result_preview')
+                node['status'] = status or 'success'
             elif event == 'error':
                 # Mark node with error info
                 node['error'] = e.get('message')
+                node['status'] = status or 'error'
                 node['end_time'] = data.get('time_epoch') or self._to_epoch(e.get('timestamp', ''))
 
         # Determine roots
@@ -130,7 +147,8 @@ class _TraceTreeBuilder:
             'generated_at': time.time(),
             'log_file': str(self.log_file),
             'roots': tree,
-            'total_nodes': len(nodes)
+            'total_nodes': len(nodes),
+            'metrics': metrics_entries
         }
 
 
@@ -235,12 +253,14 @@ class TraceViewerServer:
 
   let tree = [];
   let total = 0;
+  let metrics = [];
 
   async function fetchTree(){
     const res = await fetch('/api/tree');
     const data = await res.json();
     tree = data.roots || [];
     total = data.total_nodes || 0;
+    metrics = data.metrics || [];
     metaEl.textContent = `${new Date(data.generated_at*1000).toLocaleString()} • ${data.log_file} • ${total} nodes`;
     render();
   }
@@ -291,7 +311,24 @@ class TraceViewerServer:
   function render(){
     const q = (searchEl.value||'').toLowerCase().trim();
     const html = tree.map(n=>renderNode(n, q)).join('');
+    const metricsHtml = metrics.length ? `
+      <div style="margin:12px 0;padding:10px;border:1px solid #e5e7eb;border-radius:8px;background:#f9fafb;">
+        <div style="font-weight:600;margin-bottom:8px;">Performance Metrics</div>
+        ${metrics.map(m=>`
+          <div class="kv">
+            <div><strong>Status:</strong> ${m.status||'-'} | <strong>Timestamp:</strong> ${m.timestamp||'-'}</div>
+            <div><strong>Total functions:</strong> ${m.total_functions||0} • <strong>Total calls:</strong> ${m.total_calls||0}</div>
+            <div style="margin-top:4px;">
+              ${(m.metrics||[]).map(row=>`
+                <div>- ${row.function}: ${row.calls} calls • total ${row.total_seconds}s • avg ${row.avg_seconds}s</div>
+              `).join('') || '<div>- no data</div>'}
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    ` : '';
     rootEl.innerHTML = html || '<div class="muted">No trace nodes found. Ensure EZTRACE_LOG_FORMAT=json.</div>';
+    if(metricsHtml) rootEl.innerHTML = metricsHtml + rootEl.innerHTML;
   }
 
   searchEl.addEventListener('input', render);

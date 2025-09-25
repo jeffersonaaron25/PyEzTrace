@@ -131,12 +131,14 @@ def main():
     parser_print.add_argument('--errors', action='store_true', help="Show only errors")
     parser_print.add_argument('--format', choices=['text', 'json'], default='text',
                       help="Output format")
+    parser_print.set_defaults(func=_cmd_print)
 
     # Serve subcommand
     parser_serve = subparsers.add_parser('serve', help='Run interactive viewer server')
     parser_serve.add_argument('log_file', type=Path, help='Path to JSON-formatted log file')
     parser_serve.add_argument('--host', type=str, default=os.environ.get('EZTRACE_VIEW_HOST', '127.0.0.1'))
     parser_serve.add_argument('--port', type=int, default=int(os.environ.get('EZTRACE_VIEW_PORT', '8765')))
+    parser_serve.set_defaults(func=_cmd_serve)
 
     # Backward compatible arguments (no subcommand -> treat as print)
     parser.add_argument('--level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help=argparse.SUPPRESS)
@@ -147,22 +149,18 @@ def main():
     parser.add_argument('--function', type=str, help=argparse.SUPPRESS)
     parser.add_argument('--errors', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--format', choices=['text', 'json'], default='text', help=argparse.SUPPRESS)
-    parser.add_argument('log_file', nargs='?', type=Path, help=argparse.SUPPRESS)
+    # Note: log_file argument removed from main parser to avoid conflicts with subparsers
 
     args = parser.parse_args()
 
-    # If no command provided but a log_file is present, treat as print
+    # If no command provided, show help (backward compatibility removed due to subparser conflicts)
     if not getattr(args, 'command', None):
-        # Reconstruct for backward compatibility
-        if not getattr(args, 'log_file', None):
-            parser.print_help()
-            return
-        return _cmd_print(args)
+        parser.print_help()
+        return
 
-    if args.command == 'print':
-        return _cmd_print(args)
-    elif args.command == 'serve':
-        return _cmd_serve(args)
+    # Use the function-based approach for subcommands
+    if hasattr(args, 'func'):
+        return args.func(args)
     else:
         parser.print_help()
 
@@ -179,7 +177,12 @@ def _cmd_print(args):
             key, value = pair.split('=')
             context[key.strip()] = value.strip()
 
-    analyzer = LogAnalyzer(args.log_file)
+    log_file = getattr(args, 'log_file', None)
+    if log_file is None:
+        print("Error: No log file specified")
+        return 1
+        
+    analyzer = LogAnalyzer(log_file)
 
     if getattr(args, 'analyze', False):
         metrics = analyzer.analyze_performance(getattr(args, 'function', None))
@@ -217,8 +220,15 @@ def _cmd_print(args):
 def _cmd_serve(args):
     # Ensure JSON logging is used
     print("Note: The viewer expects logs in JSON format. Set EZTRACE_LOG_FORMAT=json before running your app.")
+    
+    # Get log_file from args
+    log_file = getattr(args, 'log_file', None)
+    if log_file is None:
+        print("Error: No log file specified")
+        return 1
+        
     from pyeztrace.viewer import TraceViewerServer
-    server = TraceViewerServer(args.log_file, host=args.host, port=args.port)
+    server = TraceViewerServer(log_file, host=args.host, port=args.port)
     server.serve_forever()
 
 if __name__ == '__main__':

@@ -289,6 +289,7 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
                 fn_type="child",
                 function=func.__qualname__,
                 event="start",
+                status="running",
                 call_id=call_id,
                 parent_id=parent_id,
                 time_epoch=start_ts,
@@ -317,6 +318,7 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
                         function=func.__qualname__,
                         duration=duration,
                         event="end",
+                        status="success",
                         call_id=call_id,
                         parent_id=parent_id,
                         time_epoch=time.time(),
@@ -333,6 +335,7 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
                         fn_type="child",
                         function=func.__qualname__,
                         event="error",
+                        status="error",
                         call_id=call_id,
                         parent_id=parent_id,
                         time_epoch=time.time()
@@ -396,6 +399,7 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
                 fn_type="child",
                 function=func.__qualname__,
                 event="start",
+                status="running",
                 call_id=call_id,
                 parent_id=parent_id,
                 time_epoch=start_ts,
@@ -424,6 +428,7 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
                         function=func.__qualname__,
                         duration=duration,
                         event="end",
+                        status="success",
                         call_id=call_id,
                         parent_id=parent_id,
                         time_epoch=time.time(),
@@ -440,6 +445,7 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
                         fn_type="child",
                         function=func.__qualname__,
                         event="error",
+                        status="error",
                         call_id=call_id,
                         parent_id=parent_id,
                         time_epoch=time.time()
@@ -670,6 +676,7 @@ def trace(
                         fn_type="parent",
                         function=func.__qualname__,
                         event="start",
+                        status="running",
                         call_id=call_id,
                         parent_id=parent_id,
                         time_epoch=start_ts,
@@ -706,6 +713,7 @@ def trace(
                                     function=func.__qualname__,
                                     duration=duration,
                                     event="end",
+                                    status="success",
                                     call_id=call_id,
                                     parent_id=parent_id,
                                     time_epoch=time.time(),
@@ -722,6 +730,7 @@ def trace(
                                     fn_type="parent",
                                     function=func.__qualname__,
                                     event="error",
+                                    status="error",
                                     call_id=call_id,
                                     parent_id=parent_id,
                                     time_epoch=time.time()
@@ -845,14 +854,18 @@ def trace(
                                 logging.record_metric(func.__qualname__, duration)
                                 return result
                             except Exception as e:
+                                end = time.time()
+                                duration = end - start
                                 logging.log_error(
                                     f"Error: {str(e)}",
-                                    function=func.__qualname__,
                                     fn_type="parent",
+                                    function=func.__qualname__,
+                                    duration=duration,
                                     event="error",
+                                    status="error",
                                     call_id=call_id,
                                     parent_id=parent_id,
-                                    time_epoch=time.time()
+                                    time_epoch=end
                                 )
                                 error_message = f"{message} -> {str(e)}" if message else str(e)
                                 record_exception(_span, e)
