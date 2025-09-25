@@ -8,6 +8,7 @@ import fnmatch
 from typing import Any, Callable, Optional, Sequence, Union, Dict, List, Set
 from pyeztrace.setup import Setup
 from pyeztrace.custom_logging import Logging
+from pyeztrace.otel import start_span, record_exception
 
 # Marker attribute for wrapped functions
 _TRACED_ATTRIBUTE = '_pyeztrace_wrapped'
@@ -210,20 +211,22 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             Setup.increment_level()
             logging.log_info(f"called...", fn_type="child", function=func.__qualname__)
             start = time.time()
-            try:
-                result = await func(*args, **kwargs)
-                end = time.time()
-                duration = end - start
-                logging.log_info(f"Ok.", fn_type="child", function=func.__qualname__, duration=duration)
-                logging.record_metric(func.__qualname__, duration)
-                return result
-            except Exception as e:
-                logging.log_error(f"Error: {str(e)}", fn_type="child", function=func.__qualname__)
-                logging.raise_exception_to_log(e, str(e), stack=False)
-                raise
-            finally:
-                Setup.decrement_level()
-                _currently_tracing.reset(token)
+            with start_span(func.__qualname__, {"fn.type": "child"}) as _span:
+                try:
+                    result = await func(*args, **kwargs)
+                    end = time.time()
+                    duration = end - start
+                    logging.log_info(f"Ok.", fn_type="child", function=func.__qualname__, duration=duration)
+                    logging.record_metric(func.__qualname__, duration)
+                    return result
+                except Exception as e:
+                    logging.log_error(f"Error: {str(e)}", fn_type="child", function=func.__qualname__)
+                    record_exception(_span, e)
+                    logging.raise_exception_to_log(e, str(e), stack=False)
+                    raise
+                finally:
+                    Setup.decrement_level()
+                    _currently_tracing.reset(token)
         
         # Mark as wrapped
         setattr(wrapper, _TRACED_ATTRIBUTE, True)
@@ -254,20 +257,22 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             Setup.increment_level()
             logging.log_info(f"called...", fn_type="child", function=func.__qualname__)
             start = time.time()
-            try:
-                result = func(*args, **kwargs)
-                end = time.time()
-                duration = end - start
-                logging.log_info(f"Ok.", fn_type="child", function=func.__qualname__, duration=duration)
-                logging.record_metric(func.__qualname__, duration)
-                return result
-            except Exception as e:
-                logging.log_error(f"Error: {str(e)}", fn_type="child", function=func.__qualname__)
-                logging.raise_exception_to_log(e, str(e), stack=False)
-                raise
-            finally:
-                Setup.decrement_level()
-                _currently_tracing.reset(token)
+            with start_span(func.__qualname__, {"fn.type": "child"}) as _span:
+                try:
+                    result = func(*args, **kwargs)
+                    end = time.time()
+                    duration = end - start
+                    logging.log_info(f"Ok.", fn_type="child", function=func.__qualname__, duration=duration)
+                    logging.record_metric(func.__qualname__, duration)
+                    return result
+                except Exception as e:
+                    logging.log_error(f"Error: {str(e)}", fn_type="child", function=func.__qualname__)
+                    record_exception(_span, e)
+                    logging.raise_exception_to_log(e, str(e), stack=False)
+                    raise
+                finally:
+                    Setup.decrement_level()
+                    _currently_tracing.reset(token)
         
         # Mark as wrapped
         setattr(wrapper, _TRACED_ATTRIBUTE, True)
@@ -473,17 +478,20 @@ def trace(
                             managers = [trace_children_in_module(t, make_child_decorator(child_trace_decorator)) for t in targets]
                             for m in managers:
                                 await m.__aenter__()
-                        result = await func(*args, **kwargs)
-                        end = time.time()
-                        duration = end - start
-                        logging.log_info(f"Ok.", fn_type="parent", function=func.__qualname__, duration=duration)
-                        logging.record_metric(func.__qualname__, duration)
-                        return result
-                    except Exception as e:
-                        logging.log_error(f"Error: {str(e)}", fn_type="parent", function=func.__qualname__)
-                        error_message = f"{message} -> {str(e)}" if message else str(e)
-                        logging.raise_exception_to_log(e, error_message, stack)
-                        raise
+                        with start_span(func.__qualname__, {"fn.type": "parent"}) as _span:
+                            try:
+                                result = await func(*args, **kwargs)
+                                end = time.time()
+                                duration = end - start
+                                logging.log_info(f"Ok.", fn_type="parent", function=func.__qualname__, duration=duration)
+                                logging.record_metric(func.__qualname__, duration)
+                                return result
+                            except Exception as e:
+                                logging.log_error(f"Error: {str(e)}", fn_type="parent", function=func.__qualname__)
+                                error_message = f"{message} -> {str(e)}" if message else str(e)
+                                record_exception(_span, e)
+                                logging.raise_exception_to_log(e, error_message, stack)
+                                raise
                     finally:
                         # Clean up context managers even if an exception occurs
                         for m in reversed(managers):
@@ -539,17 +547,20 @@ def trace(
                             managers = [trace_children_in_module(t, make_child_decorator(child_trace_decorator)) for t in targets]
                             for m in managers:
                                 m.__enter__()
-                        result = func(*args, **kwargs)
-                        end = time.time()
-                        duration = end - start
-                        logging.log_info(f"Ok.", fn_type="parent", function=func.__qualname__, duration=duration)
-                        logging.record_metric(func.__qualname__, duration)
-                        return result
-                    except Exception as e:
-                        logging.log_error(f"Error: {str(e)}", function=func.__qualname__)
-                        error_message = f"{message} -> {str(e)}" if message else str(e)
-                        logging.raise_exception_to_log(e, error_message, stack)
-                        raise
+                        with start_span(func.__qualname__, {"fn.type": "parent"}) as _span:
+                            try:
+                                result = func(*args, **kwargs)
+                                end = time.time()
+                                duration = end - start
+                                logging.log_info(f"Ok.", fn_type="parent", function=func.__qualname__, duration=duration)
+                                logging.record_metric(func.__qualname__, duration)
+                                return result
+                            except Exception as e:
+                                logging.log_error(f"Error: {str(e)}", function=func.__qualname__)
+                                error_message = f"{message} -> {str(e)}" if message else str(e)
+                                record_exception(_span, e)
+                                logging.raise_exception_to_log(e, error_message, stack)
+                                raise
                     finally:
                         # Clean up context managers even if an exception occurs
                         for m in reversed(managers):
