@@ -14,6 +14,9 @@ A dependency-free, lightweight Python tracing and logging library with hierarchi
 - 🚀 **High Performance**: Buffered logging and optimized output
  - 🌐 **OpenTelemetry Bridge (optional)**: Emit spans to OTLP/console, or export batches to S3/Azure Blob
 
+### New
+- 🧭 **Interactive Viewer**: Explore hierarchical traces with input/output previews, time, CPU, and memory
+
 ## Installation
 
 ```bash
@@ -162,6 +165,34 @@ log = Logging(log_format="csv")
 log = Logging(log_format="logfmt")
 # Output: time=2025-05-13T10:00:00 level=INFO message="Log message" data.context=value
 ```
+
+### 5. Interactive Viewer (Live Trace UI)
+
+The built-in viewer renders hierarchical traces with argument/result previews and timing/CPU/memory metrics.
+
+Requirements:
+- Set the log format to JSON so the viewer can parse entries.
+
+```python
+from pyeztrace.custom_logging import Logging
+from pyeztrace.setup import Setup
+
+Setup.initialize("MyApp", show_metrics=True)
+log = Logging(log_format="json")
+```
+
+Run your app to generate logs, then start the viewer pointing to your log file:
+
+```bash
+python -m pyeztrace.cli serve logs/app.log --host 127.0.0.1 --port 8765
+# open http://127.0.0.1:8765
+```
+
+What you get:
+- Hierarchical tree (parent/child calls)
+- Input previews (args/kwargs), output preview (result)
+- Time (duration), CPU time, memory delta and peak
+- Filter by function or error, auto-refresh every 2.5s
 
 ### 5. Async Support
 

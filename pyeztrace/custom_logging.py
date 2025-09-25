@@ -81,7 +81,8 @@ class Logging:
     _format = os.environ.get("EZTRACE_LOG_FORMAT", "color")  # color, plain, json, csv, logfmt
     _metrics_lock = threading.Lock()
     _metrics: Dict[str, Dict[str, Any]] = {}
-    _buffer_enabled = True  # Enable buffering by default
+    _buffer_enabled = False  # Disable buffering by default
+    _show_data_in_cli = os.environ.get("EZTRACE_SHOW_DATA_IN_CLI", "0").lower() in {"1", "true", "yes", "on"}
     
     COLOR_CODES = {
         'DEBUG': '\033[36m',  # Cyan
@@ -166,13 +167,17 @@ class Logging:
         # Merge context with kwargs
         context = LogContext.get_current_context()
         merged_kwargs = {**context, **kwargs}
+        include_data_in_output = Logging._show_data_in_cli
+        
+        if Logging._format == "json":
+            include_data_in_output = True  # JSON logs must include data for structured consumers
         
         project = Setup.get_project() if Setup.is_setup_done() else "?"
         level_str = level.upper()
         log_type = fn_type or ""
         func = function or context.get('function', '')
         log_format = Logging._format
-        data = f" Data: {merged_kwargs}" if merged_kwargs else ""
+        data_str = f" Data: {merged_kwargs}" if include_data_in_output and merged_kwargs else ""
         timestamp = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime())
         try:
             level_indent = int(Setup.get_level())
@@ -187,14 +192,14 @@ class Logging:
         color = Logging.COLOR_CODES.get(level_str, '')
         reset = Logging.COLOR_CODES['RESET']
         if log_format == "color":
-            msg = f"{color}{timestamp} - {level_str} - [{project}] {tree} {func} {message}{reset}{data}"
+            msg = f"{color}{timestamp} - {level_str} - [{project}] {tree} {func} {message}{reset}{data_str}"
             if duration is not None:
                 msg += f" (took {duration:.5f} seconds)"
             if level_indent == 0 and (log_type == 'parent' or log_type == ''):
                 msg = "\n" + msg
             return msg
         elif log_format == "plain":
-            msg = f"{timestamp} - {level_str} - [{project}] {tree}{log_type} {func} {message}{data}"
+            msg = f"{timestamp} - {level_str} - [{project}] {tree}{log_type} {func} {message}{data_str}"
             if duration is not None:
                 msg += f" (took {duration:.5f} seconds)"
             if level_indent == 0 and (log_type == 'parent' or log_type == ''):
@@ -202,7 +207,7 @@ class Logging:
             return msg
         # JSON
         elif log_format == "json":
-            data = {
+            payload = {
                 "timestamp": timestamp,
                 "level": level_str,
                 "project": project,
@@ -212,20 +217,24 @@ class Logging:
                 "data": merged_kwargs,
             }
             if duration is not None:
-                data["duration"] = duration
-            return json.dumps(data)
+                payload["duration"] = duration
+            return json.dumps(payload)
         # CSV
         elif log_format == "csv":
             output = io.StringIO()
             writer = csv.writer(output)
-            row = [timestamp, level_str, project, log_type, func, message, kwargs]
+            row = [timestamp, level_str, project, log_type, func, message]
+            if include_data_in_output and merged_kwargs:
+                row.append(merged_kwargs)
             if duration is not None:
                 row.append(f"{duration:.5f}")
             writer.writerow(row)
             return output.getvalue().strip()
         # logfmt
         elif log_format == "logfmt":
-            msg = f"time={timestamp} level={level_str} project={project} fn_type={log_type} function={func} message=\"{message}\" data={kwargs}"
+            msg = f"time={timestamp} level={level_str} project={project} fn_type={log_type} function={func} message=\"{message}\""
+            if include_data_in_output and merged_kwargs:
+                msg += f" data={json.dumps(merged_kwargs)}"
             if duration is not None:
                 msg += f" duration={duration:.5f}"
             return msg
@@ -234,7 +243,7 @@ class Logging:
             return log_format(level, message, fn_type, function, duration, **kwargs)
         # Fallback
         else:
-            msg = f"{timestamp} - {level_str} - [{project}]|{log_type} {func} {message} {data}"
+            msg = f"{timestamp} - {level_str} - [{project}]|{log_type} {func} {message}"
             if duration is not None:
                 msg += f" (took {duration:.5f} seconds)"
             return msg
@@ -457,17 +466,33 @@ class Logging:
                 Logging._flush_thread_metrics(thread_id)
                 
         if not Logging._metrics:
-            Logging.log_warning("No performance metrics collected.")
             return
-        Logging.log_info("\n=== Tracing Performance Metrics Summary ===")
-        Logging.log_info(f"{'Function':40} {'Calls':>8} {'Total(s)':>12} {'Avg(s)':>12}")
-        Logging.log_info("-" * 76)
+        metrics_payload = []
+        total_calls = 0
         for func, m in sorted(Logging._metrics.items()):
             count = m["count"]
             total = m["total"]
             avg = total / count if count else 0.0
-            Logging.log_info(f"{func:40} {count:8d} {total:12.5f} {avg:12.5f}")
-        Logging.log_info("=" * 76)
+            total_calls += count
+            metrics_payload.append({
+                "function": func,
+                "calls": count,
+                "total_seconds": round(total, 6),
+                "avg_seconds": round(avg, 6)
+            })
+
+        Logging.log_info(
+            "Performance metrics summary",
+            fn_type="metrics",
+            function="metrics_summary",
+            event="metrics_summary",
+            status="success",
+            metrics=metrics_payload,
+            total_functions=len(metrics_payload),
+            total_calls=total_calls,
+            generated_at=time.time()
+        )
+
 
     @staticmethod
     def disable_buffering():
