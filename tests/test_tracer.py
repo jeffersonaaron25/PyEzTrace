@@ -56,3 +56,45 @@ def test_trace_async(monkeypatch):
         return "ok"
     result = asyncio.run(foo())
     assert result == "ok"
+
+
+def test_trace_class_preserves_class_attributes(monkeypatch):
+    setup.Setup.initialize("EZTRACER_TEST_CLASS_ATTR", show_metrics=False)
+
+    class Dependency:
+        pass
+
+    @tracer.trace()
+    class Example:
+        helper_type = Dependency
+
+        def __init__(self):
+            self.helper = self.helper_type()
+
+    instance = Example()
+    assert isinstance(instance.helper, Dependency)
+    assert Example.helper_type is Dependency
+
+
+def test_trace_class_preserves_descriptors(monkeypatch):
+    setup.Setup.initialize("EZTRACER_TEST_CLASS_DESCRIPTOR", show_metrics=False)
+
+    calls = []
+
+    @tracer.trace()
+    class Example:
+        @staticmethod
+        def identity(value):
+            return value
+
+        @classmethod
+        def build(cls, value):
+            calls.append(cls)
+            return cls.identity(value)
+
+    assert Example.identity(42) == 42
+    assert Example.build("ok") == "ok"
+    assert calls[-1] is Example
+    # Ensure the descriptor types remain intact
+    assert isinstance(Example.__dict__["identity"], staticmethod)
+    assert isinstance(Example.__dict__["build"], classmethod)

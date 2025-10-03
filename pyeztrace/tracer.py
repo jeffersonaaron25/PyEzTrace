@@ -604,34 +604,61 @@ def trace(
 
         # Special case: decorator applied to a class
         if inspect.isclass(func):
-            # For classes, we need to wrap all methods
-            class_name = func.__name__
-            
             # Copy the class dictionary to avoid modifying during iteration
             attrs = dict(func.__dict__)
-            
-            # Wrap each method with trace
+
+            # Wrap each method with trace while preserving descriptor semantics
             for name, attr in attrs.items():
-                if callable(attr) and not hasattr(attr, _TRACED_ATTRIBUTE):
-                    # Skip special methods that shouldn't be traced
-                    if name.startswith('__') and name not in ['__init__', '__call__']:
-                        continue
-                    
-                    # When a method is called, we need to make sure the method name includes the class name
-                    method_trace = trace(
-                        message=message,
-                        stack=stack,
-                        include=include,
-                        exclude=exclude
-                    )
-                    
-                    # Apply trace to the method and update it in the class
-                    wrapped_method = method_trace(attr)
+                # Skip special methods that shouldn't be traced
+                if name.startswith('__') and name not in ['__init__', '__call__']:
+                    continue
+
+                descriptor_type = None
+                original_callable = None
+                extra_descriptor_attrs = {}
+
+                if isinstance(attr, staticmethod):
+                    original_callable = attr.__func__
+                    descriptor_type = staticmethod
+                    if hasattr(attr, "__isabstractmethod__"):
+                        extra_descriptor_attrs["__isabstractmethod__"] = attr.__isabstractmethod__
+                elif isinstance(attr, classmethod):
+                    original_callable = attr.__func__
+                    descriptor_type = classmethod
+                    if hasattr(attr, "__isabstractmethod__"):
+                        extra_descriptor_attrs["__isabstractmethod__"] = attr.__isabstractmethod__
+                elif _safe_to_wrap(attr):
+                    original_callable = attr
+                else:
+                    continue
+
+                if original_callable is None or not _safe_to_wrap(original_callable) or hasattr(original_callable, _TRACED_ATTRIBUTE):
+                    continue
+
+                # When a method is called, we need to make sure the method name includes the class name
+                method_trace = trace(
+                    message=message,
+                    stack=stack,
+                    include=include,
+                    exclude=exclude
+                )
+
+                wrapped_method = method_trace(original_callable)
+
+                if descriptor_type is not None:
+                    wrapped_descriptor = descriptor_type(wrapped_method)
+                    for attr_name, attr_value in extra_descriptor_attrs.items():
+                        try:
+                            setattr(wrapped_descriptor, attr_name, attr_value)
+                        except (AttributeError, TypeError):
+                            setattr(wrapped_method, attr_name, attr_value)
+                    setattr(func, name, wrapped_descriptor)
+                else:
                     setattr(func, name, wrapped_method)
-            
+
             # Mark the class as traced
             setattr(func, _TRACED_ATTRIBUTE, True)
-            
+
             return func
 
         import functools
