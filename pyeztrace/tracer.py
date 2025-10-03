@@ -5,7 +5,7 @@ import inspect
 import sys
 import threading
 import fnmatch
-from typing import Any, Callable, Optional, Sequence, Union, Dict, List, Set
+from typing import Any, Callable, Optional, Sequence, Union, Dict, List, Set, TypeVar
 import uuid
 try:
     import resource  # Unix-specific
@@ -233,7 +233,9 @@ class trace_children_in_module:
                     setattr(self.module_or_class, name, obj)
                 del ref_counter[key]
 
-def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+F = TypeVar("F", bound=Callable[..., Any])
+
+def child_trace_decorator(func: F) -> F:
     """
     Decorator for child functions: only logs if tracing_active is True.
     """
@@ -465,6 +467,8 @@ def child_trace_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         setattr(wrapper, _TRACED_ATTRIBUTE, True)
         return wrapper
 
+T = TypeVar("T")
+
 def trace(
     message: Optional[str] = None,
     stack: bool = False,
@@ -473,7 +477,7 @@ def trace(
     exclude: Optional[Sequence[str]] = None,
     recursive_depth: int = 0,  # 0 = only direct module, 1+ = levels of imports to trace
     module_pattern: Optional[str] = None  # e.g., "myapp.*" to limit recursion scope
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+) -> Callable[[T], T]:
     """
     Decorator for parent function. Enables tracing for all child functions in the given modules or classes.
     
@@ -554,7 +558,7 @@ def trace(
             
         return imported_modules
 
-    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+    def decorator(func: T) -> T:
         def _get_targets() -> List[Any]:
             """Get modules to trace based on parameters and recursive settings."""
             # Start with directly specified modules
@@ -604,34 +608,61 @@ def trace(
 
         # Special case: decorator applied to a class
         if inspect.isclass(func):
-            # For classes, we need to wrap all methods
-            class_name = func.__name__
-            
             # Copy the class dictionary to avoid modifying during iteration
             attrs = dict(func.__dict__)
-            
-            # Wrap each method with trace
+
+            # Wrap each method with trace while preserving descriptor semantics
             for name, attr in attrs.items():
-                if callable(attr) and not hasattr(attr, _TRACED_ATTRIBUTE):
-                    # Skip special methods that shouldn't be traced
-                    if name.startswith('__') and name not in ['__init__', '__call__']:
-                        continue
-                    
-                    # When a method is called, we need to make sure the method name includes the class name
-                    method_trace = trace(
-                        message=message,
-                        stack=stack,
-                        include=include,
-                        exclude=exclude
-                    )
-                    
-                    # Apply trace to the method and update it in the class
-                    wrapped_method = method_trace(attr)
+                # Skip special methods that shouldn't be traced
+                if name.startswith('__') and name not in ['__init__', '__call__']:
+                    continue
+
+                descriptor_type = None
+                original_callable = None
+                extra_descriptor_attrs = {}
+
+                if isinstance(attr, staticmethod):
+                    original_callable = attr.__func__
+                    descriptor_type = staticmethod
+                    if hasattr(attr, "__isabstractmethod__"):
+                        extra_descriptor_attrs["__isabstractmethod__"] = attr.__isabstractmethod__
+                elif isinstance(attr, classmethod):
+                    original_callable = attr.__func__
+                    descriptor_type = classmethod
+                    if hasattr(attr, "__isabstractmethod__"):
+                        extra_descriptor_attrs["__isabstractmethod__"] = attr.__isabstractmethod__
+                elif _safe_to_wrap(attr):
+                    original_callable = attr
+                else:
+                    continue
+
+                if original_callable is None or not _safe_to_wrap(original_callable) or hasattr(original_callable, _TRACED_ATTRIBUTE):
+                    continue
+
+                # When a method is called, we need to make sure the method name includes the class name
+                method_trace = trace(
+                    message=message,
+                    stack=stack,
+                    include=include,
+                    exclude=exclude
+                )
+
+                wrapped_method = method_trace(original_callable)
+
+                if descriptor_type is not None:
+                    wrapped_descriptor = descriptor_type(wrapped_method)
+                    for attr_name, attr_value in extra_descriptor_attrs.items():
+                        try:
+                            setattr(wrapped_descriptor, attr_name, attr_value)
+                        except (AttributeError, TypeError):
+                            setattr(wrapped_method, attr_name, attr_value)
+                    setattr(func, name, wrapped_descriptor)
+                else:
                     setattr(func, name, wrapped_method)
-            
+
             # Mark the class as traced
             setattr(func, _TRACED_ATTRIBUTE, True)
-            
+
             return func
 
         import functools
