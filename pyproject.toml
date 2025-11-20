@@ -8,7 +8,7 @@ version = "0.0.10"
 description = "A dependency-free, lightweight Python tracing and logging library"
 readme = "README.md"
 authors = [{ name = "Jefferson Nelsson", email = "jefferson.nelsson@gmail.com" }]
-license = "MIT"
+license = { text = "MIT" }
 classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
