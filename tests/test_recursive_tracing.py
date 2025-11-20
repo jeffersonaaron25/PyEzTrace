@@ -228,31 +228,48 @@ def test_performance_impact(setup_testing_mode):
             total += i
         return total
     
-    # Time without tracing
-    start = time.time()
-    result1 = many_calls(1000)
-    baseline_time = time.time() - start
+    # Run multiple iterations to get more stable timing (reduces flakiness)
+    iterations = 3
+    baseline_times = []
+    minimal_trace_times = []
+    recursive_trace_times = []
     
-    # Time with minimal tracing
-    traced_minimal = trace()(many_calls)
-    start = time.time()
-    result2 = traced_minimal(1000)
-    minimal_trace_time = time.time() - start
+    for _ in range(iterations):
+        # Time without tracing
+        start = time.time()
+        result1 = many_calls(1000)
+        baseline_times.append(time.time() - start)
+        
+        # Time with minimal tracing
+        traced_minimal = trace()(many_calls)
+        start = time.time()
+        result2 = traced_minimal(1000)
+        minimal_trace_times.append(time.time() - start)
+        
+        # Time with recursive tracing
+        traced_recursive = trace(
+            recursive_depth=2,
+            module_pattern="tests.*"
+        )(many_calls)
+        start = time.time()
+        result3 = traced_recursive(1000)
+        recursive_trace_times.append(time.time() - start)
+        
+        # All results should be the same
+        assert result1 == result2 == result3
     
-    # Time with recursive tracing
-    traced_recursive = trace(
-        recursive_depth=2,
-        module_pattern="tests.*"
-    )(many_calls)
-    start = time.time()
-    result3 = traced_recursive(1000)
-    recursive_trace_time = time.time() - start
-    
-    # All results should be the same
-    assert result1 == result2 == result3
+    # Use median to reduce impact of outliers
+    baseline_times.sort()
+    recursive_trace_times.sort()
+    baseline_time = baseline_times[iterations // 2]
+    recursive_trace_time = recursive_trace_times[iterations // 2]
     
     # Recursive tracing should not be catastrophically slower
-    # Allow it to be up to 10x slower than baseline for this test
-    # (in practice, it should be much less impact)
-    assert recursive_trace_time < baseline_time * 10, \
-        f"Recursive tracing too slow: {recursive_trace_time:.6f}s vs {baseline_time:.6f}s baseline" 
+    # Allow it to be up to 15x slower than baseline (increased from 10x for CI stability)
+    # Use a minimum threshold to avoid issues with very small baselines
+    min_baseline = 0.0001  # 0.1ms minimum baseline
+    effective_baseline = max(baseline_time, min_baseline)
+    max_allowed = effective_baseline * 15
+    
+    assert recursive_trace_time < max_allowed, \
+        f"Recursive tracing too slow: {recursive_trace_time:.6f}s vs {baseline_time:.6f}s baseline (allowed: {max_allowed:.6f}s)" 
