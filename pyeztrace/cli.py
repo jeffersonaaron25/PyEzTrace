@@ -8,6 +8,27 @@ from pathlib import Path
 from typing import List, Optional
 import re
 import os
+import sys
+
+def _get_version():
+    """Get the package version dynamically."""
+    try:
+        # Python 3.8+ standard library approach
+        from importlib.metadata import version
+        return version('pyeztrace')
+    except ImportError:
+        # Fallback for Python < 3.8
+        try:
+            import pkg_resources
+            return pkg_resources.get_distribution('pyeztrace').version
+        except Exception:
+            import tomllib
+            try:
+                with open('pyproject.toml', 'rb') as f:
+                    data = tomllib.load(f)
+                    return data['project']['version']
+            except Exception:
+                return 'unknown'
 
 class LogAnalyzer:
     def __init__(self, log_file: Path):
@@ -115,8 +136,20 @@ class LogAnalyzer:
         return True
 
 def main():
-    parser = argparse.ArgumentParser(description="PyEzTrace Log Analyzer")
-    subparsers = parser.add_subparsers(dest='command')
+    """Main entry point for the pyeztrace CLI command."""
+    parser = argparse.ArgumentParser(
+        description="PyEzTrace Log Analyzer and Viewer",
+        prog="pyeztrace"
+    )
+    
+    # Add version argument (must be before subparsers)
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'%(prog)s {_get_version()}'
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
     # Analyze / print subcommand (default)
     parser_print = subparsers.add_parser('print', help='Print or analyze logs')
@@ -150,7 +183,7 @@ def main():
     parser.add_argument('--errors', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--format', choices=['text', 'json'], default='text', help=argparse.SUPPRESS)
     # Note: log_file argument removed from main parser to avoid conflicts with subparsers
-
+    
     args = parser.parse_args()
 
     # If no command provided, show help (backward compatibility removed due to subparser conflicts)

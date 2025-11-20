@@ -1,9 +1,11 @@
 import pytest
 from pyeztrace import setup, tracer
 
+
 @pytest.fixture(autouse=True)
 def reset_setup():
     setup.Setup.reset()
+
 
 def test_trace_decorator_basic(monkeypatch):
     setup.Setup.initialize("EZTRACER_TEST", show_metrics=True)
@@ -18,12 +20,16 @@ def test_trace_decorator_basic(monkeypatch):
     assert result == 6
     assert calls == [3]
 
+
 def test_trace_decorator_include_exclude(monkeypatch):
     setup.Setup.initialize("EZTRACER_TEST2", show_metrics=False)
     called = []
 
-    def bar(): called.append("bar")
-    def baz(): called.append("baz")
+    def bar():
+        called.append("bar")
+
+    def baz():
+        called.append("baz")
 
     import types
     mod = types.ModuleType("mod")
@@ -39,21 +45,27 @@ def test_trace_decorator_include_exclude(monkeypatch):
     assert "bar" in called
     assert "baz" in called  # baz is not traced, but still called
 
+
 def test_child_trace_decorator_tracing(monkeypatch):
     setup.Setup.initialize("EZTRACER_TEST3", show_metrics=False)
+
     @tracer.child_trace_decorator
     def foo():
         return 42
+
     assert foo() == 42
+
 
 def test_trace_async(monkeypatch):
     import asyncio
+
     setup.Setup.initialize("EZTRACER_TEST4", show_metrics=False)
 
     @tracer.trace()
     async def foo():
         await asyncio.sleep(0.01)
         return "ok"
+
     result = asyncio.run(foo())
     assert result == "ok"
 
@@ -98,3 +110,99 @@ def test_trace_class_preserves_descriptors(monkeypatch):
     # Ensure the descriptor types remain intact
     assert isinstance(Example.__dict__["identity"], staticmethod)
     assert isinstance(Example.__dict__["build"], classmethod)
+
+
+def test_safe_preview_value_redacts_nested_structures():
+    redaction = tracer._build_redaction_settings(["password", "token"])
+    value = {
+        "username": "alice",
+        "password": "hunter2",
+        "nested": {"token": "abc", "keep": "ok"},
+        "items": [
+            {"token": "list-secret", "visible": True},
+            "safe",
+        ],
+    }
+
+    preview = tracer._safe_preview_value(value, redaction=redaction)
+
+    assert preview["password"] == "<redacted>"
+    assert preview["nested"]["token"] == "<redacted>"
+    assert preview["nested"]["keep"] == "ok"
+    assert preview["items"][0]["token"] == "<redacted>"
+    assert preview["items"][0]["visible"] is True
+
+
+def test_safe_preview_value_redacts_by_value_pattern():
+    redaction = tracer._build_redaction_settings(redact_value_patterns=[r"secret\d+"])
+    value = ["public", "secret123", {"other": "secret999"}]
+
+    preview = tracer._safe_preview_value(value, redaction=redaction)
+
+    assert preview[0] == "public"
+    assert preview[1] == "<redacted>"
+    assert preview[2]["other"] == "<redacted>"
+
+
+def test_safe_preview_value_uses_presets_for_common_patterns():
+    redaction = tracer._build_redaction_settings(redact_value_patterns=["pii"])
+    value = {"field1": "alice@example.com", "field2": "123-45-6789", "ok": "fine"}
+
+    preview = tracer._safe_preview_value(value, redaction=redaction)
+
+    assert preview["field1"] == "<redacted>"
+    assert preview["field2"] == "<redacted>"
+    assert preview["ok"] == "fine"
+
+
+def test_trace_applies_environment_redaction(monkeypatch):
+    monkeypatch.setenv("EZTRACE_REDACT_KEYS", "secret,token")
+    setup.Setup.initialize("EZTRACER_ENV_REDACTION", show_metrics=False)
+
+    logs = []
+
+    def capture_log_info(message, **kwargs):
+        logs.append({"message": message, **kwargs})
+
+    monkeypatch.setattr(tracer.logging, "log_info", capture_log_info)
+    monkeypatch.setattr(tracer.logging, "record_metric", lambda *args, **kwargs: None)
+
+    @tracer.trace()
+    def foo(secret, token, visible):
+        return {"secret": secret, "token": token, "visible": visible}
+
+    foo(secret="s", token="t", visible="ok")
+
+    start_log = next(log for log in logs if "kwargs_preview" in log)
+    assert start_log["kwargs_preview"]["secret"] == "<redacted>"
+    assert start_log["kwargs_preview"]["token"] == "<redacted>"
+
+    result_log = next(log for log in reversed(logs) if "result_preview" in log)
+    assert result_log["result_preview"]["secret"] == "<redacted>"
+    assert result_log["result_preview"]["token"] == "<redacted>"
+    assert result_log["result_preview"]["visible"] == "ok"
+
+
+def test_trace_applies_value_pattern_environment_redaction(monkeypatch):
+    monkeypatch.setenv("EZTRACE_REDACT_VALUE_PATTERNS", r"secret\d+")
+    setup.Setup.initialize("EZTRACER_ENV_VALUE_REDACTION", show_metrics=False)
+
+    logs = []
+
+    def capture_log_info(message, **kwargs):
+        logs.append({"message": message, **kwargs})
+
+    monkeypatch.setattr(tracer.logging, "log_info", capture_log_info)
+    monkeypatch.setattr(tracer.logging, "record_metric", lambda *args, **kwargs: None)
+
+    @tracer.trace()
+    def foo(data):
+        return {"response": data}
+
+    foo(data="secret123")
+
+    start_log = next(log for log in logs if "kwargs_preview" in log)
+    assert start_log["kwargs_preview"]["data"] == "<redacted>"
+
+    result_log = next(log for log in reversed(logs) if "result_preview" in log)
+    assert result_log["result_preview"]["response"] == "<redacted>"

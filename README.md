@@ -138,6 +138,36 @@ def service_function():
 Using `module_pattern` is strongly recommended when enabling recursive tracing to prevent tracing system libraries or third-party packages. Be sure to limit recursive tracing to avoid unexpected issues
 and unnecessary traces.
 
+#### Redacting sensitive data
+
+You can hide sensitive fields from argument/result previews using `redact_keys`,
+`redact_pattern`, or value-based patterns that match sensitive payloads even when the
+keys are unknown:
+
+```python
+@trace(
+    redact_keys=["password", "token"],
+    redact_value_patterns=[r"secret\d+"],
+    redact_presets=["pii"],  # Enable built-in PII/PHI patterns (email, SSN, phone, etc.) Currently allowed: "pii", "phi"
+)
+def process(user, password, token):
+    return {"user": user, "token": token, "status": "ok", "email": "alice@example.com"}
+```
+
+Environment variables provide a global default for all traces:
+
+```bash
+export EZTRACE_REDACT_KEYS="password,token,secret"
+export EZTRACE_REDACT_PATTERN="(?i)auth|secret"
+export EZTRACE_REDACT_VALUE_PATTERNS="secret\d+,\b\d{3}-\d{2}-\d{4}\b"
+export EZTRACE_REDACT_PRESETS="pii,phi"
+```
+
+Both lists and regex settings are applied to nested dictionaries and lists so you can
+safely log complex structures without leaking secrets.
+You can also set global defaults in code with `pyeztrace.set_global_redaction(...)`,
+which accepts the same key, regex, value pattern, and preset parameters.
+
 ### 3. Context Management
 
 Thread-safe context propagation for structured logging:
@@ -190,7 +220,7 @@ log = Logging(log_format="json")
 Run your app to generate logs, then start the viewer pointing to your log file:
 
 ```bash
-python -m pyeztrace.cli serve logs/app.log --host 127.0.0.1 --port 8765
+pyeztrace serve logs/app.log --host 127.0.0.1 --port 8765
 # open http://127.0.0.1:8765
 ```
 
