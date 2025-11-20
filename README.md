@@ -39,6 +39,12 @@ pip install "pyeztrace[azure]"
 pip install "pyeztrace[all]"
 ```
 
+To run the full test suite, including the OpenTelemetry bridge coverage, install the OTEL extra:
+
+```bash
+pip install "pyeztrace[otel]"
+```
+
 ## Quick Start
 
 ```python

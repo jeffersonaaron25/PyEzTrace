@@ -8,9 +8,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
+pytest.importorskip("opentelemetry", reason="OpenTelemetry bridge tests require optional dependencies")
+
+from opentelemetry import trace as ot_trace
+
 from pyeztrace import otel
 from pyeztrace.setup import Setup
-from opentelemetry import trace as ot_trace
 
 
 @pytest.fixture(autouse=True)
