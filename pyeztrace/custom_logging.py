@@ -93,7 +93,7 @@ class Logging:
         'RESET': '\033[0m',
     }
 
-    def __init__(self, log_format: Optional[Union[str, Callable[..., str]]] = config.format) -> None:
+    def __init__(self, log_format: Optional[Union[str, Callable[..., str]]] = config.format, disable_file_logging: Optional[bool] = None) -> None:
         """
         Initialize the Logging class and set up the logger (only once).
         log_format: 'color', 'plain', 'json', 'csv', 'logfmt', or a callable
@@ -119,6 +119,11 @@ class Logging:
         if log_format:
             Logging._format = log_format
         if not Logging._configured:
+            disable_files = Setup.get_disable_file_logging()
+            if disable_file_logging is not None:
+                disable_files = disable_file_logging
+            if Setup.is_testing_mode():
+                disable_files = True
             logger = logging.getLogger("pyeztrace")
             logger.setLevel(getattr(logging, config.log_level))
             logger.propagate = False  # Prevent logs from propagating to root logger
@@ -131,34 +136,39 @@ class Logging:
             # Set up console handler
             stream_handler = logging.StreamHandler(sys.__stdout__)
             stream_handler.setFormatter(formatter)
-            
-            # Set up rotating file handler
-            log_path = config.get_log_path()
-            os.makedirs(log_path.parent, exist_ok=True)
 
-            # Close and remove any existing handlers for this file
-            for handler in logger.handlers[:]:
-                if isinstance(handler, logging.FileHandler) and handler.baseFilename == str(log_path):
-                    handler.close()
-                    logger.removeHandler(handler)
+            if not disable_files:
+                # Set up rotating file handler
+                log_path = config.get_log_path()
+                os.makedirs(log_path.parent, exist_ok=True)
 
-            file_handler = RotatingFileHandler(
-                filename=str(log_path),
-                maxBytes=config.max_size,
-                backupCount=config.backup_count,
-                encoding='utf-8'
-            )
-            file_handler.setFormatter(formatter)
+                # Close and remove any existing handlers for this file
+                for handler in logger.handlers[:]:
+                    if isinstance(handler, logging.FileHandler) and handler.baseFilename == str(log_path):
+                        handler.close()
+                        logger.removeHandler(handler)
 
-            # Use buffered handlers for better performance
-            if Logging._buffer_enabled:
-                buffered_stream = BufferedHandler(stream_handler, flush_interval=Logging._buffer_flush_interval)
-                buffered_file = BufferedHandler(file_handler, flush_interval=Logging._buffer_flush_interval)
-                logger.addHandler(buffered_stream)
-                logger.addHandler(buffered_file)
+
+                file_handler = RotatingFileHandler(
+                    filename=str(log_path),
+                    maxBytes=config.max_size,
+                    backupCount=config.backup_count,
+                    encoding='utf-8'
+                )
+                file_handler.setFormatter(formatter)
+
+                # Use buffered handlers for better performance
+                if Logging._buffer_enabled:
+                    buffered_stream = BufferedHandler(stream_handler, flush_interval=Logging._buffer_flush_interval)
+                    buffered_file = BufferedHandler(file_handler, flush_interval=Logging._buffer_flush_interval)
+                    logger.addHandler(buffered_stream)
+                    logger.addHandler(buffered_file)
+                else:
+                    logger.addHandler(stream_handler)
+                    logger.addHandler(file_handler)
             else:
-                logger.addHandler(stream_handler)
-                logger.addHandler(file_handler)
+                # File logging disabled, only add stream handler
+                logger.addHandler(BufferedHandler(stream_handler, flush_interval=Logging._buffer_flush_interval) if Logging._buffer_enabled else stream_handler)
 
             Logging._configured = True
 

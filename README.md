@@ -240,6 +240,19 @@ config.log_file = "app.log"  # Custom log filename
 # must be setup before importing trace
 ```
 
+To run without writing log files (console-only output), set the configuration flag:
+
+```bash
+export EZTRACE_DISABLE_FILE_LOGGING=1
+```
+
+You can also opt out programmatically:
+
+```python
+Setup.initialize("MyApp", disable_file_logging=True)
+log = Logging(disable_file_logging=True)
+```
+
 ### 8. Error Handling and Debug Support
 
 ```python

@@ -2,6 +2,7 @@ import threading
 import asyncio
 import contextvars
 from pyeztrace import exceptions
+from pyeztrace.config import config
 
 
 class Setup:
@@ -13,6 +14,7 @@ class Setup:
     __thread_level = threading.local()
     __async_level = contextvars.ContextVar("async_level", default=0)
     __show_metrics = False
+    __disable_file_logging = None
     __lock = threading.Lock()
     __async_lock = asyncio.Lock()
     __metrics_registered = False
@@ -69,7 +71,7 @@ class Setup:
 
     # Synchronous methods (thread-safe)
     @classmethod
-    def initialize(cls, project="eztracer", show_metrics=False):
+    def initialize(cls, project="eztracer", show_metrics=False, disable_file_logging=None):
         with cls.__lock:
             if cls.__setup_done:
                 raise exceptions.SetupAlreadyDoneError("Setup is already done.")
@@ -77,6 +79,10 @@ class Setup:
             cls.__thread_level.value = 0
             cls.__project = project.upper()
             cls.__show_metrics = show_metrics
+            if disable_file_logging is None:
+                cls.__disable_file_logging = config.disable_file_logging
+            else:
+                cls.__disable_file_logging = disable_file_logging
             if show_metrics:
                 cls._register_metrics_handler()
 
@@ -191,6 +197,7 @@ class Setup:
             cls.__setup_done = False
             cls.__thread_level.value = 0
             cls.__show_metrics = False
+            cls.__disable_file_logging = None
         cls.__async_level.set(0)
 
     @classmethod
@@ -204,3 +211,15 @@ class Setup:
             if not cls.__setup_done:
                 raise exceptions.SetupNotDoneError("Setup must be done before setting project name.")
             cls.__project = project.upper()
+
+    @classmethod
+    def get_disable_file_logging(cls) -> bool:
+        with cls.__lock:
+            if cls.__disable_file_logging is None:
+                return config.disable_file_logging
+            return cls.__disable_file_logging
+
+    @classmethod
+    def set_disable_file_logging(cls, disable: bool) -> None:
+        with cls.__lock:
+            cls.__disable_file_logging = disable

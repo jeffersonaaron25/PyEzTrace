@@ -13,7 +13,8 @@ class LogConfig:
             'log_dir': self._get_env('LOG_DIR', 'logs'),
             'log_level': self._get_env('LOG_LEVEL', 'DEBUG'),
             'buffer_enabled': self._get_env_bool('BUFFER_ENABLED', False),
-            'buffer_flush_interval': float(self._get_env('BUFFER_FLUSH_INTERVAL', '1.0'))
+            'buffer_flush_interval': float(self._get_env('BUFFER_FLUSH_INTERVAL', '1.0')),
+            'disable_file_logging': self._get_env('DISABLE_FILE_LOGGING', '0').lower() in {'1', 'true', 'yes', 'on'},
         }
 
     def _get_env(self, key: str, default: str) -> str:
@@ -95,5 +96,13 @@ class LogConfig:
         if os.path.isabs(self.log_file):
             return Path(self.log_file)
         return Path(self.log_dir) / self.log_file
+
+    @property
+    def disable_file_logging(self) -> bool:
+        return self._config['disable_file_logging']
+
+    @disable_file_logging.setter
+    def disable_file_logging(self, value: bool) -> None:
+        self._config['disable_file_logging'] = value
 
 config = LogConfig()

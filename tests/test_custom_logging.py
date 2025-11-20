@@ -1,25 +1,35 @@
+import json
 import logging
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
+
+from pyeztrace.config import config
 from pyeztrace.custom_logging import Logging, BufferedHandler
 from pyeztrace.setup import Setup
 from pyeztrace.tracer import trace
-import time
-import json
-from concurrent.futures import ThreadPoolExecutor
-import random
-from pyeztrace.config import config
-
-
-def reset_logging_state():
-    logger = logging.getLogger("pyeztrace")
-    logger.handlers.clear()
-    Logging._configured = False
-    Logging._buffer_enabled = False
-    Logging._buffer_flush_interval = 1.0
 
 @pytest.fixture(autouse=True)
 def reset_setup():
     Setup.reset()
+
+
+@pytest.fixture
+def reset_logging_state():
+    logger = logging.getLogger("pyeztrace")
+    for handler in logger.handlers[:]:
+        if hasattr(handler, "close"):
+            handler.close()
+        logger.removeHandler(handler)
+    Logging._configured = False
+    yield
+    for handler in logger.handlers[:]:
+        if hasattr(handler, "close"):
+            handler.close()
+        logger.removeHandler(handler)
+    Logging._configured = False
 
 
 @pytest.fixture
@@ -31,8 +41,20 @@ def restore_log_config():
     config.buffer_flush_interval = original_flush_interval
 
 
-def test_buffering_respects_environment(monkeypatch, restore_log_config):
-    reset_logging_state()
+@pytest.fixture
+def restore_config():
+    original = {
+        "log_dir": config.log_dir,
+        "log_file": config.log_file,
+        "disable_file_logging": config.disable_file_logging,
+    }
+    yield
+    config.log_dir = original["log_dir"]
+    config.log_file = original["log_file"]
+    config.disable_file_logging = original["disable_file_logging"]
+
+
+def test_buffering_respects_environment(monkeypatch, restore_log_config, reset_logging_state):
     monkeypatch.setenv("EZTRACE_BUFFER_ENABLED", "true")
     monkeypatch.setenv("EZTRACE_BUFFER_FLUSH_INTERVAL", "2.5")
 
@@ -44,11 +66,9 @@ def test_buffering_respects_environment(monkeypatch, restore_log_config):
 
     assert len(buffered_handlers) == 2
     assert {h.flush_interval for h in buffered_handlers} == {2.5}
-    reset_logging_state()
 
 
-def test_buffering_respects_config(monkeypatch, restore_log_config):
-    reset_logging_state()
+def test_buffering_respects_config(monkeypatch, restore_log_config, reset_logging_state):
     monkeypatch.delenv("EZTRACE_BUFFER_ENABLED", raising=False)
     monkeypatch.delenv("EZTRACE_BUFFER_FLUSH_INTERVAL", raising=False)
 
@@ -63,7 +83,6 @@ def test_buffering_respects_config(monkeypatch, restore_log_config):
 
     assert len(buffered_handlers) == 2
     assert {h.flush_interval for h in buffered_handlers} == {0.2}
-    reset_logging_state()
 
 def test_log_info_and_error(monkeypatch):
     Setup.initialize("EZTRACER_LOG", show_metrics=False)
@@ -71,6 +90,47 @@ def test_log_info_and_error(monkeypatch):
     # Should not raise
     log.log_info("info message", function="test_func")
     log.log_error("error message", function="test_func")
+
+
+def test_disable_file_logging_via_config(tmp_path, reset_logging_state, restore_config):
+    config.log_dir = str(tmp_path / "logs")
+    config.log_file = "no-file.log"
+    config.disable_file_logging = True
+
+    Setup.initialize("NO_FILE", show_metrics=False)
+    log = Logging(log_format="plain")
+    log.log_info("info message", function="test_func")
+    Logging.flush_logs()
+
+    assert not config.get_log_path().exists()
+
+
+def test_disable_file_logging_via_initializer(tmp_path, reset_logging_state, restore_config):
+    config.log_dir = str(tmp_path / "logs")
+    config.log_file = "no-file.log"
+    config.disable_file_logging = False
+
+    Setup.initialize("NO_FILE", show_metrics=False, disable_file_logging=True)
+    log = Logging(log_format="plain")
+    log.log_info("info message", function="test_func")
+    Logging.flush_logs()
+
+    assert not config.get_log_path().exists()
+
+
+def test_file_logging_enabled_by_default(tmp_path, reset_logging_state, restore_config):
+    config.log_dir = str(tmp_path / "logs")
+    config.log_file = "file.log"
+    config.disable_file_logging = False
+
+    Setup.initialize("FILE_OK", show_metrics=False)
+    log = Logging(log_format="plain")
+    log.log_info("info message", function="test_func")
+    Logging.flush_logs()
+
+    log_path = config.get_log_path()
+    assert log_path.exists()
+    assert log_path.read_text().strip()
 
 def test_log_format_json(monkeypatch):
     Setup.initialize("EZTRACER_LOG2", show_metrics=False)
