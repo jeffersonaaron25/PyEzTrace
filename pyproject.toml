@@ -46,3 +46,6 @@ azure = [
 all = [
     "pyeztrace[otel,s3,azure]",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
