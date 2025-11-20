@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyeztrace"
-version = "0.0.7"
+version = "0.0.10"
 description = "A dependency-free, lightweight Python tracing and logging library"
 readme = "README.md"
 authors = [{ name = "Jefferson Nelsson", email = "jefferson.nelsson@gmail.com" }]
@@ -17,6 +17,8 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
     "Operating System :: OS Independent",
 ]

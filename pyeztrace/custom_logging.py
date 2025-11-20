@@ -81,7 +81,8 @@ class Logging:
     _format = os.environ.get("EZTRACE_LOG_FORMAT", "color")  # color, plain, json, csv, logfmt
     _metrics_lock = threading.Lock()
     _metrics: Dict[str, Dict[str, Any]] = {}
-    _buffer_enabled = False  # Disable buffering by default
+    _buffer_enabled = False  # Disable buffering by default (configurable via env)
+    _buffer_flush_interval = 1.0
     _show_data_in_cli = os.environ.get("EZTRACE_SHOW_DATA_IN_CLI", "0").lower() in {"1", "true", "yes", "on"}
     
     COLOR_CODES = {
@@ -99,6 +100,22 @@ class Logging:
         """
         if not Setup.is_setup_done():
             raise Exception("Setup is not done. Cannot initialize logging.")
+
+        env_buffer_enabled = os.environ.get("EZTRACE_BUFFER_ENABLED")
+        env_flush_interval = os.environ.get("EZTRACE_BUFFER_FLUSH_INTERVAL")
+        if env_buffer_enabled is not None:
+            Logging._buffer_enabled = env_buffer_enabled.lower() in {"1", "true", "yes", "on"}
+        else:
+            Logging._buffer_enabled = config.buffer_enabled
+
+        if env_flush_interval is not None:
+            try:
+                Logging._buffer_flush_interval = float(env_flush_interval)
+            except ValueError:
+                Logging._buffer_flush_interval = config.buffer_flush_interval
+        else:
+            Logging._buffer_flush_interval = config.buffer_flush_interval
+
         if log_format:
             Logging._format = log_format
         if not Logging._configured:
@@ -132,11 +149,11 @@ class Logging:
                 encoding='utf-8'
             )
             file_handler.setFormatter(formatter)
-            
+
             # Use buffered handlers for better performance
             if Logging._buffer_enabled:
-                buffered_stream = BufferedHandler(stream_handler)
-                buffered_file = BufferedHandler(file_handler)
+                buffered_stream = BufferedHandler(stream_handler, flush_interval=Logging._buffer_flush_interval)
+                buffered_file = BufferedHandler(file_handler, flush_interval=Logging._buffer_flush_interval)
                 logger.addHandler(buffered_stream)
                 logger.addHandler(buffered_file)
             else:

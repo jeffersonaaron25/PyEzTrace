@@ -1,15 +1,69 @@
+import logging
 import pytest
-from pyeztrace.custom_logging import Logging
+from pyeztrace.custom_logging import Logging, BufferedHandler
 from pyeztrace.setup import Setup
 from pyeztrace.tracer import trace
 import time
 import json
 from concurrent.futures import ThreadPoolExecutor
 import random
+from pyeztrace.config import config
+
+
+def reset_logging_state():
+    logger = logging.getLogger("pyeztrace")
+    logger.handlers.clear()
+    Logging._configured = False
+    Logging._buffer_enabled = False
+    Logging._buffer_flush_interval = 1.0
 
 @pytest.fixture(autouse=True)
 def reset_setup():
     Setup.reset()
+
+
+@pytest.fixture
+def restore_log_config():
+    original_enabled = config.buffer_enabled
+    original_flush_interval = config.buffer_flush_interval
+    yield
+    config.buffer_enabled = original_enabled
+    config.buffer_flush_interval = original_flush_interval
+
+
+def test_buffering_respects_environment(monkeypatch, restore_log_config):
+    reset_logging_state()
+    monkeypatch.setenv("EZTRACE_BUFFER_ENABLED", "true")
+    monkeypatch.setenv("EZTRACE_BUFFER_FLUSH_INTERVAL", "2.5")
+
+    Setup.initialize("EZTRACE_BUFFERING_ENV", show_metrics=False)
+    Logging(log_format="plain")
+
+    logger = logging.getLogger("pyeztrace")
+    buffered_handlers = [h for h in logger.handlers if isinstance(h, BufferedHandler)]
+
+    assert len(buffered_handlers) == 2
+    assert {h.flush_interval for h in buffered_handlers} == {2.5}
+    reset_logging_state()
+
+
+def test_buffering_respects_config(monkeypatch, restore_log_config):
+    reset_logging_state()
+    monkeypatch.delenv("EZTRACE_BUFFER_ENABLED", raising=False)
+    monkeypatch.delenv("EZTRACE_BUFFER_FLUSH_INTERVAL", raising=False)
+
+    config.buffer_enabled = True
+    config.buffer_flush_interval = 0.2
+
+    Setup.initialize("EZTRACE_BUFFERING_CONFIG", show_metrics=False)
+    Logging(log_format="plain")
+
+    logger = logging.getLogger("pyeztrace")
+    buffered_handlers = [h for h in logger.handlers if isinstance(h, BufferedHandler)]
+
+    assert len(buffered_handlers) == 2
+    assert {h.flush_interval for h in buffered_handlers} == {0.2}
+    reset_logging_state()
 
 def test_log_info_and_error(monkeypatch):
     Setup.initialize("EZTRACER_LOG", show_metrics=False)

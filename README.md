@@ -399,6 +399,8 @@ export EZTRACE_LOG_LEVEL="DEBUG"
 export EZTRACE_LOG_FILE="custom.log"
 export EZTRACE_MAX_SIZE="10485760"  # 10MB
 export EZTRACE_BACKUP_COUNT="5"
+export EZTRACE_BUFFER_ENABLED="false"          # Buffer logs (default: false)
+export EZTRACE_BUFFER_FLUSH_INTERVAL="1.0"      # Seconds between flushes when buffering
 
 # Via code - must be setup before importing trace
 
@@ -408,6 +410,8 @@ config.log_level = "DEBUG"
 config.log_file = "custom.log"
 config.max_size = 10 * 1024 * 1024  # 10MB
 config.backup_count = 5
+config.buffer_enabled = False
+config.buffer_flush_interval = 1.0
 ```
 
 ## Contributing
