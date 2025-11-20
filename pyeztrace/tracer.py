@@ -1,12 +1,15 @@
-import time
 import contextvars
-import types
+import fnmatch
 import inspect
+import os
+import re
 import sys
 import threading
-import fnmatch
-from typing import Any, Callable, Optional, Sequence, Union, Dict, List, Set, TypeVar
+import time
+import types
 import uuid
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Optional, Pattern, Sequence, Set, TypeVar, Union
 try:
     import resource  # Unix-specific
 except Exception:
@@ -23,6 +26,162 @@ _currently_tracing = contextvars.ContextVar('_pyeztrace_currently_tracing', defa
 
 # ContextVar to maintain parent-child relationship for call hierarchy
 _call_stack_ids = contextvars.ContextVar('_pyeztrace_call_stack_ids', default=tuple())
+
+# ContextVar to propagate redaction configuration across parent/child spans
+_active_redaction = contextvars.ContextVar('_pyeztrace_active_redaction', default=None)
+
+
+_PREDEFINED_VALUE_PATTERNS: Dict[str, List[Pattern[str]]] = {
+    # Personally identifiable information (PII)
+    "pii": [
+        re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE),  # Email addresses
+        re.compile(r"\b(?:\d[ -]*?){13,16}\b"),  # Credit card-like sequences
+        re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),  # SSN format
+        re.compile(r"\b\+?\d{1,3}?[\s-]?(?:\(\d{3}\)|\d{3})[\s-]?\d{3}[\s-]?\d{4}\b"),  # Phone numbers
+    ],
+    # Protected health information (PHI)
+    "phi": [
+        re.compile(r"\b(?:0?[1-9]|1[0-2])/[0-3]?\d/(?:19|20)\d{2}\b"),  # MM/DD/YYYY dates
+        re.compile(r"\b(?:MRN|Medical\s*Record\s*Number)[:\s]*\w+\b", re.IGNORECASE),
+    ],
+}
+
+
+@dataclass(frozen=True)
+class RedactionSettings:
+    keys: Optional[Set[str]] = None
+    pattern: Optional[Pattern[str]] = None
+    value_patterns: Optional[List[Pattern[str]]] = None
+
+    def should_redact_key(self, key: Any) -> bool:
+        key_str = str(key)
+        if self.keys is not None and key_str.lower() in self.keys:
+            return True
+        if self.pattern is not None and self.pattern.search(key_str):
+            return True
+        return False
+
+    def should_redact_value(self, value: Any) -> bool:
+        if not self.value_patterns:
+            return False
+
+        if isinstance(value, (dict, list, tuple, set)):
+            return False
+
+        try:
+            value_str = value if isinstance(value, str) else str(value)
+        except Exception:
+            return False
+
+        for pattern in self.value_patterns:
+            try:
+                if pattern.search(value_str):
+                    return True
+            except Exception:
+                continue
+        return False
+
+
+def _build_redaction_settings(
+    redact_keys: Optional[Iterable[str]] = None,
+    redact_pattern: Optional[Union[str, Pattern[str]]] = None,
+    redact_value_patterns: Optional[Iterable[Union[str, Pattern[str]]]] = None,
+    presets: Optional[Iterable[str]] = None,
+) -> Optional[RedactionSettings]:
+    keys_set = None
+    if redact_keys:
+        keys_set = {str(k).lower() for k in redact_keys}
+
+    compiled_pattern: Optional[Pattern[str]] = None
+    if redact_pattern:
+        if isinstance(redact_pattern, str):
+            try:
+                compiled_pattern = re.compile(redact_pattern, re.IGNORECASE)
+            except re.error:
+                compiled_pattern = None
+        else:
+            compiled_pattern = redact_pattern
+    else:
+        compiled_pattern = redact_pattern
+
+    compiled_value_patterns: List[Pattern[str]] = []
+    if presets:
+        for preset in presets:
+            preset_key = str(preset).lower()
+            compiled_value_patterns.extend(_PREDEFINED_VALUE_PATTERNS.get(preset_key, []))
+
+    if redact_value_patterns:
+        for pat in redact_value_patterns:
+            if isinstance(pat, str):
+                preset_key = pat.lower()
+                if preset_key in _PREDEFINED_VALUE_PATTERNS:
+                    compiled_value_patterns.extend(_PREDEFINED_VALUE_PATTERNS[preset_key])
+                    continue
+                try:
+                    compiled_value_patterns.append(re.compile(pat, re.IGNORECASE))
+                except re.error:
+                    continue
+            else:
+                compiled_value_patterns.append(pat)
+
+    if keys_set or compiled_pattern or compiled_value_patterns:
+        return RedactionSettings(
+            keys=keys_set, pattern=compiled_pattern, value_patterns=compiled_value_patterns or None
+        )
+    return None
+
+
+def _redaction_from_env() -> Optional[RedactionSettings]:
+    keys_env = os.environ.get("EZTRACE_REDACT_KEYS")
+    pattern_env = os.environ.get("EZTRACE_REDACT_PATTERN")
+    value_patterns_env = os.environ.get("EZTRACE_REDACT_VALUE_PATTERNS")
+    presets_env = os.environ.get("EZTRACE_REDACT_PRESETS")
+
+    keys = None
+    if keys_env:
+        keys = [k.strip() for k in keys_env.split(",") if k.strip()]
+
+    value_patterns = None
+    if value_patterns_env:
+        value_patterns = [p.strip() for p in value_patterns_env.split(",") if p.strip()]
+
+    presets = None
+    if presets_env:
+        presets = [p.strip() for p in presets_env.split(",") if p.strip()]
+
+    return _build_redaction_settings(keys, pattern_env, value_patterns, presets)
+
+
+_global_redaction_override: Optional[RedactionSettings] = None
+
+
+def set_global_redaction(
+    redact_keys: Optional[Iterable[str]] = None,
+    redact_pattern: Optional[Union[str, Pattern[str]]] = None,
+    redact_value_patterns: Optional[Iterable[Union[str, Pattern[str]]]] = None,
+    presets: Optional[Iterable[str]] = None,
+) -> None:
+    """Set a global redaction configuration used when no per-trace settings are provided."""
+    global _global_redaction_override
+    _global_redaction_override = _build_redaction_settings(
+        redact_keys, redact_pattern, redact_value_patterns, presets
+    )
+
+
+def _resolve_redaction(
+    redaction: Optional[RedactionSettings] = None,
+) -> Optional[RedactionSettings]:
+    if redaction is not None:
+        return redaction
+
+    current = _active_redaction.get()
+    if current is not None:
+        return current
+
+    if _global_redaction_override is not None:
+        return _global_redaction_override
+
+    return _redaction_from_env()
 
 def ensure_initialized():
     """Ensure EzTrace is initialized with sensible defaults if not already done."""
@@ -87,12 +246,19 @@ def _safe_to_wrap(obj):
         or (inspect.isbuiltin(obj) and getattr(obj, "__module__", "") and getattr(obj, "__module__", "").startswith("builtins"))
     )
 
-def _safe_preview_value(value: Any, max_len: int = 200) -> Any:
+def _safe_preview_value(
+    value: Any,
+    max_len: int = 200,
+    redaction: Optional[RedactionSettings] = None,
+) -> Any:
     """
     Produce a JSON-serializable, size-bounded preview of a value.
     Falls back to type name and truncated repr for complex objects.
     """
     try:
+        redaction = _resolve_redaction(redaction)
+        if redaction is not None and redaction.should_redact_value(value):
+            return "<redacted>"
         # Primitive types pass through
         if value is None or isinstance(value, (bool, int, float, str)):
             if isinstance(value, str) and len(value) > max_len:
@@ -100,14 +266,25 @@ def _safe_preview_value(value: Any, max_len: int = 200) -> Any:
             return value
         # Simple containers: preview recursively but bounded
         if isinstance(value, (list, tuple)):
-            preview = [_safe_preview_value(v, max_len=max_len // 2) for v in list(value)[:5]]
+            preview = []
+            for v in list(value)[:5]:
+                if redaction is not None and redaction.should_redact_value(v):
+                    preview.append("<redacted>")
+                else:
+                    preview.append(_safe_preview_value(v, max_len=max_len // 2, redaction=redaction))
             if len(value) > 5:
                 preview.append("…")
             return preview
         if isinstance(value, dict):
             preview_items = {}
             for i, (k, v) in enumerate(list(value.items())[:5]):
-                preview_items[str(k)] = _safe_preview_value(v, max_len=max_len // 2)
+                key_str = str(k)
+                if redaction is not None and redaction.should_redact_key(key_str):
+                    preview_items[key_str] = "<redacted>"
+                elif redaction is not None and redaction.should_redact_value(v):
+                    preview_items[key_str] = "<redacted>"
+                else:
+                    preview_items[key_str] = _safe_preview_value(v, max_len=max_len // 2, redaction=redaction)
             if len(value) > 5:
                 preview_items["…"] = "…"
             return preview_items
@@ -122,16 +299,29 @@ def _safe_preview_value(value: Any, max_len: int = 200) -> Any:
         except Exception:
             return "<unrepr>"
 
-def _preview_args_kwargs(args: tuple, kwargs: dict) -> Dict[str, Any]:
+def _preview_args_kwargs(
+    args: tuple,
+    kwargs: dict,
+    redaction: Optional[RedactionSettings] = None,
+) -> Dict[str, Any]:
     """Return safe previews for args and kwargs."""
+    redaction = _resolve_redaction(redaction)
     try:
-        args_preview = [_safe_preview_value(a) for a in list(args)[:5]]
+        args_preview = [_safe_preview_value(a, redaction=redaction) for a in list(args)[:5]]
         if len(args) > 5:
             args_preview.append("…")
     except Exception:
         args_preview = ["<args_unavailable>"]
     try:
-        kwargs_preview = {str(k): _safe_preview_value(v) for k, v in list(kwargs.items())[:8]}
+        kwargs_preview = {}
+        for k, v in list(kwargs.items())[:8]:
+            key_str = str(k)
+            if redaction is not None and redaction.should_redact_key(key_str):
+                kwargs_preview[key_str] = "<redacted>"
+            elif redaction is not None and redaction.should_redact_value(v):
+                kwargs_preview[key_str] = "<redacted>"
+            else:
+                kwargs_preview[key_str] = _safe_preview_value(v, redaction=redaction)
         if len(kwargs) > 8:
             kwargs_preview["…"] = "…"
     except Exception:
@@ -276,7 +466,8 @@ def child_trace_decorator(func: F) -> F:
             
             # Normal tracing logic
             Setup.increment_level()
-            previews = _preview_args_kwargs(args, kwargs)
+            redaction = _resolve_redaction(None)
+            previews = _preview_args_kwargs(args, kwargs, redaction=redaction)
             start_ts = time.time()
             # Resource snapshots
             start_cpu = time.process_time()
@@ -327,7 +518,7 @@ def child_trace_decorator(func: F) -> F:
                         cpu_time=cpu_time,
                         mem_peak_kb=mem_after,
                         mem_delta_kb=mem_delta,
-                        result_preview=_safe_preview_value(result)
+                        result_preview=_safe_preview_value(result, redaction=redaction)
                     )
                     logging.record_metric(func.__qualname__, duration)
                     return result
@@ -386,7 +577,8 @@ def child_trace_decorator(func: F) -> F:
             
             # Normal tracing logic
             Setup.increment_level()
-            previews = _preview_args_kwargs(args, kwargs)
+            redaction = _resolve_redaction(None)
+            previews = _preview_args_kwargs(args, kwargs, redaction=redaction)
             start_ts = time.time()
             # Resource snapshots
             start_cpu = time.process_time()
@@ -437,7 +629,7 @@ def child_trace_decorator(func: F) -> F:
                         cpu_time=cpu_time,
                         mem_peak_kb=mem_after,
                         mem_delta_kb=mem_delta,
-                        result_preview=_safe_preview_value(result)
+                        result_preview=_safe_preview_value(result, redaction=redaction)
                     )
                     logging.record_metric(func.__qualname__, duration)
                     return result
@@ -476,7 +668,11 @@ def trace(
     include: Optional[Sequence[str]] = None,
     exclude: Optional[Sequence[str]] = None,
     recursive_depth: int = 0,  # 0 = only direct module, 1+ = levels of imports to trace
-    module_pattern: Optional[str] = None  # e.g., "myapp.*" to limit recursion scope
+    module_pattern: Optional[str] = None,  # e.g., "myapp.*" to limit recursion scope
+    redact_keys: Optional[Sequence[str]] = None,
+    redact_pattern: Optional[Union[str, Pattern[str]]] = None,
+    redact_value_patterns: Optional[Sequence[Union[str, Pattern[str]]]] = None,
+    redact_presets: Optional[Sequence[str]] = None,
 ) -> Callable[[T], T]:
     """
     Decorator for parent function. Enables tracing for all child functions in the given modules or classes.
@@ -494,7 +690,15 @@ def trace(
         exclude: Function names to exclude (glob patterns)
         recursive_depth: How many levels of imports to trace (0 = only direct module)
         module_pattern: Pattern to match module names for recursive tracing (e.g., "myapp.*")
+        redact_keys: Iterable of keys to redact from previews (case-insensitive)
+        redact_pattern: Regex pattern for keys to redact from previews
+        redact_value_patterns: Regex patterns (or preset names) that trigger value redaction even when keys are unknown
+        redact_presets: Preset groups (e.g., "pii", "phi") to enable value redaction patterns
     """
+    configured_redaction = _build_redaction_settings(
+        redact_keys, redact_pattern, redact_value_patterns, redact_presets
+    )
+
     def _should_trace(func_name: str) -> bool:
         if include:
             if not any(fnmatch.fnmatch(func_name, pat) for pat in include):
@@ -644,7 +848,11 @@ def trace(
                     message=message,
                     stack=stack,
                     include=include,
-                    exclude=exclude
+                    exclude=exclude,
+                    redact_keys=redact_keys,
+                    redact_pattern=redact_pattern,
+                    redact_value_patterns=redact_value_patterns,
+                    redact_presets=redact_presets,
                 )
 
                 wrapped_method = method_trace(original_callable)
@@ -669,9 +877,12 @@ def trace(
         if inspect.iscoroutinefunction(func):
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
+                redaction_token = None
                 try:
                     # Initialize if not already done
                     ensure_initialized()
+                    redaction_to_use = _resolve_redaction(configured_redaction)
+                    redaction_token = _active_redaction.set(redaction_to_use)
                     token = tracing_active.set(True)
                     Setup.increment_level()
                     
@@ -692,7 +903,7 @@ def trace(
                     parent_id = stack_before[-1] if stack_before else None
                     stack_token = _call_stack_ids.set(new_stack)
                     
-                    previews = _preview_args_kwargs(args, kwargs)
+                    previews = _preview_args_kwargs(args, kwargs, redaction=redaction_to_use)
                     start_ts = time.time()
                     # Resource snapshots
                     start_cpu = time.process_time()
@@ -751,7 +962,7 @@ def trace(
                                     cpu_time=cpu_time,
                                     mem_peak_kb=mem_after,
                                     mem_delta_kb=mem_delta,
-                                    result_preview=_safe_preview_value(result)
+                                    result_preview=_safe_preview_value(result, redaction=redaction_to_use)
                                 )
                                 logging.record_metric(func.__qualname__, duration)
                                 return result
@@ -787,6 +998,8 @@ def trace(
                     try:
                         Setup.decrement_level()
                         tracing_active.reset(token)
+                        if redaction_token is not None:
+                            _active_redaction.reset(redaction_token)
                         if 'tracing_token' in locals():
                             _currently_tracing.reset(tracing_token)
                         if 'stack_token' in locals():
@@ -800,9 +1013,12 @@ def trace(
         else:
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
+                redaction_token = None
                 try:
                     # Initialize if not already done
                     ensure_initialized()
+                    redaction_to_use = _resolve_redaction(configured_redaction)
+                    redaction_token = _active_redaction.set(redaction_to_use)
                     token = tracing_active.set(True)
                     Setup.increment_level()
                     
@@ -823,7 +1039,7 @@ def trace(
                     parent_id = stack_before[-1] if stack_before else None
                     stack_token = _call_stack_ids.set(new_stack)
                     
-                    previews = _preview_args_kwargs(args, kwargs)
+                    previews = _preview_args_kwargs(args, kwargs, redaction=redaction_to_use)
                     start_ts = time.time()
                     # Resource snapshots
                     start_cpu = time.process_time()
@@ -880,7 +1096,7 @@ def trace(
                                     cpu_time=cpu_time,
                                     mem_peak_kb=mem_after,
                                     mem_delta_kb=mem_delta,
-                                    result_preview=_safe_preview_value(result)
+                                    result_preview=_safe_preview_value(result, redaction=redaction_to_use)
                                 )
                                 logging.record_metric(func.__qualname__, duration)
                                 return result
@@ -919,6 +1135,8 @@ def trace(
                     try:
                         Setup.decrement_level()
                         tracing_active.reset(token)
+                        if redaction_token is not None:
+                            _active_redaction.reset(redaction_token)
                         if 'tracing_token' in locals():
                             _currently_tracing.reset(tracing_token)
                         if 'stack_token' in locals():
