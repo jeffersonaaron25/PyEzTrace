@@ -39,6 +39,12 @@ pip install "pyeztrace[azure]"
 pip install "pyeztrace[all]"
 ```
 
+To run the full test suite, including the OpenTelemetry bridge coverage, install the OTEL extra:
+
+```bash
+pip install "pyeztrace[otel]"
+```
+
 ## Quick Start
 
 ```python
@@ -240,6 +246,19 @@ config.log_file = "app.log"  # Custom log filename
 # must be setup before importing trace
 ```
 
+To run without writing log files (console-only output), set the configuration flag:
+
+```bash
+export EZTRACE_DISABLE_FILE_LOGGING=1
+```
+
+You can also opt out programmatically:
+
+```python
+Setup.initialize("MyApp", disable_file_logging=True)
+log = Logging(disable_file_logging=True)
+```
+
 ### 8. Error Handling and Debug Support
 
 ```python
@@ -399,6 +418,8 @@ export EZTRACE_LOG_LEVEL="DEBUG"
 export EZTRACE_LOG_FILE="custom.log"
 export EZTRACE_MAX_SIZE="10485760"  # 10MB
 export EZTRACE_BACKUP_COUNT="5"
+export EZTRACE_BUFFER_ENABLED="false"          # Buffer logs (default: false)
+export EZTRACE_BUFFER_FLUSH_INTERVAL="1.0"      # Seconds between flushes when buffering
 
 # Via code - must be setup before importing trace
 
@@ -408,6 +429,8 @@ config.log_level = "DEBUG"
 config.log_file = "custom.log"
 config.max_size = 10 * 1024 * 1024  # 10MB
 config.backup_count = 5
+config.buffer_enabled = False
+config.buffer_flush_interval = 1.0
 ```
 
 ## Contributing
