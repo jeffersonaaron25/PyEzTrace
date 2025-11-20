@@ -26,6 +26,9 @@ keywords = ["logging", "tracing", "monitoring", "debugging", "performance"]
 dependencies = []
 requires-python = ">=3.7"
 
+[project.scripts]
+pyeztrace = "pyeztrace.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["pyeztrace*"]
 exclude = ["tests*"]
