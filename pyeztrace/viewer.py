@@ -52,6 +52,33 @@ class _TraceTreeBuilder:
         metrics_entries: List[Dict[str, Any]] = []
         roots: List[str] = []
 
+        def ensure_node(cid: str, parent_id: Optional[str] = None) -> Dict[str, Any]:
+            if cid not in nodes:
+                nodes[cid] = {
+                    'call_id': cid,
+                    'parent_id': parent_id,
+                    'function': None,
+                    'fn_type': None,
+                    'start_time': None,
+                    'end_time': None,
+                    'duration': None,
+                    'cpu_time': None,
+                    'mem_peak_kb': None,
+                    'mem_rss_kb': None,
+                    'mem_delta_kb': None,
+                    'args_preview': None,
+                    'kwargs_preview': None,
+                    'result_preview': None,
+                    'status': None,
+                    'level': None,
+                    'project': None,
+                    'children': []
+                }
+            node = nodes[cid]
+            if parent_id and node.get('parent_id') is None:
+                node['parent_id'] = parent_id
+            return node
+
         for e in entries:
             data = e.get('data') or {}
             call_id = data.get('call_id')
@@ -76,36 +103,19 @@ class _TraceTreeBuilder:
                 # Not a structured trace entry; skip from tree but include as loose log?
                 continue
 
-            if call_id not in nodes:
-                nodes[call_id] = {
-                    'call_id': call_id,
-                    'parent_id': parent_id,
-                    'function': function,
-                    'fn_type': fn_type,
-                    'start_time': None,
-                    'end_time': None,
-                    'duration': None,
-                    'cpu_time': None,
-                    'mem_peak_kb': None,
-                    'mem_delta_kb': None,
-                    'args_preview': None,
-                    'kwargs_preview': None,
-                    'result_preview': None,
-                    'status': status,
-                    'level': e.get('level'),
-                    'project': e.get('project'),
-                    'children': []  # child call_ids
-                }
+            node = ensure_node(call_id, parent_id)
+            node.update({
+                'function': node.get('function') or function,
+                'fn_type': node.get('fn_type') or fn_type,
+                'status': status if status is not None else node.get('status'),
+                'level': node.get('level') or e.get('level'),
+                'project': node.get('project') or e.get('project'),
+            })
 
-            node = nodes[call_id]
-
-            # Link parent-child
-            if parent_id and parent_id in nodes:
-                parent = nodes[parent_id]
+            if parent_id:
+                parent = ensure_node(parent_id)
                 if call_id not in parent['children']:
                     parent['children'].append(call_id)
-
-            # Identify roots later after all nodes present
 
             # Timestamps and metrics
             if event == 'start':
@@ -117,6 +127,7 @@ class _TraceTreeBuilder:
                 node['end_time'] = data.get('time_epoch') or self._to_epoch(e.get('timestamp', ''))
                 node['duration'] = e.get('duration')
                 node['cpu_time'] = data.get('cpu_time')
+                node['mem_rss_kb'] = data.get('mem_rss_kb') or data.get('mem_peak_kb')
                 node['mem_peak_kb'] = data.get('mem_peak_kb')
                 node['mem_delta_kb'] = data.get('mem_delta_kb')
                 node['result_preview'] = data.get('result_preview')
@@ -310,10 +321,6 @@ class TraceViewerServer:
   const refreshBtn = document.getElementById('refresh');
   const overviewEl = document.getElementById('overview');
   const statusFilterGroup = document.getElementById('status-filter');
-  const autoRefreshToggle = document.getElementById('auto-refresh');
-  const expandAllBtn = document.getElementById('expand-all');
-  const collapseAllBtn = document.getElementById('collapse-all');
-
   let tree = [];
   let total = 0;
   let metrics = [];
@@ -322,6 +329,8 @@ class TraceViewerServer:
   const expanded = new Set();
   let metricsExpanded = false; // Collapsed by default
   let refreshTimer = null;
+  let autoRefreshEnabled = true;
+  let autoExpandRoots = true;
 
   async function fetchTree(){
     const res = await fetch('/api/tree');
@@ -330,7 +339,7 @@ class TraceViewerServer:
     total = data.total_nodes || 0;
     metrics = data.metrics || [];
     generatedAt = data.generated_at || null;
-    metaEl.textContent = `${generatedAt ? new Date(generatedAt*1000).toLocaleString() : ''} • ${data.log_file} • ${total} nodes`;
+    metaEl.textContent = `${generatedAt ? new Date(generatedAt*1000).toLocaleString() : ''} • ${data.log_file} • ${total} nodes • Memory values reflect current RSS snapshots per event`;
     render();
   }
 
@@ -374,14 +383,14 @@ class TraceViewerServer:
       `time: ${fmtDuration(node.duration)}`,
       `cpu: ${fmt(node.cpu_time)}s`,
       `memΔ: ${node.mem_delta_kb==null?'-':node.mem_delta_kb+' KB'}`,
-      `peak: ${node.mem_peak_kb==null?'-':node.mem_peak_kb+' KB'}`
+      `rss: ${node.mem_rss_kb==null?'-':node.mem_rss_kb+' KB'}`
     ].join(' • ');
 
     const args = node.args_preview!=null ? JSON.stringify(node.args_preview) : '-';
     const kwargs = node.kwargs_preview!=null ? JSON.stringify(node.kwargs_preview) : '-';
     const result = node.result_preview!=null ? JSON.stringify(node.result_preview) : '-';
     const hasErr = !!node.error;
-    const isExpanded = expanded.has(node.call_id) || depth < 1 || hasErr;
+    const isExpanded = expanded.has(node.call_id) || (autoExpandRoots && depth === 0) || hasErr;
     const badges = [
       node.fn_type ? `<span class="pill">${node.fn_type}</span>` : '',
       hasErr ? `<span class="pill error">error</span>` : '',
@@ -499,12 +508,15 @@ class TraceViewerServer:
     ` : '';
 
     rootEl.innerHTML = metricsHtml + traceHtml;
+
+    wireTraceControls();
   }
 
   searchEl.addEventListener('input', render);
   refreshBtn.addEventListener('click', fetchTree);
 
   window.__toggleNode = function(cid){
+    autoExpandRoots = false;
     if(expanded.has(cid)) expanded.delete(cid); else expanded.add(cid);
     render();
   }
@@ -536,23 +548,44 @@ class TraceViewerServer:
     return count;
   }
 
-  expandAllBtn.addEventListener('click', ()=>{
-    const collect = (nodes)=>{ nodes.forEach(n=>{ expanded.add(n.call_id); if(n.children) collect(n.children); }); };
-    collect(tree); render();
-  });
+  function wireTraceControls(){
+    const expandAllBtn = document.getElementById('expand-all');
+    const collapseAllBtn = document.getElementById('collapse-all');
+    const autoRefreshToggle = document.getElementById('auto-refresh');
 
-  collapseAllBtn.addEventListener('click', ()=>{ expanded.clear(); render(); });
+    if(expandAllBtn){
+      expandAllBtn.onclick = ()=>{
+        const collect = (nodes)=>{ nodes.forEach(n=>{ expanded.add(n.call_id); if(n.children) collect(n.children); }); };
+        autoExpandRoots = false;
+        collect(tree); render();
+      };
+    }
 
-  autoRefreshToggle.addEventListener('change', ()=>{
-    if(autoRefreshToggle.checked){ scheduleRefresh(); }
-    else { clearInterval(refreshTimer); refreshTimer = null; }
-  });
+    if(collapseAllBtn){
+      collapseAllBtn.onclick = ()=>{ autoExpandRoots = false; expanded.clear(); render(); };
+    }
 
-  function scheduleRefresh(){
+    if(autoRefreshToggle){
+      autoRefreshToggle.checked = autoRefreshEnabled;
+      autoRefreshToggle.onchange = ()=>{
+        autoRefreshEnabled = autoRefreshToggle.checked;
+        if(autoRefreshEnabled){
+          scheduleRefresh(true);
+        } else {
+          clearInterval(refreshTimer);
+          refreshTimer = null;
+        }
+      };
+    }
+  }
+
+  function scheduleRefresh(immediate=false){
     if(refreshTimer) clearInterval(refreshTimer);
+    if(!autoRefreshEnabled) return;
     refreshTimer = setInterval(()=>{
-      if(autoRefreshToggle.checked) fetchTree();
+      if(autoRefreshEnabled) fetchTree();
     }, 2500);
+    if(immediate) fetchTree();
   }
 
   fetchTree();
