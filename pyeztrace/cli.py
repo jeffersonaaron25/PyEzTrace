@@ -33,6 +33,7 @@ def _get_version():
 class LogAnalyzer:
     def __init__(self, log_file: Path):
         self.log_file = log_file
+        self._ansi_pattern = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
         
     def parse_logs(self, filter_level: Optional[str] = None, 
                    since: Optional[datetime] = None,
@@ -51,6 +52,134 @@ class LogAnalyzer:
                     continue  # Skip invalid lines
                     
         return entries
+    
+    def read_formatted_lines(self, filter_level: Optional[str] = None,
+                            since: Optional[datetime] = None,
+                            until: Optional[datetime] = None,
+                            context: Optional[dict] = None) -> List[str]:
+        """Read original formatted lines from log file, preserving ANSI codes and tree structure."""
+        formatted_lines = []
+        
+        with open(self.log_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                original_line = line.rstrip('\n\r')
+                if not original_line.strip():
+                    continue
+                    
+                try:
+                    # Parse to check filters (strip ANSI for parsing)
+                    entry = self._parse_line(self._strip_ansi_codes(original_line))
+                    if self._should_include(entry, filter_level, since, until, context):
+                        formatted_lines.append(original_line)
+                except:
+                    # If parsing fails, include the line anyway (might be a non-standard format)
+                    formatted_lines.append(original_line)
+                    
+        return formatted_lines
+    
+    def format_json_entry(self, entry: dict, call_hierarchy: Optional[dict] = None) -> str:
+        """Reconstruct formatted output from JSON log entry."""
+        # Import here to avoid circular dependency
+        from pyeztrace.custom_logging import Logging
+        
+        timestamp = entry.get('timestamp', '')
+        level = entry.get('level', 'INFO')
+        project = entry.get('project', '')
+        function = entry.get('function', '')
+        message = entry.get('message', '')
+        duration = entry.get('duration')
+        data = entry.get('data', {})
+        fn_type = entry.get('fn_type', '')
+        event = data.get('event', '')
+        
+        # Check if this is a metrics entry
+        is_metrics = (event == 'metrics_summary' or fn_type == 'metrics') and data.get('metrics')
+        
+        if is_metrics:
+            # Format metrics entry with metrics table
+            color = Logging.COLOR_CODES.get(level, '')
+            reset = Logging.COLOR_CODES['RESET']
+            
+            # Header line
+            msg = f"{color}{timestamp} - {level} - [{project}] {message}{reset}\n"
+            
+            # Metrics summary
+            total_functions = data.get('total_functions', 0)
+            total_calls = data.get('total_calls', 0)
+            metrics_list = data.get('metrics', [])
+            
+            if metrics_list:
+                msg += f"  Functions: {total_functions}, Total calls: {total_calls}\n"
+                msg += f"  {'Function':<40} {'Calls':>8} {'Total Time':>12} {'Avg Time':>12} {'Time/Call':>12}\n"
+                msg += f"  {'-' * 40} {'-' * 8} {'-' * 12} {'-' * 12} {'-' * 12}\n"
+                
+                for metric in metrics_list:
+                    func_name = metric.get('function', '')
+                    calls = metric.get('calls', 0)
+                    total_seconds = metric.get('total_seconds', 0.0)
+                    avg_seconds = metric.get('avg_seconds', 0.0)
+                    time_per_call = (total_seconds / calls * 1000) if calls > 0 else 0.0
+                    
+                    # Truncate function name if too long
+                    if len(func_name) > 38:
+                        func_name = func_name[:35] + "..."
+                    
+                    msg += f"  {func_name:<40} {calls:>8} {total_seconds:>12.6f}s {avg_seconds:>12.6f}s {time_per_call:>12.3f}ms\n"
+            
+            return msg.rstrip()
+        
+        # Try to determine level_indent from data or call hierarchy
+        level_indent = 0
+        call_id = data.get('call_id')
+        
+        if call_hierarchy and call_id:
+            # Calculate depth from call hierarchy
+            depth = 0
+            current_id = call_id
+            while current_id and current_id in call_hierarchy:
+                depth += 1
+                current_id = call_hierarchy[current_id]
+            level_indent = depth
+        else:
+            # Try to get from data fields (might be stored as 'depth' or 'level_indent')
+            level_indent = data.get('depth', data.get('level_indent', 0))
+            if isinstance(level_indent, str):
+                try:
+                    level_indent = int(level_indent)
+                except:
+                    level_indent = 0
+            elif not isinstance(level_indent, int):
+                level_indent = 0
+        
+        # Build tree structure
+        if level_indent == 0:
+            tree = ""
+        elif level_indent == 1:
+            tree = "├──"
+        else:
+            tree = "│    " * (level_indent - 1) + "├───"
+        
+        # Get color codes
+        color = Logging.COLOR_CODES.get(level, '')
+        reset = Logging.COLOR_CODES['RESET']
+        
+        # Format message
+        msg = f"{color}{timestamp} - {level} - [{project}] {tree} {function} {message}{reset}"
+        if duration is not None:
+            msg += f" (took {duration:.5f} seconds)"
+        
+        return msg
+    
+    def build_call_hierarchy(self, entries: List[dict]) -> dict:
+        """Build a call hierarchy map from entries: {call_id: parent_id}."""
+        hierarchy = {}
+        for entry in entries:
+            data = entry.get('data', {})
+            call_id = data.get('call_id')
+            parent_id = data.get('parent_id')
+            if call_id and parent_id:
+                hierarchy[call_id] = parent_id
+        return hierarchy
     
     def analyze_performance(self, function_name: Optional[str] = None) -> dict:
         """Analyze performance metrics from logs."""
@@ -92,20 +221,29 @@ class LogAnalyzer:
     
     def _parse_line(self, line: str) -> dict:
         """Parse a single log line."""
+        line = self._strip_ansi_codes(line)
+        if not line:
+            raise ValueError("Empty log line")
+
         try:
             # Try JSON format first
             return json.loads(line)
         except:
             # Fall back to parsing other formats
             return self._parse_plain_format(line)
-    
+
     def _parse_plain_format(self, line: str) -> dict:
         """Parse plain text format."""
-        pattern = r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) - (\w+) - \[([^\]]+)\](.*)'
+        pattern = (
+            r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\s*-\s*'
+            r'(\w+)\s*-\s*'
+            r'(?:\[([^\]]+)\]\s*)?'
+            r'(.*)'
+        )
         match = re.match(pattern, line)
         if not match:
             raise ValueError("Invalid log format")
-            
+
         timestamp, level, project, rest = match.groups()
         return {
             'timestamp': timestamp,
@@ -113,6 +251,10 @@ class LogAnalyzer:
             'project': project,
             'message': rest.strip()
         }
+
+    def _strip_ansi_codes(self, line: str) -> str:
+        """Remove ANSI color codes from a log line."""
+        return self._ansi_pattern.sub('', line).strip()
     
     def _should_include(self, entry: dict, 
                        filter_level: Optional[str] = None,
@@ -242,12 +384,38 @@ def _cmd_print(args):
                     print(f"Context: {json.dumps(error['data'], indent=2)}")
         return
 
-    entries = analyzer.parse_logs(getattr(args, 'level', None), since, until, context)
+    # Check if log file contains JSON format
+    is_json_format = False
+    try:
+        with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+            first_line = f.readline().strip()
+            if first_line:
+                try:
+                    json.loads(first_line)
+                    is_json_format = True
+                except:
+                    pass
+    except:
+        pass
+    
     if getattr(args, 'format', 'text') == 'json':
+        entries = analyzer.parse_logs(getattr(args, 'level', None), since, until, context)
         print(json.dumps(entries, indent=2))
-    else:
+    elif is_json_format:
+        # For JSON format logs, reconstruct formatted output
+        entries = analyzer.parse_logs(getattr(args, 'level', None), since, until, context)
+        # Build call hierarchy for depth calculation
+        call_hierarchy = analyzer.build_call_hierarchy(entries)
         for entry in entries:
-            print(f"{entry['timestamp']} - {entry['level']} - {entry['message']}")
+            formatted = analyzer.format_json_entry(entry, call_hierarchy)
+            print(formatted)
+    else:
+        # For color/plain format logs, preserve original formatting
+        formatted_lines = analyzer.read_formatted_lines(
+            getattr(args, 'level', None), since, until, context
+        )
+        for line in formatted_lines:
+            print(line)
 
 
 def _cmd_serve(args):

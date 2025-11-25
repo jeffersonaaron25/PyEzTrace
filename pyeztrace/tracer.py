@@ -183,6 +183,37 @@ def _resolve_redaction(
 
     return _redaction_from_env()
 
+
+def _get_current_rss_kb() -> Optional[int]:
+    """Best-effort snapshot of the current resident set size (in KB).
+
+    Uses /proc/self/statm when available to capture the current RSS. Falls back to
+    ``resource.getrusage`` (which reports the historical peak) if reading from
+    /proc is not possible.
+    """
+
+    try:
+        # On Windows, os.sysconf is not available and raises AttributeError.
+        # Guard the call so we can gracefully fall back.
+        if hasattr(os, "sysconf"):
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            with open("/proc/self/statm", "r", encoding="utf-8") as statm:
+                parts = statm.readline().split()
+                if len(parts) >= 2:
+                    resident_pages = int(parts[1])
+                    return int(resident_pages * page_size / 1024)
+    except (OSError, ValueError, AttributeError):
+        # Any issues with sysconf or /proc access fall through to the portable fallback
+        pass
+
+    if resource is not None:
+        try:
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        except Exception:
+            return None
+
+    return None
+
 def ensure_initialized():
     """Ensure EzTrace is initialized with sensible defaults if not already done."""
     try:
@@ -471,12 +502,7 @@ def child_trace_decorator(func: F) -> F:
             start_ts = time.time()
             # Resource snapshots
             start_cpu = time.process_time()
-            mem_before = None
-            if resource is not None:
-                try:
-                    mem_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                except Exception:
-                    mem_before = None
+            mem_before = _get_current_rss_kb()
             logging.log_info(
                 f"called...",
                 fn_type="child",
@@ -496,15 +522,10 @@ def child_trace_decorator(func: F) -> F:
                     duration = end - start
                     # Metrics capture
                     cpu_time = time.process_time() - start_cpu
-                    mem_after = None
+                    mem_after = _get_current_rss_kb()
                     mem_delta = None
-                    if resource is not None:
-                        try:
-                            mem_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                            if mem_before is not None:
-                                mem_delta = mem_after - mem_before
-                        except Exception:
-                            mem_after = None
+                    if mem_after is not None and mem_before is not None:
+                        mem_delta = mem_after - mem_before
                     logging.log_info(
                         f"Ok.",
                         fn_type="child",
@@ -517,6 +538,7 @@ def child_trace_decorator(func: F) -> F:
                         time_epoch=time.time(),
                         cpu_time=cpu_time,
                         mem_peak_kb=mem_after,
+                        mem_rss_kb=mem_after,
                         mem_delta_kb=mem_delta,
                         result_preview=_safe_preview_value(result, redaction=redaction)
                     )
@@ -582,12 +604,7 @@ def child_trace_decorator(func: F) -> F:
             start_ts = time.time()
             # Resource snapshots
             start_cpu = time.process_time()
-            mem_before = None
-            if resource is not None:
-                try:
-                    mem_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                except Exception:
-                    mem_before = None
+            mem_before = _get_current_rss_kb()
             logging.log_info(
                 f"called...",
                 fn_type="child",
@@ -607,15 +624,10 @@ def child_trace_decorator(func: F) -> F:
                     duration = end - start
                     # Metrics capture
                     cpu_time = time.process_time() - start_cpu
-                    mem_after = None
+                    mem_after = _get_current_rss_kb()
                     mem_delta = None
-                    if resource is not None:
-                        try:
-                            mem_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                            if mem_before is not None:
-                                mem_delta = mem_after - mem_before
-                        except Exception:
-                            mem_after = None
+                    if mem_after is not None and mem_before is not None:
+                        mem_delta = mem_after - mem_before
                     logging.log_info(
                         f"Ok.",
                         fn_type="child",
@@ -628,6 +640,7 @@ def child_trace_decorator(func: F) -> F:
                         time_epoch=time.time(),
                         cpu_time=cpu_time,
                         mem_peak_kb=mem_after,
+                        mem_rss_kb=mem_after,
                         mem_delta_kb=mem_delta,
                         result_preview=_safe_preview_value(result, redaction=redaction)
                     )
@@ -907,12 +920,7 @@ def trace(
                     start_ts = time.time()
                     # Resource snapshots
                     start_cpu = time.process_time()
-                    mem_before = None
-                    if resource is not None:
-                        try:
-                            mem_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                        except Exception:
-                            mem_before = None
+                    mem_before = _get_current_rss_kb()
                     logging.log_info(
                         f"called...",
                         fn_type="parent",
@@ -940,15 +948,10 @@ def trace(
                                 duration = end - start
                                 # Metrics capture
                                 cpu_time = time.process_time() - start_cpu
-                                mem_after = None
+                                mem_after = _get_current_rss_kb()
                                 mem_delta = None
-                                if resource is not None:
-                                    try:
-                                        mem_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                                        if mem_before is not None:
-                                            mem_delta = mem_after - mem_before
-                                    except Exception:
-                                        mem_after = None
+                                if mem_after is not None and mem_before is not None:
+                                    mem_delta = mem_after - mem_before
                                 logging.log_info(
                                     f"Ok.",
                                     fn_type="parent",
@@ -961,6 +964,7 @@ def trace(
                                     time_epoch=time.time(),
                                     cpu_time=cpu_time,
                                     mem_peak_kb=mem_after,
+                                    mem_rss_kb=mem_after,
                                     mem_delta_kb=mem_delta,
                                     result_preview=_safe_preview_value(result, redaction=redaction_to_use)
                                 )
@@ -1043,12 +1047,7 @@ def trace(
                     start_ts = time.time()
                     # Resource snapshots
                     start_cpu = time.process_time()
-                    mem_before = None
-                    if resource is not None:
-                        try:
-                            mem_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                        except Exception:
-                            mem_before = None
+                    mem_before = _get_current_rss_kb()
                     logging.log_info(
                         f"called...",
                         fn_type="parent",
@@ -1075,15 +1074,10 @@ def trace(
                                 duration = end - start
                                 # Metrics capture
                                 cpu_time = time.process_time() - start_cpu
-                                mem_after = None
+                                mem_after = _get_current_rss_kb()
                                 mem_delta = None
-                                if resource is not None:
-                                    try:
-                                        mem_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                                        if mem_before is not None:
-                                            mem_delta = mem_after - mem_before
-                                    except Exception:
-                                        mem_after = None
+                                if mem_after is not None and mem_before is not None:
+                                    mem_delta = mem_after - mem_before
                                 logging.log_info(
                                     f"Ok.",
                                     fn_type="parent",
@@ -1095,6 +1089,7 @@ def trace(
                                     time_epoch=time.time(),
                                     cpu_time=cpu_time,
                                     mem_peak_kb=mem_after,
+                                    mem_rss_kb=mem_after,
                                     mem_delta_kb=mem_delta,
                                     result_preview=_safe_preview_value(result, redaction=redaction_to_use)
                                 )

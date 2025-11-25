@@ -1,3 +1,4 @@
+import atexit
 import logging
 import sys
 import time
@@ -81,6 +82,10 @@ class Logging:
     _format = os.environ.get("EZTRACE_LOG_FORMAT", "color")  # color, plain, json, csv, logfmt
     _metrics_lock = threading.Lock()
     _metrics: Dict[str, Dict[str, Any]] = {}
+    _metrics_thread = None
+    _metrics_stop_event = threading.Event()
+    _metrics_scheduler_started = False
+    _metrics_flush_interval = float(os.environ.get("EZTRACE_METRICS_INTERVAL", "5.0"))
     _buffer_enabled = False  # Disable buffering by default (configurable via env)
     _buffer_flush_interval = 1.0
     _show_data_in_cli = os.environ.get("EZTRACE_SHOW_DATA_IN_CLI", "0").lower() in {"1", "true", "yes", "on"}
@@ -449,6 +454,7 @@ class Logging:
 
     @staticmethod
     def record_metric(func_name: str, duration: float) -> None:
+        Logging._ensure_metrics_scheduler()
         # Use thread-local storage for temporary metrics to reduce lock contention
         thread_id = threading.get_ident()
         if not hasattr(Logging, '_thread_metrics'):
@@ -468,6 +474,25 @@ class Logging:
         # Periodically flush to global metrics (every 10 records)
         if thread_metrics[func_name]["count"] % 10 == 0:
             Logging._flush_thread_metrics(thread_id)
+
+    @staticmethod
+    def _ensure_metrics_scheduler() -> None:
+        if Logging._metrics_scheduler_started:
+            return
+
+        Logging._metrics_scheduler_started = True
+
+        def _run_scheduler():
+            while not Logging._metrics_stop_event.wait(Logging._metrics_flush_interval):
+                try:
+                    Logging.log_metrics_summary()
+                except Exception:
+                    continue
+
+        Logging._metrics_thread = threading.Thread(target=_run_scheduler, daemon=True)
+        Logging._metrics_thread.start()
+        atexit.register(Logging.stop_metrics_scheduler)
+        atexit.register(Logging.log_metrics_summary)
     
     @staticmethod
     def _flush_thread_metrics(thread_id):
@@ -491,12 +516,15 @@ class Logging:
         if hasattr(Logging, '_thread_metrics'):
             for thread_id in list(Logging._thread_metrics.keys()):
                 Logging._flush_thread_metrics(thread_id)
-                
-        if not Logging._metrics:
+
+        with Logging._metrics_lock:
+            metrics_snapshot = {k: v.copy() for k, v in Logging._metrics.items()}
+
+        if not metrics_snapshot:
             return
         metrics_payload = []
         total_calls = 0
-        for func, m in sorted(Logging._metrics.items()):
+        for func, m in sorted(metrics_snapshot.items()):
             count = m["count"]
             total = m["total"]
             avg = total / count if count else 0.0
@@ -519,6 +547,16 @@ class Logging:
             total_calls=total_calls,
             generated_at=time.time()
         )
+
+    @staticmethod
+    def stop_metrics_scheduler() -> None:
+        Logging._metrics_stop_event.set()
+        thread = Logging._metrics_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=1.0)
+        Logging._metrics_thread = None
+        Logging._metrics_scheduler_started = False
+        Logging._metrics_stop_event = threading.Event()
 
 
     @staticmethod
