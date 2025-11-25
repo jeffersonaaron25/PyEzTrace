@@ -193,13 +193,17 @@ def _get_current_rss_kb() -> Optional[int]:
     """
 
     try:
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        with open("/proc/self/statm", "r", encoding="utf-8") as statm:
-            parts = statm.readline().split()
-            if len(parts) >= 2:
-                resident_pages = int(parts[1])
-                return int(resident_pages * page_size / 1024)
-    except (OSError, ValueError):
+        # On Windows, os.sysconf is not available and raises AttributeError.
+        # Guard the call so we can gracefully fall back.
+        if hasattr(os, "sysconf"):
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            with open("/proc/self/statm", "r", encoding="utf-8") as statm:
+                parts = statm.readline().split()
+                if len(parts) >= 2:
+                    resident_pages = int(parts[1])
+                    return int(resident_pages * page_size / 1024)
+    except (OSError, ValueError, AttributeError):
+        # Any issues with sysconf or /proc access fall through to the portable fallback
         pass
 
     if resource is not None:
