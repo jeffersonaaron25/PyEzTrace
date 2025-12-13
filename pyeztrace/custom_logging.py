@@ -10,6 +10,7 @@ import traceback
 from logging.handlers import RotatingFileHandler
 import threading
 import queue
+import hashlib
 from pyeztrace.setup import Setup
 from pyeztrace.config import config
 
@@ -79,13 +80,18 @@ class Logging:
     """
 
     _configured = False
-    _format = os.environ.get("EZTRACE_LOG_FORMAT", "color")  # color, plain, json, csv, logfmt
+    _base_format = os.environ.get("EZTRACE_LOG_FORMAT")  # Legacy: sets both console and file
+    _console_format: Optional[Union[str, Callable[..., str]]] = None
+    _file_format: Optional[Union[str, Callable[..., str]]] = None
+    _file_logging_enabled = False
     _metrics_lock = threading.Lock()
     _metrics: Dict[str, Dict[str, Any]] = {}
     _metrics_thread = None
     _metrics_stop_event = threading.Event()
     _metrics_scheduler_started = False
     _metrics_flush_interval = float(os.environ.get("EZTRACE_METRICS_INTERVAL", "5.0"))
+    _metrics_sidecar_lock = threading.Lock()
+    _last_metrics_sidecar_fingerprint: Optional[str] = None
     _buffer_enabled = False  # Disable buffering by default (configurable via env)
     _buffer_flush_interval = 1.0
     _show_data_in_cli = os.environ.get("EZTRACE_SHOW_DATA_IN_CLI", "0").lower() in {"1", "true", "yes", "on"}
@@ -98,7 +104,7 @@ class Logging:
         'RESET': '\033[0m',
     }
 
-    def __init__(self, log_format: Optional[Union[str, Callable[..., str]]] = config.format, disable_file_logging: Optional[bool] = None) -> None:
+    def __init__(self, log_format: Optional[Union[str, Callable[..., str]]] = None, disable_file_logging: Optional[bool] = None) -> None:
         """
         Initialize the Logging class and set up the logger (only once).
         log_format: 'color', 'plain', 'json', 'csv', 'logfmt', or a callable
@@ -121,18 +127,51 @@ class Logging:
         else:
             Logging._buffer_flush_interval = config.buffer_flush_interval
 
-        if log_format:
-            Logging._format = log_format
+        # Determine per-sink formats.
+        # Precedence:
+        # 1) Explicit log_format arg: force both sinks (backward compatible).
+        # 2) Explicit config.format (env EZTRACE_LOG_FORMAT or config.format setter): sets both sinks.
+        # 3) Per-sink formats (defaults: console=color, file=json).
+        if log_format is not None:
+            Logging._base_format = log_format
+            Logging._console_format = log_format
+            Logging._file_format = log_format
+        else:
+            if getattr(config, "format_explicit", False) and config.format is not None:
+                Logging._base_format = config.format
+                Logging._console_format = config.format
+                Logging._file_format = config.format
+            else:
+                Logging._base_format = None
+                Logging._console_format = config.console_format
+                Logging._file_format = config.file_format
+
+            # Allow explicit per-sink overrides even when a base format is set via env/config.
+            if getattr(config, "console_format_explicit", False):
+                Logging._console_format = config.console_format
+            if getattr(config, "file_format_explicit", False):
+                Logging._file_format = config.file_format
         if not Logging._configured:
             disable_files = Setup.get_disable_file_logging()
             if disable_file_logging is not None:
                 disable_files = disable_file_logging
             if Setup.is_testing_mode():
                 disable_files = True
+            Logging._file_logging_enabled = not disable_files
             logger = logging.getLogger("pyeztrace")
             logger.setLevel(getattr(logging, config.log_level))
             logger.propagate = False  # Prevent logs from propagating to root logger
             formatter = logging.Formatter('%(message)s')
+
+            class _SinkFilter(logging.Filter):
+                def __init__(self, sink: str) -> None:
+                    super().__init__()
+                    self._sink = sink
+
+                def filter(self, record: logging.LogRecord) -> bool:
+                    if not getattr(record, "eztrace_managed", False):
+                        return True
+                    return getattr(record, "eztrace_sink", None) == self._sink
 
             # Remove all handlers associated with the named logger (avoid duplicate logs)
             for handler in logger.handlers[:]:
@@ -166,14 +205,24 @@ class Logging:
                 if Logging._buffer_enabled:
                     buffered_stream = BufferedHandler(stream_handler, flush_interval=Logging._buffer_flush_interval)
                     buffered_file = BufferedHandler(file_handler, flush_interval=Logging._buffer_flush_interval)
+                    buffered_stream.addFilter(_SinkFilter("console"))
+                    buffered_file.addFilter(_SinkFilter("file"))
                     logger.addHandler(buffered_stream)
                     logger.addHandler(buffered_file)
                 else:
+                    stream_handler.addFilter(_SinkFilter("console"))
+                    file_handler.addFilter(_SinkFilter("file"))
                     logger.addHandler(stream_handler)
                     logger.addHandler(file_handler)
             else:
                 # File logging disabled, only add stream handler
-                logger.addHandler(BufferedHandler(stream_handler, flush_interval=Logging._buffer_flush_interval) if Logging._buffer_enabled else stream_handler)
+                if Logging._buffer_enabled:
+                    buffered_stream = BufferedHandler(stream_handler, flush_interval=Logging._buffer_flush_interval)
+                    buffered_stream.addFilter(_SinkFilter("console"))
+                    logger.addHandler(buffered_stream)
+                else:
+                    stream_handler.addFilter(_SinkFilter("console"))
+                    logger.addHandler(stream_handler)
 
             Logging._configured = True
 
@@ -194,21 +243,23 @@ class Logging:
         fn_type: Optional[str] = None,
         function: Optional[str] = None,
         duration: Optional[float] = None,
+        _log_format: Optional[Union[str, Callable[..., str]]] = None,
         **kwargs: Any
     ) -> str:
         # Merge context with kwargs
         context = LogContext.get_current_context()
         merged_kwargs = {**context, **kwargs}
         include_data_in_output = Logging._show_data_in_cli
-        
-        if Logging._format == "json":
+
+        log_format = _log_format if _log_format is not None else Logging._base_format or "color"
+
+        if log_format == "json":
             include_data_in_output = True  # JSON logs must include data for structured consumers
         
         project = Setup.get_project() if Setup.is_setup_done() else "?"
         level_str = level.upper()
         log_type = fn_type or ""
         func = function or context.get('function', '')
-        log_format = Logging._format
         data_str = f" Data: {merged_kwargs}" if include_data_in_output and merged_kwargs else ""
         timestamp = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime())
         try:
@@ -292,9 +343,8 @@ class Logging:
             # Get the current context and merge with kwargs
             context = LogContext.get_current_context()
             merged_kwargs = {**context, **kwargs}
-            
-            msg = Logging._format_message("INFO", message, fn_type, function, duration, **merged_kwargs)
-            # Capture logs in testing mode
+
+            # In testing mode, capture logs with minimal overhead (no formatting).
             if Setup.is_testing_mode():
                 Setup.capture_log({
                     "level": "INFO",
@@ -302,13 +352,30 @@ class Logging:
                     "fn_type": fn_type,
                     "function": function,
                     "duration": duration,
-                    "formatted": msg,
-                    "kwargs": merged_kwargs  # Use merged kwargs here
+                    "formatted": None,
+                    "kwargs": merged_kwargs,
                 })
                 return
-                
+            
+            console_format = Logging._console_format or "color"
+            file_format = Logging._file_format or "json"
+
+            def _formats_equal(a: Any, b: Any) -> bool:
+                if isinstance(a, str) and isinstance(b, str):
+                    return a == b
+                return a is b
+
+            split = Logging._file_logging_enabled and not _formats_equal(console_format, file_format)
+
+            msg = Logging._format_message("INFO", message, fn_type, function, duration, _log_format=console_format, **merged_kwargs)
+
             logger = logging.getLogger("pyeztrace")
-            logger.info(msg)
+            if split:
+                logger.info(msg, extra={"eztrace_managed": True, "eztrace_sink": "console"})
+                file_msg = Logging._format_message("INFO", message, fn_type, function, duration, _log_format=file_format, **merged_kwargs)
+                logger.info(file_msg, extra={"eztrace_managed": True, "eztrace_sink": "file"})
+            else:
+                logger.info(msg)
         else:
             raise Exception("Setup is not done. Cannot log info.")
         
@@ -324,10 +391,8 @@ class Logging:
             # Get the current context and merge with kwargs
             context = LogContext.get_current_context()
             merged_kwargs = {**context, **kwargs}
-            
-            msg = Logging._format_message("ERROR", message, fn_type, function, duration, **merged_kwargs)
-            
-            # Capture logs in testing mode
+
+            # In testing mode, capture logs with minimal overhead (no formatting).
             if Setup.is_testing_mode():
                 Setup.capture_log({
                     "level": "ERROR",
@@ -335,13 +400,30 @@ class Logging:
                     "fn_type": fn_type,
                     "function": function,
                     "duration": duration,
-                    "formatted": msg,
-                    "kwargs": merged_kwargs  # Use merged kwargs here
+                    "formatted": None,
+                    "kwargs": merged_kwargs,
                 })
                 return
-                
+            
+            console_format = Logging._console_format or "color"
+            file_format = Logging._file_format or "json"
+
+            def _formats_equal(a: Any, b: Any) -> bool:
+                if isinstance(a, str) and isinstance(b, str):
+                    return a == b
+                return a is b
+
+            split = Logging._file_logging_enabled and not _formats_equal(console_format, file_format)
+
+            msg = Logging._format_message("ERROR", message, fn_type, function, duration, _log_format=console_format, **merged_kwargs)
+
             logger = logging.getLogger("pyeztrace")
-            logger.error(msg)
+            if split:
+                logger.error(msg, extra={"eztrace_managed": True, "eztrace_sink": "console"})
+                file_msg = Logging._format_message("ERROR", message, fn_type, function, duration, _log_format=file_format, **merged_kwargs)
+                logger.error(file_msg, extra={"eztrace_managed": True, "eztrace_sink": "file"})
+            else:
+                logger.error(msg)
         else:
             raise Exception("Setup is not done. Cannot log error.")
         
@@ -357,10 +439,8 @@ class Logging:
             # Get the current context and merge with kwargs
             context = LogContext.get_current_context()
             merged_kwargs = {**context, **kwargs}
-            
-            msg = Logging._format_message("WARNING", message, fn_type, function, duration, **merged_kwargs)
-            
-            # Capture logs in testing mode
+
+            # In testing mode, capture logs with minimal overhead (no formatting).
             if Setup.is_testing_mode():
                 Setup.capture_log({
                     "level": "WARNING",
@@ -368,13 +448,30 @@ class Logging:
                     "fn_type": fn_type,
                     "function": function,
                     "duration": duration,
-                    "formatted": msg,
-                    "kwargs": merged_kwargs  # Use merged kwargs here
+                    "formatted": None,
+                    "kwargs": merged_kwargs,
                 })
                 return
-                
+            
+            console_format = Logging._console_format or "color"
+            file_format = Logging._file_format or "json"
+
+            def _formats_equal(a: Any, b: Any) -> bool:
+                if isinstance(a, str) and isinstance(b, str):
+                    return a == b
+                return a is b
+
+            split = Logging._file_logging_enabled and not _formats_equal(console_format, file_format)
+
+            msg = Logging._format_message("WARNING", message, fn_type, function, duration, _log_format=console_format, **merged_kwargs)
+
             logger = logging.getLogger("pyeztrace")
-            logger.warning(msg)
+            if split:
+                logger.warning(msg, extra={"eztrace_managed": True, "eztrace_sink": "console"})
+                file_msg = Logging._format_message("WARNING", message, fn_type, function, duration, _log_format=file_format, **merged_kwargs)
+                logger.warning(file_msg, extra={"eztrace_managed": True, "eztrace_sink": "file"})
+            else:
+                logger.warning(msg)
         else:
             raise Exception("Setup is not done. Cannot log warning.")
         
@@ -390,10 +487,8 @@ class Logging:
             # Get the current context and merge with kwargs
             context = LogContext.get_current_context()
             merged_kwargs = {**context, **kwargs}
-            
-            msg = Logging._format_message("DEBUG", message, fn_type, function, duration, **merged_kwargs)
-            
-            # Capture logs in testing mode
+
+            # In testing mode, capture logs with minimal overhead (no formatting).
             if Setup.is_testing_mode():
                 Setup.capture_log({
                     "level": "DEBUG",
@@ -401,13 +496,30 @@ class Logging:
                     "fn_type": fn_type,
                     "function": function,
                     "duration": duration,
-                    "formatted": msg,
-                    "kwargs": merged_kwargs  # Use merged kwargs here
+                    "formatted": None,
+                    "kwargs": merged_kwargs,
                 })
                 return
-                
+            
+            console_format = Logging._console_format or "color"
+            file_format = Logging._file_format or "json"
+
+            def _formats_equal(a: Any, b: Any) -> bool:
+                if isinstance(a, str) and isinstance(b, str):
+                    return a == b
+                return a is b
+
+            split = Logging._file_logging_enabled and not _formats_equal(console_format, file_format)
+
+            msg = Logging._format_message("DEBUG", message, fn_type, function, duration, _log_format=console_format, **merged_kwargs)
+
             logger = logging.getLogger("pyeztrace")
-            logger.debug(msg)
+            if split:
+                logger.debug(msg, extra={"eztrace_managed": True, "eztrace_sink": "console"})
+                file_msg = Logging._format_message("DEBUG", message, fn_type, function, duration, _log_format=file_format, **merged_kwargs)
+                logger.debug(file_msg, extra={"eztrace_managed": True, "eztrace_sink": "file"})
+            else:
+                logger.debug(msg)
         else:
             raise Exception("Setup is not done. Cannot log debug.")
         
@@ -454,7 +566,14 @@ class Logging:
 
     @staticmethod
     def record_metric(func_name: str, duration: float) -> None:
-        Logging._ensure_metrics_scheduler()
+        if not Setup.get_show_metrics():
+            return
+
+        # Only run the periodic background snapshot writer when file logging is enabled.
+        # Console should only show the final summary at exit.
+        if Logging._file_logging_active():
+            Logging._ensure_metrics_scheduler()
+
         # Use thread-local storage for temporary metrics to reduce lock contention
         thread_id = threading.get_ident()
         if not hasattr(Logging, '_thread_metrics'):
@@ -485,6 +604,8 @@ class Logging:
         def _run_scheduler():
             while not Logging._metrics_stop_event.wait(Logging._metrics_flush_interval):
                 try:
+                    # Background snapshots are persisted to a sidecar file (when enabled),
+                    # not emitted as log lines to avoid console noise and mixed log schemas.
                     Logging.log_metrics_summary()
                 except Exception:
                     continue
@@ -492,7 +613,6 @@ class Logging:
         Logging._metrics_thread = threading.Thread(target=_run_scheduler, daemon=True)
         Logging._metrics_thread.start()
         atexit.register(Logging.stop_metrics_scheduler)
-        atexit.register(Logging.log_metrics_summary)
     
     @staticmethod
     def _flush_thread_metrics(thread_id):
@@ -511,7 +631,7 @@ class Logging:
             Logging._thread_metrics[thread_id] = {}
 
     @staticmethod
-    def log_metrics_summary() -> None:
+    def _build_metrics_summary_snapshot() -> Optional[Dict[str, Any]]:
         # Flush any remaining thread-local metrics
         if hasattr(Logging, '_thread_metrics'):
             for thread_id in list(Logging._thread_metrics.keys()):
@@ -521,12 +641,13 @@ class Logging:
             metrics_snapshot = {k: v.copy() for k, v in Logging._metrics.items()}
 
         if not metrics_snapshot:
-            return
+            return None
+
         metrics_payload = []
         total_calls = 0
         for func, m in sorted(metrics_snapshot.items()):
-            count = m["count"]
-            total = m["total"]
+            count = int(m.get("count", 0) or 0)
+            total = float(m.get("total", 0.0) or 0.0)
             avg = total / count if count else 0.0
             total_calls += count
             metrics_payload.append({
@@ -536,17 +657,139 @@ class Logging:
                 "avg_seconds": round(avg, 6)
             })
 
-        Logging.log_info(
-            "Performance metrics summary",
-            fn_type="metrics",
-            function="metrics_summary",
-            event="metrics_summary",
-            status="success",
-            metrics=metrics_payload,
-            total_functions=len(metrics_payload),
-            total_calls=total_calls,
-            generated_at=time.time()
-        )
+        return {
+            "schema_version": 1,
+            "event": "metrics_summary",
+            "status": "success",
+            "timestamp": time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime()),
+            "generated_at": time.time(),
+            "metrics": metrics_payload,
+            "total_functions": len(metrics_payload),
+            "total_calls": total_calls,
+        }
+
+    @staticmethod
+    def _file_logging_active() -> bool:
+        try:
+            return Logging._file_logging_enabled and (not Setup.is_testing_mode())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _metrics_sidecar_path() -> Optional["os.PathLike"]:
+        try:
+            if not Setup.is_setup_done():
+                return None
+            if not Logging._file_logging_active():
+                return None
+            log_path = config.get_log_path()
+            return type(log_path)(str(log_path) + ".metrics")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _persist_metrics_sidecar(snapshot: Dict[str, Any]) -> None:
+        metrics_path = Logging._metrics_sidecar_path()
+        if metrics_path is None:
+            return
+
+        # Dedupe based on content, not timestamps
+        fingerprint_obj = {
+            "metrics": snapshot.get("metrics", []),
+            "total_functions": snapshot.get("total_functions"),
+            "total_calls": snapshot.get("total_calls"),
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+        with Logging._metrics_sidecar_lock:
+            if Logging._last_metrics_sidecar_fingerprint == fingerprint:
+                return
+
+            # Best-effort append; viewer ignores malformed/partial JSON lines
+            try:
+                parent_dir = os.path.dirname(os.fspath(metrics_path))
+                if parent_dir:
+                    os.makedirs(parent_dir, exist_ok=True)
+                with open(metrics_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(snapshot) + "\n")
+                Logging._last_metrics_sidecar_fingerprint = fingerprint
+            except Exception:
+                return
+
+    @staticmethod
+    def _format_metrics_table(snapshot: Dict[str, Any]) -> str:
+        metrics_list = snapshot.get("metrics") or []
+        total_functions = snapshot.get("total_functions") or 0
+        total_calls = snapshot.get("total_calls") or 0
+        ts = snapshot.get("timestamp") or ""
+
+        lines = []
+        lines.append(f"{ts} - METRICS SUMMARY")
+        lines.append(f"Functions: {total_functions}, Total calls: {total_calls}")
+        if not metrics_list:
+            return "\n".join(lines)
+
+        lines.append(f"  {'Function':<40} {'Calls':>8} {'Total Time':>12} {'Avg Time':>12} {'Time/Call':>12}")
+        lines.append(f"  {'-' * 40} {'-' * 8} {'-' * 12} {'-' * 12} {'-' * 12}")
+        for metric in metrics_list:
+            func_name = metric.get("function", "")
+            calls = int(metric.get("calls", 0) or 0)
+            total_seconds = float(metric.get("total_seconds", 0.0) or 0.0)
+            avg_seconds = float(metric.get("avg_seconds", 0.0) or 0.0)
+            time_per_call_ms = (total_seconds / calls * 1000) if calls > 0 else 0.0
+
+            if len(func_name) > 38:
+                func_name = func_name[:35] + "..."
+            lines.append(
+                f"  {func_name:<40} {calls:>8} {total_seconds:>12.6f}s {avg_seconds:>12.6f}s {time_per_call_ms:>12.3f}ms"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def log_metrics_summary() -> None:
+        """
+        Persist a metrics snapshot for tooling (viewer/UI).
+        This does not emit a log line (to avoid console spam and mixed schemas).
+        """
+        if not Setup.get_show_metrics():
+            return
+
+        snapshot = Logging._build_metrics_summary_snapshot()
+        if snapshot is None:
+            return
+
+        Logging._persist_metrics_sidecar(snapshot)
+
+    @staticmethod
+    def log_final_metrics_summary() -> None:
+        """
+        Print the final metrics summary to console at exit (if enabled),
+        and persist one last snapshot to the sidecar when file logging is enabled.
+        """
+        if not Setup.is_setup_done() or not Setup.get_show_metrics():
+            return
+
+        try:
+            Logging.stop_metrics_scheduler()
+        except Exception:
+            pass
+
+        snapshot = Logging._build_metrics_summary_snapshot()
+        if snapshot is None:
+            return
+
+        Logging._persist_metrics_sidecar(snapshot)
+
+        # Avoid noisy output in testing mode.
+        if Setup.is_testing_mode():
+            return
+
+        try:
+            print(Logging._format_metrics_table(snapshot), file=sys.__stdout__)
+        except Exception:
+            pass
 
     @staticmethod
     def stop_metrics_scheduler() -> None:

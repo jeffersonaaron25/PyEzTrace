@@ -65,7 +65,7 @@ class RedactionSettings:
         if not self.value_patterns:
             return False
 
-        if isinstance(value, (dict, list, tuple, set)):
+        if isinstance(value, (dict, list, tuple, set, frozenset)):
             return False
 
         try:
@@ -296,7 +296,7 @@ def _safe_preview_value(
                 return value[:max_len] + "…"
             return value
         # Simple containers: preview recursively but bounded
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, (list, tuple, set, frozenset)):
             preview = []
             for v in list(value)[:5]:
                 if redaction is not None and redaction.should_redact_value(v):

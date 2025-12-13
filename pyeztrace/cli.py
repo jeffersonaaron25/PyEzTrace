@@ -419,8 +419,8 @@ def _cmd_print(args):
 
 
 def _cmd_serve(args):
-    # Ensure JSON logging is used
-    print("Note: The viewer expects logs in JSON format. Set EZTRACE_LOG_FORMAT=json before running your app.")
+    # Ensure JSON file logging is used
+    print("Note: The viewer expects the log file in JSON format. Set EZTRACE_FILE_LOG_FORMAT=json (or EZTRACE_LOG_FORMAT=json) before running your app.")
     
     # Get log_file from args
     log_file = getattr(args, 'log_file', None)

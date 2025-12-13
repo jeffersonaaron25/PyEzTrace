@@ -52,7 +52,8 @@ from pyeztrace.tracer import trace
 from pyeztrace.custom_logging import Logging
 
 # Initialize the logging system
-log = Logging(log_format="color")  # or "json", "plain", "csv", "logfmt"
+# Defaults: console=color, file=json (when file logging is enabled)
+log = Logging()  # or Logging(log_format="json"), "plain", "csv", "logfmt"
 
 # Use the tracer decorator
 @trace()
@@ -163,7 +164,7 @@ export EZTRACE_REDACT_VALUE_PATTERNS="secret\d+,\b\d{3}-\d{2}-\d{4}\b"
 export EZTRACE_REDACT_PRESETS="pii,phi"
 ```
 
-Both lists and regex settings are applied to nested dictionaries and lists so you can
+Both lists and regex settings are applied to nested dictionaries, lists, and sets so you can
 safely log complex structures without leaking secrets.
 You can also set global defaults in code with `pyeztrace.set_global_redaction(...)`,
 which accepts the same key, regex, value pattern, and preset parameters.
@@ -444,6 +445,8 @@ All configuration options can be set via environment variables or code:
 ```python
 # Via environment variables
 export EZTRACE_LOG_FORMAT="json"
+export EZTRACE_CONSOLE_LOG_FORMAT="color"   # overrides console only
+export EZTRACE_FILE_LOG_FORMAT="json"       # overrides file only (viewer expects JSON)
 export EZTRACE_LOG_LEVEL="DEBUG"
 export EZTRACE_LOG_FILE="custom.log"
 export EZTRACE_MAX_SIZE="10485760"  # 10MB
@@ -454,7 +457,9 @@ export EZTRACE_BUFFER_FLUSH_INTERVAL="1.0"      # Seconds between flushes when b
 # Via code - must be setup before importing trace
 
 from pyeztrace.config import config
-config.format = "json"
+config.format = "json"  # legacy: sets both console and file formats
+config.console_format = "color"
+config.file_format = "json"
 config.log_level = "DEBUG"
 config.log_file = "custom.log"
 config.max_size = 10 * 1024 * 1024  # 10MB

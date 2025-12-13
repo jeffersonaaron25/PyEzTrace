@@ -155,6 +155,20 @@ def test_safe_preview_value_uses_presets_for_common_patterns():
     assert preview["ok"] == "fine"
 
 
+def test_safe_preview_value_redacts_sets_and_frozensets():
+    redaction = tracer._build_redaction_settings(redact_value_patterns=[r"secret\d+"])
+
+    preview = tracer._safe_preview_value({"public", "secret123"}, redaction=redaction)
+    assert isinstance(preview, list)
+    assert "public" in preview
+    assert "<redacted>" in preview
+
+    preview = tracer._safe_preview_value(frozenset(["public", "secret123"]), redaction=redaction)
+    assert isinstance(preview, list)
+    assert "public" in preview
+    assert "<redacted>" in preview
+
+
 def test_trace_applies_environment_redaction(monkeypatch):
     monkeypatch.setenv("EZTRACE_REDACT_KEYS", "secret,token")
     setup.Setup.initialize("EZTRACER_ENV_REDACTION", show_metrics=False)

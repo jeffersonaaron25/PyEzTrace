@@ -2,6 +2,8 @@ import json
 import logging
 import random
 import time
+import io
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -24,12 +26,20 @@ def reset_logging_state():
             handler.close()
         logger.removeHandler(handler)
     Logging._configured = False
+    Logging._base_format = None
+    Logging._console_format = None
+    Logging._file_format = None
+    Logging._file_logging_enabled = False
     yield
     for handler in logger.handlers[:]:
         if hasattr(handler, "close"):
             handler.close()
         logger.removeHandler(handler)
     Logging._configured = False
+    Logging._base_format = None
+    Logging._console_format = None
+    Logging._file_format = None
+    Logging._file_logging_enabled = False
 
 
 @pytest.fixture
@@ -47,11 +57,20 @@ def restore_config():
         "log_dir": config.log_dir,
         "log_file": config.log_file,
         "disable_file_logging": config.disable_file_logging,
+        "_explicit": getattr(config, "_explicit", {}).copy(),
+        "format": config.format,
+        "console_format": config.console_format,
+        "file_format": config.file_format,
     }
     yield
     config.log_dir = original["log_dir"]
     config.log_file = original["log_file"]
     config.disable_file_logging = original["disable_file_logging"]
+    config.format = original["format"]
+    config.console_format = original["console_format"]
+    config.file_format = original["file_format"]
+    if hasattr(config, "_explicit"):
+        config._explicit = original["_explicit"]
 
 
 def test_buffering_respects_environment(monkeypatch, restore_log_config, reset_logging_state):
@@ -131,6 +150,31 @@ def test_file_logging_enabled_by_default(tmp_path, reset_logging_state, restore_
     log_path = config.get_log_path()
     assert log_path.exists()
     assert log_path.read_text().strip()
+
+def test_default_console_color_file_json(tmp_path, reset_logging_state, restore_config, monkeypatch):
+    config.log_dir = str(tmp_path / "logs")
+    config.log_file = "default.log"
+    config.disable_file_logging = False
+
+    Setup.initialize("DEFAULT_FORMATS", show_metrics=False)
+
+    buf = io.StringIO()
+    monkeypatch.setattr(sys, "__stdout__", buf, raising=False)
+
+    log = Logging()
+    log.log_info("hello", function="test_func")
+    Logging.flush_logs()
+
+    console_out = buf.getvalue()
+    assert "\x1b[" in console_out  # ANSI color escape
+    assert '"timestamp"' not in console_out  # file JSON should not leak to console
+
+    log_path = config.get_log_path()
+    lines = [l for l in log_path.read_text().splitlines() if l.strip()]
+    assert lines
+    assert "\x1b[" not in lines[-1]
+    payload = json.loads(lines[-1])
+    assert payload["message"] == "hello"
 
 def test_log_format_json(monkeypatch):
     Setup.initialize("EZTRACER_LOG2", show_metrics=False)
