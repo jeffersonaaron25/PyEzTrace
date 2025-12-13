@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.0.13
+- **Breaking (behavior):** When file logging is enabled, the default file format is now JSON while the console remains colored output.
+- Added `EZTRACE_CONSOLE_LOG_FORMAT` and `EZTRACE_FILE_LOG_FORMAT` to configure formats independently (legacy `EZTRACE_LOG_FORMAT` still sets both).
+- Updated viewer/CLI messaging to require JSON **file** logs (not necessarily JSON console logs).
+- **Breaking (behavior):** Periodic `metrics_summary` snapshots are no longer emitted into the main trace log stream; they are persisted to a sidecar file `"<logfile>.metrics"` for the viewer/UI.
+- Viewer now prefers reading performance metrics snapshots from `"<logfile>.metrics"`, with fallback support for legacy in-log `metrics_summary` entries.
+- Metrics scheduler runs only when metrics are enabled and file logging is enabled; console output shows only the final summary at process exit.
+
+## v0.0.12
+- Added CLI log analysis utilities (filtering, hierarchy formatting, performance summaries).
+- Added memory tracking (RSS/peak/delta) to trace events and viewer display.
+- Viewer improvements for JSON logs (metrics handling and richer node details).
+
+## v0.0.11
+- Enhanced trace viewer and CLI integration.
+- Added redaction for argument/result previews (env-configurable and via API helpers).
+- Expanded tracer previews/metadata to be safer and more informative.
+
+## v0.0.10
+- Added more logging configuration knobs (buffering, flush interval, disable file logging).
+- Added CI/release GitHub workflows and expanded test coverage (including optional OpenTelemetry tests).
+- Updated packaging metadata (dependency-free default install, newer Python classifiers, pytest config).
+
+## v0.0.9
+- Fixed class tracing to preserve descriptor semantics.
+
+## v0.0.8
+- Added optional OpenTelemetry integration (`pyeztrace[otel]`) and OTLP export bridge.
+- Added interactive trace viewer and CLI tooling.
+
 ## v0.0.7
 - Fixed issue with class method tracing.
 - Added recursive tracing.

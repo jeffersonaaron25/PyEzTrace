@@ -9,7 +9,15 @@ import time
 
 class _TraceTreeBuilder:
     def __init__(self, log_file: Path) -> None:
-        self.log_file = log_file
+        # Normalize to an absolute, user-expanded path so `~` and relative paths work
+        # even when the viewer is started from a different working directory.
+        try:
+            self.log_file = log_file.expanduser().resolve(strict=False)
+        except Exception:
+            self.log_file = Path(str(log_file)).expanduser()
+
+    def _metrics_file(self) -> Path:
+        return Path(str(self.log_file) + ".metrics")
 
     def _read_lines(self) -> List[str]:
         if not self.log_file.exists():
@@ -36,6 +44,28 @@ class _TraceTreeBuilder:
                 continue
         return entries
 
+    def _read_metrics_sidecar(self) -> List[Dict[str, Any]]:
+        metrics_file = self._metrics_file()
+        if not metrics_file.exists():
+            return []
+        try:
+            lines = metrics_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            return []
+
+        metrics_entries: List[Dict[str, Any]] = []
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict) and obj.get("event") == "metrics_summary":
+                    metrics_entries.append(obj)
+            except Exception:
+                continue
+        return metrics_entries
+
     def _to_epoch(self, timestamp_str: str) -> float:
         try:
             # Format: YYYY-MM-DDTHH:MM:SS
@@ -49,7 +79,7 @@ class _TraceTreeBuilder:
         lines = self._read_lines()
         entries = self._parse_json_lines(lines)
         nodes: Dict[str, Dict[str, Any]] = {}
-        metrics_entries: List[Dict[str, Any]] = []
+        metrics_entries_from_log: List[Dict[str, Any]] = []
         roots: List[str] = []
 
         def ensure_node(cid: str, parent_id: Optional[str] = None) -> Dict[str, Any]:
@@ -89,7 +119,7 @@ class _TraceTreeBuilder:
             status = data.get('status')
 
             if event == 'metrics_summary':
-                metrics_entries.append({
+                metrics_entries_from_log.append({
                     'timestamp': e.get('timestamp'),
                     'status': status or e.get('level'),
                     'metrics': data.get('metrics', []),
@@ -154,6 +184,15 @@ class _TraceTreeBuilder:
             }
 
         tree = [materialize(cid) for cid in roots]
+
+        sidecar_metrics = self._read_metrics_sidecar()
+        metrics_entries: List[Dict[str, Any]] = []
+        if sidecar_metrics:
+            # Prefer sidecar snapshots; they are derived UI caches and avoid polluting trace logs.
+            metrics_entries = sidecar_metrics
+        else:
+            metrics_entries = metrics_entries_from_log
+
         return {
             'generated_at': time.time(),
             'log_file': str(self.log_file),
@@ -165,10 +204,13 @@ class _TraceTreeBuilder:
 
 class TraceViewerServer:
     def __init__(self, log_file: Path, host: str = '127.0.0.1', port: int = 8765) -> None:
-        self.log_file = log_file
+        try:
+            self.log_file = log_file.expanduser().resolve(strict=False)
+        except Exception:
+            self.log_file = Path(str(log_file)).expanduser()
         self.host = host
         self.port = port
-        self._builder = _TraceTreeBuilder(log_file)
+        self._builder = _TraceTreeBuilder(self.log_file)
         self._httpd: Optional[ThreadingHTTPServer] = None
 
     def _handler_factory(self):
@@ -320,17 +362,18 @@ class TraceViewerServer:
   const metaEl = document.getElementById('meta');
   const refreshBtn = document.getElementById('refresh');
   const overviewEl = document.getElementById('overview');
-  const statusFilterGroup = document.getElementById('status-filter');
-  let tree = [];
-  let total = 0;
-  let metrics = [];
-  let generatedAt = null;
-  let statusFilter = 'all';
-  const expanded = new Set();
-  let metricsExpanded = false; // Collapsed by default
-  let refreshTimer = null;
-  let autoRefreshEnabled = true;
-  let autoExpandRoots = true;
+	  const statusFilterGroup = document.getElementById('status-filter');
+	  let tree = [];
+	  let total = 0;
+	  let metrics = [];
+	  let generatedAt = null;
+	  let statusFilter = 'all';
+	  const expanded = new Set();
+	  let metricsExpanded = false; // Collapsed by default
+	  let metricsTab = 'latest'; // 'latest' | 'timeseries'
+	  let refreshTimer = null;
+	  let autoRefreshEnabled = true;
+	  let autoExpandRoots = true;
 
   async function fetchTree(){
     const res = await fetch('/api/tree');
@@ -339,7 +382,7 @@ class TraceViewerServer:
     total = data.total_nodes || 0;
     metrics = data.metrics || [];
     generatedAt = data.generated_at || null;
-    metaEl.textContent = `${generatedAt ? new Date(generatedAt*1000).toLocaleString() : ''} • ${data.log_file} • ${total} nodes • Memory values reflect current RSS snapshots per event`;
+    metaEl.textContent = `${generatedAt ? new Date(generatedAt*1000).toLocaleString() : ''} • ${data.log_file} • ${total} nodes`;
     render();
   }
 
@@ -420,9 +463,9 @@ class TraceViewerServer:
     `;
   }
 
-  function render(){
-    const q = (searchEl.value||'').toLowerCase().trim();
-    const html = tree.map(n=>renderNode(n, q, 0)).join('');
+	  function render(){
+	    const q = (searchEl.value||'').toLowerCase().trim();
+	    const html = tree.map(n=>renderNode(n, q, 0)).join('');
     const traceHeader = `<div class="section-title">
       <span>Trace calls</span>
       <div class="flex">
@@ -431,81 +474,182 @@ class TraceViewerServer:
         <button class="btn" id="collapse-all">Collapse all</button>
       </div>
     </div>`;
-    const traceHtml = traceHeader + (html || '<div class="muted">No trace nodes found. Ensure EZTRACE_LOG_FORMAT=json.</div>');
+    const traceHtml = traceHeader + (html || '<div class="muted">No trace nodes found. Ensure EZTRACE_FILE_LOG_FORMAT=json (or EZTRACE_LOG_FORMAT=json).</div>');
 
     const overviewCards = [];
     overviewCards.push(`<div class="card"><div class="section-title"><span>Last updated</span></div><div class="fn">${generatedAt ? new Date(generatedAt*1000).toLocaleString() : '-'}</div><div class="muted">Live reload every 2.5s</div></div>`);
-    overviewCards.push(`<div class="card"><div class="section-title"><span>Nodes</span></div><div class="fn">${total}</div><div class="muted">Trace entries parsed</div></div>`);
-    const errorCount = countMatches(tree, n => !!n.error || n.status === 'error');
-    overviewCards.push(`<div class="card"><div class="section-title"><span>Errors</span></div><div class="fn" style="color:#fca5a5;">${errorCount}</div><div class="muted">Across all calls</div></div>`);
-    overviewCards.push(`<div class="card"><div class="section-title"><span>Metrics snapshots</span></div><div class="fn">${metrics.length}</div><div class="muted">performance summaries</div></div>`);
-    overviewEl.innerHTML = overviewCards.join('');
+	    overviewCards.push(`<div class="card"><div class="section-title"><span>Nodes</span></div><div class="fn">${total}</div><div class="muted">Trace entries parsed</div></div>`);
+	    const errorCount = countMatches(tree, n => !!n.error || n.status === 'error');
+	    overviewCards.push(`<div class="card"><div class="section-title"><span>Errors</span></div><div class="fn" style="color:#fca5a5;">${errorCount}</div><div class="muted">Across all calls</div></div>`);
+	    overviewCards.push(`<div class="card"><div class="section-title"><span>Metrics</span></div><div class="fn">${metrics.length ? '✓' : '-'}</div><div class="muted">${metrics.length ? `latest snapshot (history: ${metrics.length})` : 'no metrics snapshots'}</div></div>`);
+	    overviewEl.innerHTML = overviewCards.join('');
 
-    // Build metrics HTML (collapsible, at the top)
-    const metricsHtml = metrics.length ? `
-      <div class="collapsible-section">
-        <div class="collapsible-header" onclick="window.__toggleMetrics()">
-          <div class="section-title" style="margin:0;">
-            <span>Performance metrics</span>
-            <span class="muted" style="font-size:11px; margin-left:8px;">(${metrics.length} snapshot${metrics.length !== 1 ? 's' : ''})</span>
-          </div>
-          <span class="chevron ${metricsExpanded ? 'expanded' : ''}" style="color:var(--muted);">▶</span>
-        </div>
-        <div class="collapsible-content ${metricsExpanded ? '' : 'hidden'}">
-          ${metrics.map((m, idx)=>`
-            <div class="card" style="margin-bottom: ${idx < metrics.length - 1 ? '20px' : '0'};">
-              <div class="flex" style="justify-content: space-between; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border);">
-                <div class="badges">
-                  <span class="badge">${m.status||'-'}</span>
-                  <span class="badge">${m.timestamp||'-'}</span>
-                </div>
-                <div class="muted" style="font-size: 11px;">Generated ${m.generated_at ? new Date(m.generated_at*1000).toLocaleString() : '-'}</div>
-              </div>
-              <div class="metrics-summary">
-                <div class="metrics-summary-item">
-                  <strong>Functions:</strong>${m.total_functions||0}
-                </div>
-                <div class="metrics-summary-item">
-                  <strong>Total calls:</strong>${m.total_calls||0}
-                </div>
-                <div class="metrics-summary-item">
-                  <strong>Metrics:</strong>${(m.metrics||[]).length}
-                </div>
-              </div>
-              ${(m.metrics||[]).length > 0 ? `
-                <table class="metrics-table">
-                  <thead>
-                    <tr>
-                      <th>Function</th>
-                      <th class="number">Calls</th>
-                      <th class="number">Total Time</th>
-                      <th class="number">Avg Time</th>
-                      <th class="number">Time/Call</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${(m.metrics||[]).map(row=>{
-                      const avgMs = (row.avg_seconds || 0) * 1000;
-                      const timePerCall = row.calls > 0 ? (row.total_seconds / row.calls * 1000) : 0;
-                      const avgClass = avgMs > 100 ? 'bad' : avgMs > 10 ? '' : 'good';
-                      return `
-                        <tr>
-                          <td class="function-name">${row.function||'-'}</td>
-                          <td class="number">${row.calls||0}</td>
-                          <td class="number">${(row.total_seconds||0).toFixed(6)}s</td>
-                          <td class="number ${avgClass}">${(row.avg_seconds||0).toFixed(6)}s</td>
-                          <td class="number">${timePerCall.toFixed(3)}ms</td>
-                        </tr>
-                      `;
-                    }).join('')}
-                  </tbody>
-                </table>
-              ` : '<div class="muted" style="padding:16px 0; text-align:center;">No metrics data available</div>'}
-            </div>
-          `).join('')}
-        </div>
-      </div>
-    ` : '';
+	    // Build metrics HTML (collapsible, at the top)
+	    const latestMetrics = metrics && metrics.length ? metrics[metrics.length - 1] : null;
+
+	    function normalizeMetricsList(mList){
+	      const out = [];
+	      (mList||[]).forEach(row=>{
+	        if(!row) return;
+	        out.push({
+	          function: row.function || '-',
+	          calls: row.calls || 0,
+	          total_seconds: row.total_seconds || 0,
+	          avg_seconds: row.avg_seconds || 0
+	        });
+	      });
+	      return out;
+	    }
+
+	    function buildDeltaSeries(snaps){
+	      // snaps are cumulative; derive per-interval deltas.
+	      const series = new Map(); // fn -> {fn, deltas: [{calls,total,avg_ms}], last:{calls,total,avg_s}}
+	      if(!snaps || snaps.length < 2) return series;
+	      const toMap = (snap)=>{
+	        const map = new Map();
+	        normalizeMetricsList(snap.metrics).forEach(r=> map.set(r.function, r));
+	        return map;
+	      };
+	      for(let i=1;i<snaps.length;i++){
+	        const prev = toMap(snaps[i-1]);
+	        const cur = toMap(snaps[i]);
+	        const fns = new Set([...prev.keys(), ...cur.keys()]);
+	        fns.forEach(fn=>{
+	          const p = prev.get(fn) || {calls:0,total_seconds:0,avg_seconds:0};
+	          const c = cur.get(fn) || {calls:0,total_seconds:0,avg_seconds:0};
+	          const dcalls = (c.calls||0) - (p.calls||0);
+	          const dtotal = (c.total_seconds||0) - (p.total_seconds||0);
+	          if(dcalls <= 0 || dtotal < 0) return;
+	          const avgMs = dcalls > 0 ? (dtotal / dcalls * 1000) : 0;
+	          if(!series.has(fn)) series.set(fn, { fn, deltas: [], last: c });
+	          series.get(fn).deltas.push({ calls: dcalls, total: dtotal, avg_ms: avgMs });
+	          series.get(fn).last = c;
+	        });
+	      }
+	      return series;
+	    }
+
+	    function sparkline(values){
+	      const vals = (values||[]).map(v=>Number(v)||0);
+	      if(!vals.length) return '<span class="muted">-</span>';
+	      const max = Math.max(...vals, 1e-9);
+	      const bars = vals.map(v=>{
+	        const h = Math.max(2, Math.round((v / max) * 20));
+	        return `<span title="${v.toFixed(6)}s" style="display:inline-block;width:5px;height:${h}px;background:rgba(56,189,248,0.65);border-radius:2px;"></span>`;
+	      }).join('');
+	      return `<span style="display:inline-flex;align-items:flex-end;gap:2px;height:22px;">${bars}</span>`;
+	    }
+
+	    const metricsHtml = latestMetrics ? `
+	      <div class="collapsible-section">
+	        <div class="collapsible-header" onclick="window.__toggleMetrics()">
+	          <div class="section-title" style="margin:0;">
+	            <span>Performance metrics</span>
+	            <span class="muted" style="font-size:11px; margin-left:8px;">(latest${metrics.length > 1 ? ` • history: ${metrics.length}` : ''})</span>
+	          </div>
+	          <span class="chevron ${metricsExpanded ? 'expanded' : ''}" style="color:var(--muted);">▶</span>
+	        </div>
+	        <div class="collapsible-content ${metricsExpanded ? '' : 'hidden'}">
+	          <div class="flex" style="justify-content: space-between; align-items:center; margin-bottom: 10px;">
+	            <div class="chip-group">
+	              <button class="chip ${metricsTab==='latest'?'active':''}" onclick="window.__setMetricsTab('latest')">Latest</button>
+	              <button class="chip ${metricsTab==='timeseries'?'active':''}" onclick="window.__setMetricsTab('timeseries')">Time series</button>
+	            </div>
+	            <div class="muted" style="font-size: 11px;">Generated ${latestMetrics.generated_at ? new Date(latestMetrics.generated_at*1000).toLocaleString() : '-'}</div>
+	          </div>
+
+	          ${metricsTab === 'latest' ? `
+	            <div class="card">
+	              <div class="flex" style="justify-content: space-between; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border);">
+	                <div class="badges">
+	                  <span class="badge">${latestMetrics.status||'-'}</span>
+	                  <span class="badge">${latestMetrics.timestamp||'-'}</span>
+	                </div>
+	                <div class="muted" style="font-size: 11px;">Showing latest snapshot</div>
+	              </div>
+	              <div class="metrics-summary">
+	                <div class="metrics-summary-item"><strong>Functions:</strong>${latestMetrics.total_functions||0}</div>
+	                <div class="metrics-summary-item"><strong>Total calls:</strong>${latestMetrics.total_calls||0}</div>
+	                <div class="metrics-summary-item"><strong>Metrics:</strong>${(latestMetrics.metrics||[]).length}</div>
+	              </div>
+	              ${(latestMetrics.metrics||[]).length > 0 ? `
+	                <table class="metrics-table">
+	                  <thead>
+	                    <tr>
+	                      <th>Function</th>
+	                      <th class="number">Calls</th>
+	                      <th class="number">Total Time</th>
+	                      <th class="number">Avg Time</th>
+	                      <th class="number">Time/Call</th>
+	                    </tr>
+	                  </thead>
+	                  <tbody>
+	                    ${(latestMetrics.metrics||[]).map(row=>{
+	                      const avgMs = (row.avg_seconds || 0) * 1000;
+	                      const timePerCall = row.calls > 0 ? (row.total_seconds / row.calls * 1000) : 0;
+	                      const avgClass = avgMs > 100 ? 'bad' : avgMs > 10 ? '' : 'good';
+	                      return `
+	                        <tr>
+	                          <td class="function-name">${row.function||'-'}</td>
+	                          <td class="number">${row.calls||0}</td>
+	                          <td class="number">${(row.total_seconds||0).toFixed(6)}s</td>
+	                          <td class="number ${avgClass}">${(row.avg_seconds||0).toFixed(6)}s</td>
+	                          <td class="number">${timePerCall.toFixed(3)}ms</td>
+	                        </tr>
+	                      `;
+	                    }).join('')}
+	                  </tbody>
+	                </table>
+	              ` : '<div class="muted" style="padding:16px 0; text-align:center;">No metrics data available</div>'}
+	            </div>
+	          ` : `
+	            <div class="card">
+	              <div class="section-title"><span>Hotspot evolution</span></div>
+	              ${metrics.length < 2 ? `<div class="muted">Need at least 2 snapshots to show trends.</div>` : `
+	                <div class="muted" style="font-size:12px; margin-bottom:10px;">Trends are computed from per-snapshot deltas (snapshots are cumulative).</div>
+	                <table class="metrics-table">
+	                  <thead>
+	                    <tr>
+	                      <th>Function</th>
+	                      <th class="number">Total</th>
+	                      <th class="number">Calls</th>
+	                      <th class="number">Last avg</th>
+	                      <th>Trend (Δ total per interval)</th>
+	                    </tr>
+	                  </thead>
+	                  <tbody>
+	                    ${(()=>{
+	                      const series = buildDeltaSeries(metrics);
+	                      const lastMap = new Map();
+	                      normalizeMetricsList(latestMetrics.metrics).forEach(r=> lastMap.set(r.function, r));
+	                      const rows = [...lastMap.values()]
+	                        .sort((a,b)=> (b.total_seconds||0) - (a.total_seconds||0))
+	                        .slice(0, 20)
+	                        .map(r=>{
+	                          const s = series.get(r.function);
+	                          const deltas = (s && s.deltas) ? s.deltas.map(d=>d.total) : [];
+	                          const lastAvgMs = (r.avg_seconds||0) * 1000;
+	                          const avgClass = lastAvgMs > 100 ? 'bad' : lastAvgMs > 10 ? '' : 'good';
+	                          return `
+	                            <tr>
+	                              <td class="function-name">${r.function||'-'}</td>
+	                              <td class="number">${(r.total_seconds||0).toFixed(6)}s</td>
+	                              <td class="number">${r.calls||0}</td>
+	                              <td class="number ${avgClass}">${(r.avg_seconds||0).toFixed(6)}s</td>
+	                              <td>${sparkline(deltas)}</td>
+	                            </tr>
+	                          `;
+	                        });
+	                      return rows.join('');
+	                    })()}
+	                  </tbody>
+	                </table>
+	              `}
+	            </div>
+	          `}
+	        </div>
+	      </div>
+	    ` : '';
 
     rootEl.innerHTML = metricsHtml + traceHtml;
 
@@ -521,10 +665,15 @@ class TraceViewerServer:
     render();
   }
 
-  window.__toggleMetrics = function(){
-    metricsExpanded = !metricsExpanded;
-    render();
-  }
+	  window.__toggleMetrics = function(){
+	    metricsExpanded = !metricsExpanded;
+	    render();
+	  }
+
+	  window.__setMetricsTab = function(tab){
+	    metricsTab = tab;
+	    render();
+	  }
 
   function setStatusFilter(val){
     statusFilter = val;
@@ -603,4 +752,3 @@ class TraceViewerServer:
             pass
         finally:
             self._httpd.server_close()
-

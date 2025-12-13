@@ -92,7 +92,7 @@ class Setup:
         if not cls.__metrics_registered:
             from pyeztrace.custom_logging import Logging
             import atexit
-            atexit.register(Logging.log_metrics_summary)
+            atexit.register(Logging.log_final_metrics_summary)
             cls.__metrics_registered = True
 
     @classmethod

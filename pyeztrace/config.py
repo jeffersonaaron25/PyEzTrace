@@ -1,12 +1,25 @@
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 class LogConfig:
     """Configuration for the logging system."""
     def __init__(self):
+        env_base_format = os.environ.get("EZTRACE_LOG_FORMAT")
+        env_console_format = os.environ.get("EZTRACE_CONSOLE_LOG_FORMAT")
+        env_file_format = os.environ.get("EZTRACE_FILE_LOG_FORMAT")
+
+        self._explicit: Dict[str, bool] = {
+            "format": env_base_format is not None,
+            "console_format": env_console_format is not None,
+            "file_format": env_file_format is not None,
+        }
+
         self._config: Dict[str, Any] = {
-            'format': self._get_env('LOG_FORMAT', 'color'),
+            # Legacy "set both" format. When unset, per-sink defaults apply.
+            'format': env_base_format,
+            'console_format': env_console_format or 'color',
+            'file_format': env_file_format or 'json',
             'log_file': self._get_env('LOG_FILE', 'app.log'),
             'max_size': int(self._get_env('MAX_SIZE', str(10 * 1024 * 1024))),  # 10MB
             'backup_count': int(self._get_env('BACKUP_COUNT', '5')),
@@ -28,12 +41,43 @@ class LogConfig:
         return value.lower() in {"1", "true", "yes", "on"}
 
     @property
-    def format(self) -> str:
+    def format(self) -> Optional[str]:
         return self._config['format']
 
     @format.setter
-    def format(self, value: str) -> None:
+    def format(self, value: Optional[str]) -> None:
         self._config['format'] = value
+        self._explicit["format"] = True
+
+    @property
+    def console_format(self) -> str:
+        return self._config["console_format"]
+
+    @console_format.setter
+    def console_format(self, value: str) -> None:
+        self._config["console_format"] = value
+        self._explicit["console_format"] = True
+
+    @property
+    def file_format(self) -> str:
+        return self._config["file_format"]
+
+    @file_format.setter
+    def file_format(self, value: str) -> None:
+        self._config["file_format"] = value
+        self._explicit["file_format"] = True
+
+    @property
+    def format_explicit(self) -> bool:
+        return self._explicit.get("format", False)
+
+    @property
+    def console_format_explicit(self) -> bool:
+        return self._explicit.get("console_format", False)
+
+    @property
+    def file_format_explicit(self) -> bool:
+        return self._explicit.get("file_format", False)
 
     @property
     def log_file(self) -> str:
