@@ -240,6 +240,22 @@ async def async_function():
     log.log_info("Async operation completed")
 ```
 
+### 6. Redirecting `print` to logging
+
+If you have existing `print` statements, you can import PyEzTrace's drop-in replacement to route them into the logger (async-friendly and structured):
+
+```python
+from pyeztrace import print  # noqa: A001 - intentionally shadow built-in
+from pyeztrace.setup import Setup
+
+Setup.initialize("MyApp")
+
+print("Hello from EzTrace!")            # logs at INFO level
+print("Something odd", level="WARNING") # choose a level
+```
+
+It automatically falls back to the built-in `print` if EzTrace is not initialized yet or when printing to a custom file handle.
+
 ### 6. Performance Metrics
 
 Enable automatic performance tracking:
