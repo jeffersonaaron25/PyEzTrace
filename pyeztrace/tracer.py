@@ -10,6 +10,7 @@ import types
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Pattern, Sequence, Set, TypeVar, Union
+import warnings
 try:
     import resource  # Unix-specific
 except Exception:
@@ -97,8 +98,8 @@ def _build_redaction_settings(
         if isinstance(redact_pattern, str):
             try:
                 compiled_pattern = re.compile(redact_pattern, re.IGNORECASE)
-            except re.error:
-                compiled_pattern = None
+            except re.error as exc:
+                warnings.warn(f"Ignoring invalid redaction pattern '{redact_pattern}': {exc}")
         else:
             compiled_pattern = redact_pattern
     else:
@@ -119,8 +120,8 @@ def _build_redaction_settings(
                     continue
                 try:
                     compiled_value_patterns.append(re.compile(pat, re.IGNORECASE))
-                except re.error:
-                    continue
+                except re.error as exc:
+                    warnings.warn(f"Ignoring invalid redaction value pattern '{pat}': {exc}")
             else:
                 compiled_value_patterns.append(pat)
 
@@ -297,6 +298,25 @@ def _safe_preview_value(
             return value
         # Simple containers: preview recursively but bounded
         if isinstance(value, (list, tuple, set, frozenset)):
+            if isinstance(value, (set, frozenset)):
+                elements = list(value)
+                preview = []
+                redacted_in_tail = False
+                for idx, v in enumerate(elements):
+                    is_redacted = redaction is not None and redaction.should_redact_value(v)
+                    if idx < 5:
+                        if is_redacted:
+                            preview.append("<redacted>")
+                        else:
+                            preview.append(_safe_preview_value(v, max_len=max_len // 2, redaction=redaction))
+                    elif is_redacted:
+                        redacted_in_tail = True
+                if len(elements) > 5:
+                    if redacted_in_tail:
+                        preview.append("<redacted>")
+                    preview.append("…")
+                return preview
+
             preview = []
             for v in list(value)[:5]:
                 if redaction is not None and redaction.should_redact_value(v):

@@ -1,3 +1,4 @@
+import warnings
 import pytest
 from pyeztrace import setup, tracer
 
@@ -167,6 +168,39 @@ def test_safe_preview_value_redacts_sets_and_frozensets():
     assert isinstance(preview, list)
     assert "public" in preview
     assert "<redacted>" in preview
+
+
+def test_build_redaction_settings_warns_on_invalid_regex():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        settings = tracer._build_redaction_settings(redact_pattern="(")
+    assert settings is None or settings.pattern is None
+    assert any("invalid redaction pattern" in str(w.message) for w in caught)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        settings = tracer._build_redaction_settings(redact_value_patterns=["["])
+    assert settings is None or settings.value_patterns is None
+    assert any("invalid redaction value pattern" in str(w.message) for w in caught)
+
+
+def test_safe_preview_value_redacts_set_tail_elements():
+    redaction = tracer._build_redaction_settings(redact_value_patterns=[r"secret\d+"])
+
+    class OrderedSet(set):
+        def __init__(self, items):
+            self._order = list(items)
+            super().__init__(items)
+
+        def __iter__(self):
+            return iter(self._order)
+
+    data = OrderedSet(["public1", "public2", "public3", "public4", "public5", "secret123"])
+
+    preview = tracer._safe_preview_value(data, redaction=redaction)
+
+    assert preview.count("<redacted>") >= 1
+    assert "…" in preview
 
 
 def test_trace_applies_environment_redaction(monkeypatch):
