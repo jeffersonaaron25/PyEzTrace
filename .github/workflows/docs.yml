@@ -19,7 +19,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install MkDocs and Material
-        run: pip install mkdocs mkdocs-material mkdocs-awesome-pages-plugin
+        run: pip install mkdocs mkdocs-material mkdocs-awesome-pages-plugin mkdocs-git-revision-date-localized-plugin
 
       - name: Deploy to GitHub Pages
         run: mkdocs gh-deploy --force
