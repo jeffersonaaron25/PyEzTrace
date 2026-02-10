@@ -9,6 +9,7 @@ import io
 import traceback
 from logging.handlers import RotatingFileHandler
 import threading
+import contextvars
 import queue
 import hashlib
 from pyeztrace.setup import Setup
@@ -17,26 +18,30 @@ from pyeztrace.config import config
 from typing import Any, Callable, Optional, Union, Dict
 
 class LogContext:
-    """Thread-safe context management for logging."""
-    _context_data = threading.local()
+    """Async-safe context management for logging."""
+    _context_stack = contextvars.ContextVar("eztrace_log_context_stack", default=None)
 
     @classmethod
     def get_current_context(cls) -> Dict:
-        if not hasattr(cls._context_data, 'stack'):
-            cls._context_data.stack = [{}]
-        return cls._context_data.stack[-1]
+        stack = cls._context_stack.get()
+        if stack is None:
+            stack = [{}]
+            cls._context_stack.set(stack)
+        return stack[-1]
 
     def __init__(self, **kwargs):
         self.context = kwargs
 
     def __enter__(self):
-        if not hasattr(self.__class__._context_data, 'stack'):
-            self.__class__._context_data.stack = [{}]
-        self.__class__._context_data.stack.append({**self.__class__.get_current_context(), **self.context})
+        stack = self.__class__._context_stack.get()
+        if stack is None:
+            stack = [{}]
+        new_stack = stack + [{**stack[-1], **self.context}]
+        self._token = self.__class__._context_stack.set(new_stack)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.__class__._context_data.stack.pop()
+        self.__class__._context_stack.reset(self._token)
 
 
 class BufferedHandler(logging.Handler):

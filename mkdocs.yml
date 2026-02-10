@@ -1,0 +1,45 @@
+# PyEzTrace documentation - https://www.mkdocs.org/user-guide/configuration/
+site_name: PyEzTrace
+site_description: Lightweight Python tracing and logging with hierarchical output and an interactive viewer
+site_url: https://jeffersonaaron25.github.io/pyeztrace/
+repo_url: https://github.com/jeffersonaaron25/pyeztrace
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: cyan
+      accent: blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: cyan
+      accent: blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+    - content.code.annotate
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Usage: usage.md
+  - Configuration: configuration.md
+  - Contributing: contributing.md
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.snippets
+  - admonition
+  - pymdownx.tabbed:
+      alternate_style: true

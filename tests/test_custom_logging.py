@@ -46,9 +46,11 @@ def reset_logging_state():
 def restore_log_config():
     original_enabled = config.buffer_enabled
     original_flush_interval = config.buffer_flush_interval
+    original_disable_file_logging = config.disable_file_logging
     yield
     config.buffer_enabled = original_enabled
     config.buffer_flush_interval = original_flush_interval
+    config.disable_file_logging = original_disable_file_logging
 
 
 @pytest.fixture
@@ -76,6 +78,7 @@ def restore_config():
 def test_buffering_respects_environment(monkeypatch, restore_log_config, reset_logging_state):
     monkeypatch.setenv("EZTRACE_BUFFER_ENABLED", "true")
     monkeypatch.setenv("EZTRACE_BUFFER_FLUSH_INTERVAL", "2.5")
+    config.disable_file_logging = False
 
     Setup.initialize("EZTRACE_BUFFERING_ENV", show_metrics=False)
     Logging(log_format="plain")
@@ -93,6 +96,7 @@ def test_buffering_respects_config(monkeypatch, restore_log_config, reset_loggin
 
     config.buffer_enabled = True
     config.buffer_flush_interval = 0.2
+    config.disable_file_logging = False
 
     Setup.initialize("EZTRACE_BUFFERING_CONFIG", show_metrics=False)
     Logging(log_format="plain")

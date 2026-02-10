@@ -4,18 +4,18 @@ A dependency-free, lightweight Python tracing and logging library with hierarchi
 
 ## Features
 
-- 🌳 **Hierarchical Logging**: Visualize nested operations with tree-style output
-- 🎨 **Multiple Formats**: Support for color, plain text, JSON, CSV, and logfmt outputs
-- 📊 **Performance Metrics**: Built-in timing and tracing capabilities
-- 🔄 **Context Management**: Thread-safe context propagation
-- 🔄 **Log Rotation**: Automatic log file management
-- 🎯 **Decorator-based Tracing**: Easy function and method tracing
-- 💪 **Thread-Safe**: Fully thread-safe implementation
-- 🚀 **High Performance**: Buffered logging and optimized output
- - 🌐 **OpenTelemetry Bridge (optional)**: Emit spans to OTLP/console, or export batches to S3/Azure Blob
+- **Hierarchical Logging**: Visualize nested operations with tree-style output
+- **Multiple Formats**: Support for color, plain text, JSON, CSV, and logfmt outputs
+- **Performance Metrics**: Built-in timing and tracing capabilities
+- **Context Management**: Thread-safe context propagation
+- **Log Rotation**: Automatic log file management
+- **Decorator-based Tracing**: Easy function and method tracing
+- **Thread-Safe**: Fully thread-safe implementation
+- **High Performance**: Buffered logging and optimized output
+- **OpenTelemetry Bridge (optional)**: Emit spans to OTLP/console, or export batches to S3/Azure Blob
 
 ### New
-- 🧭 **Interactive Viewer**: Explore hierarchical traces with input/output previews, time, CPU, and memory
+- **Interactive Viewer**: Explore hierarchical traces with input/output previews, time, CPU, and memory
 
 ## Installation
 
@@ -86,14 +86,38 @@ Output example:
 ### 1. Setup and Configuration
 
 ```python
-# Auto-initialization
-from pyeztrace.tracer import trace  # Automatically initializes with script name
-
-# Optional: customize settings
 from pyeztrace.setup import Setup
-Setup.set_project("MyApp")          # Change project name
-Setup.set_show_metrics(True)        # Enable performance metrics
+from pyeztrace import trace
+
+# Recommended: initialize once at app startup
+Setup.initialize(
+    "MyApp",
+    show_metrics=True,
+    log_format="json",      # legacy "set both sinks"
+    log_file="app.log",
+    log_dir="logs",
+    disable_file_logging=False,
+)
 ```
+
+#### Initialization order (important)
+
+Initialization is lazy and occurs on first traced/logging use if you did not call `Setup.initialize(...)` yourself.
+Because logging handlers are configured once, configure before first traced call for predictable behavior.
+
+For predictable behavior in scripts/apps:
+
+- Set environment variables **before process start** (recommended for CLI):
+  - `EZTRACE_DISABLE_FILE_LOGGING=0`
+  - `EZTRACE_LOG_DIR=logs`
+  - `EZTRACE_LOG_FILE=app.log`
+- Or initialize/configure explicitly at startup (recommended for libraries/apps):
+  - call `Setup.initialize(...)` before first traced call.
+
+Configuration precedence (highest to lowest):
+- Explicit kwargs in `Setup.initialize(...)`
+- Environment variables (`EZTRACE_*`)
+- Built-in defaults
 
 ### 2. Tracing with Fine-grained Control
 
@@ -214,8 +238,8 @@ Requirements:
 from pyeztrace.custom_logging import Logging
 from pyeztrace.setup import Setup
 
-Setup.initialize("MyApp", show_metrics=True)
-log = Logging(log_format="json")
+Setup.initialize("MyApp", show_metrics=True, file_format="json", disable_file_logging=False)
+log = Logging()
 ```
 
 Run your app to generate logs, then start the viewer pointing to your log file:
@@ -284,13 +308,8 @@ def monitored_function():
 Configure automatic log rotation based on file size:
 
 ```python
-from pyeztrace.config import config
-
-config.max_size = 10 * 1024 * 1024  # 10MB
-config.backup_count = 5  # Keep 5 backup files
-config.log_dir = "logs"  # Custom log directory
-config.log_file = "app.log"  # Custom log filename
-# must be setup before importing trace
+from pyeztrace.setup import Setup
+Setup.initialize("MyApp", max_size=10 * 1024 * 1024, backup_count=5, log_dir="logs", log_file="app.log")
 ```
 
 To run without writing log files (console-only output), set the configuration flag:
@@ -303,7 +322,7 @@ You can also opt out programmatically:
 
 ```python
 Setup.initialize("MyApp", disable_file_logging=True)
-log = Logging(disable_file_logging=True)
+log = Logging()
 ```
 
 ### 8. Error Handling and Debug Support
@@ -458,7 +477,7 @@ This ensures clean logs without duplicate entries while maintaining comprehensiv
 
 All configuration options can be set via environment variables or code:
 
-```python
+```bash
 # Via environment variables
 export EZTRACE_LOG_FORMAT="json"
 export EZTRACE_CONSOLE_LOG_FORMAT="color"   # overrides console only
@@ -469,19 +488,22 @@ export EZTRACE_MAX_SIZE="10485760"  # 10MB
 export EZTRACE_BACKUP_COUNT="5"
 export EZTRACE_BUFFER_ENABLED="false"          # Buffer logs (default: false)
 export EZTRACE_BUFFER_FLUSH_INTERVAL="1.0"      # Seconds between flushes when buffering
+```
 
-# Via code - must be setup before importing trace
+```python
+# Via Setup.initialize (recommended)
+from pyeztrace.setup import Setup
 
-from pyeztrace.config import config
-config.format = "json"  # legacy: sets both console and file formats
-config.console_format = "color"
-config.file_format = "json"
-config.log_level = "DEBUG"
-config.log_file = "custom.log"
-config.max_size = 10 * 1024 * 1024  # 10MB
-config.backup_count = 5
-config.buffer_enabled = False
-config.buffer_flush_interval = 1.0
+Setup.initialize(
+    "MyApp",
+    log_format="json",
+    log_level="DEBUG",
+    log_file="custom.log",
+    max_size=10 * 1024 * 1024,
+    backup_count=5,
+    buffer_enabled=False,
+    buffer_flush_interval=1.0,
+)
 ```
 
 ## Contributing
