@@ -8,26 +8,51 @@ theme:
   name: material
   palette:
     - scheme: default
-      primary: "#0a2355"
-      accent: blue
+      primary: "#0d1540"   
+      accent: "#1865e0"  
+      background: "#10172a" 
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
     - scheme: slate
-      primary: "#0a2355"
-      accent: blue
+      primary: "#06102B"
+      accent: "#3fa1ff" 
+      background: "#0c161f"
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
+  font:
+    text: Roboto
+    code: Fira Mono
   features:
     - navigation.tabs
     - navigation.sections
     - navigation.expand
+    - navigation.path
+    - navigation.top
+    - toc.integrate
+    - toc.follow
     - content.code.copy
     - content.code.annotate
+    - content.action.edit
+    - content.action.view
+    - content.tabs.link
+    - search.suggest
+    - search.highlight
+    - search.share
+    - header.autohide
+    - announce.dismiss
+    - announce.info
+    - logo
+  logo: assets/logo_dark.svg
+  favicon: assets/favicon.ico
 
 plugins:
   - search
+  - awesome-pages
+  - git-revision-date-localized:
+      enable_creation_date: true
+      fallback_to_build_date: true
 
 nav:
   - Home: index.md
@@ -39,7 +64,15 @@ nav:
 markdown_extensions:
   - pymdownx.highlight:
       anchor_linenums: true
+      linenums_style: table
   - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
   - admonition
   - pymdownx.tabbed:
       alternate_style: true
+  - pymdownx.details
+  - pymdownx.keys
+  - toc:
+      permalink: ⚓︎
+      toc_depth: 3
