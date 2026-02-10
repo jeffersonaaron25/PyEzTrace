@@ -27,7 +27,7 @@ class LogConfig:
             'log_level': self._get_env('LOG_LEVEL', 'DEBUG'),
             'buffer_enabled': self._get_env_bool('BUFFER_ENABLED', False),
             'buffer_flush_interval': float(self._get_env('BUFFER_FLUSH_INTERVAL', '1.0')),
-            'disable_file_logging': self._get_env('DISABLE_FILE_LOGGING', '0').lower() in {'1', 'true', 'yes', 'on'},
+            'disable_file_logging': self._get_env('DISABLE_FILE_LOGGING', '1').lower() in {'1', 'true', 'yes', 'on'},
         }
 
     def _get_env(self, key: str, default: str) -> str:

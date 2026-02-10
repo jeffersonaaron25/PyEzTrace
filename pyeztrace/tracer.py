@@ -154,6 +154,8 @@ def _redaction_from_env() -> Optional[RedactionSettings]:
 
 
 _global_redaction_override: Optional[RedactionSettings] = None
+_logger_lock = threading.Lock()
+_logger_instance: Optional[Logging] = None
 
 
 def set_global_redaction(
@@ -185,8 +187,8 @@ def _resolve_redaction(
     return _redaction_from_env()
 
 
-def _get_current_rss_kb() -> Optional[int]:
-    """Best-effort snapshot of the current resident set size (in KB).
+def _get_current_rss_snapshot() -> tuple[Optional[int], str]:
+    """Best-effort RSS snapshot with measurement mode metadata.
 
     Uses /proc/self/statm when available to capture the current RSS. Falls back to
     ``resource.getrusage`` (which reports the historical peak) if reading from
@@ -202,58 +204,89 @@ def _get_current_rss_kb() -> Optional[int]:
                 parts = statm.readline().split()
                 if len(parts) >= 2:
                     resident_pages = int(parts[1])
-                    return int(resident_pages * page_size / 1024)
+                    return int(resident_pages * page_size / 1024), "current_rss"
     except (OSError, ValueError, AttributeError):
         # Any issues with sysconf or /proc access fall through to the portable fallback
         pass
 
     if resource is not None:
         try:
-            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # On macOS ru_maxrss is bytes; on Linux it is already KB.
+            if sys.platform == "darwin":
+                peak = int(peak / 1024)
+            return int(peak), "peak_rusage"
         except Exception:
-            return None
+            return None, "unavailable"
 
-    return None
+    return None, "unavailable"
+
+
+def _get_current_rss_kb() -> Optional[int]:
+    """Best-effort snapshot of the current resident set size (in KB)."""
+    rss_kb, _mode = _get_current_rss_snapshot()
+    return rss_kb
 
 def ensure_initialized():
     """Ensure EzTrace is initialized with sensible defaults if not already done."""
-    try:
-        if not Setup.is_setup_done():
-            try:
-                # Try to get main script name
-                project_name = sys.argv[0].split('/')[-1].replace('.py', '') if sys.argv else None
-                
-                # If running in interactive mode or argv[0] is empty, try module name
-                if not project_name or project_name == '' or project_name == '-c':
-                    # Try to get calling module name
-                    frame = inspect.currentframe()
-                    if frame:
-                        try:
-                            frame = frame.f_back
-                            if frame and frame.f_globals:
-                                module_name = frame.f_globals.get('__name__')
-                                if module_name and module_name != '__main__':
-                                    project_name = module_name.split('.')[0]
-                        finally:
-                            del frame
-                
-                # Fallback 
-                if not project_name or project_name == '':
-                    project_name = "EzTrace"
-                    
-                Setup.initialize(project_name)
-                Setup.set_setup_done()
-            except Exception as e:
-                # Last resort fallback
-                Setup.initialize("EzTrace")
-                Setup.set_setup_done()
-                print(f"Warning: Error during tracer initialization: {str(e)}")
-    except Exception as e:
-        # Catastrophic failure - print and continue
-        print(f"Critical error in EzTrace initialization: {str(e)}")
-    return Logging()
+    global _logger_instance
+    if _logger_instance is not None and Logging._configured:
+        return _logger_instance
 
-logging = ensure_initialized()
+    with _logger_lock:
+        if _logger_instance is not None and Logging._configured:
+            return _logger_instance
+
+        try:
+            if not Setup.is_setup_done():
+                try:
+                    # Try to get main script name
+                    project_name = sys.argv[0].split('/')[-1].replace('.py', '') if sys.argv else None
+
+                    # If running in interactive mode or argv[0] is empty, try module name
+                    if not project_name or project_name == '' or project_name == '-c':
+                        # Try to get calling module name
+                        frame = inspect.currentframe()
+                        if frame:
+                            try:
+                                frame = frame.f_back
+                                if frame and frame.f_globals:
+                                    module_name = frame.f_globals.get('__name__')
+                                    if module_name and module_name != '__main__':
+                                        project_name = module_name.split('.')[0]
+                            finally:
+                                del frame
+
+                    # Fallback
+                    if not project_name or project_name == '':
+                        project_name = "EzTrace"
+
+                    Setup.initialize(project_name)
+                except Exception as e:
+                    # Last resort fallback
+                    if not Setup.is_setup_done():
+                        Setup.initialize("EzTrace")
+                    print(f"Warning: Error during tracer initialization: {str(e)}")
+        except Exception as e:
+            # Catastrophic failure - print and continue
+            print(f"Critical error in EzTrace initialization: {str(e)}")
+        _logger_instance = Logging()
+        return _logger_instance
+
+class _LazyLoggingProxy:
+    """Resolve the logger lazily to avoid import-time setup side effects."""
+
+    def __getattr__(self, item: str):
+        # Ensure setup/logging is initialized exactly once, then resolve from the
+        # Logging class first so monkeypatched static methods keep their original
+        # call signatures (i.e., no instance binding of a patched plain function).
+        ensure_initialized()
+        if hasattr(Logging, item):
+            return getattr(Logging, item)
+        return getattr(ensure_initialized(), item)
+
+
+logging = _LazyLoggingProxy()
 
 def _safe_to_wrap(obj):
     """
@@ -522,7 +555,7 @@ def child_trace_decorator(func: F) -> F:
             start_ts = time.time()
             # Resource snapshots
             start_cpu = time.process_time()
-            mem_before = _get_current_rss_kb()
+            mem_before, mem_mode_before = _get_current_rss_snapshot()
             logging.log_info(
                 f"called...",
                 fn_type="child",
@@ -542,10 +575,11 @@ def child_trace_decorator(func: F) -> F:
                     duration = end - start
                     # Metrics capture
                     cpu_time = time.process_time() - start_cpu
-                    mem_after = _get_current_rss_kb()
+                    mem_after, mem_mode_after = _get_current_rss_snapshot()
                     mem_delta = None
                     if mem_after is not None and mem_before is not None:
                         mem_delta = mem_after - mem_before
+                    mem_mode = mem_mode_after if mem_mode_after != "unavailable" else mem_mode_before
                     logging.log_info(
                         f"Ok.",
                         fn_type="child",
@@ -560,6 +594,7 @@ def child_trace_decorator(func: F) -> F:
                         mem_peak_kb=mem_after,
                         mem_rss_kb=mem_after,
                         mem_delta_kb=mem_delta,
+                        mem_mode=mem_mode,
                         result_preview=_safe_preview_value(result, redaction=redaction)
                     )
                     logging.record_metric(func.__qualname__, duration)
@@ -576,6 +611,7 @@ def child_trace_decorator(func: F) -> F:
                         time_epoch=time.time()
                     )
                     record_exception(_span, e)
+                    setattr(e, "_eztrace_logged", True)
                     logging.raise_exception_to_log(e, str(e), stack=False)
                     raise
                 finally:
@@ -624,7 +660,7 @@ def child_trace_decorator(func: F) -> F:
             start_ts = time.time()
             # Resource snapshots
             start_cpu = time.process_time()
-            mem_before = _get_current_rss_kb()
+            mem_before, mem_mode_before = _get_current_rss_snapshot()
             logging.log_info(
                 f"called...",
                 fn_type="child",
@@ -644,10 +680,11 @@ def child_trace_decorator(func: F) -> F:
                     duration = end - start
                     # Metrics capture
                     cpu_time = time.process_time() - start_cpu
-                    mem_after = _get_current_rss_kb()
+                    mem_after, mem_mode_after = _get_current_rss_snapshot()
                     mem_delta = None
                     if mem_after is not None and mem_before is not None:
                         mem_delta = mem_after - mem_before
+                    mem_mode = mem_mode_after if mem_mode_after != "unavailable" else mem_mode_before
                     logging.log_info(
                         f"Ok.",
                         fn_type="child",
@@ -662,6 +699,7 @@ def child_trace_decorator(func: F) -> F:
                         mem_peak_kb=mem_after,
                         mem_rss_kb=mem_after,
                         mem_delta_kb=mem_delta,
+                        mem_mode=mem_mode,
                         result_preview=_safe_preview_value(result, redaction=redaction)
                     )
                     logging.record_metric(func.__qualname__, duration)
@@ -678,6 +716,7 @@ def child_trace_decorator(func: F) -> F:
                         time_epoch=time.time()
                     )
                     record_exception(_span, e)
+                    setattr(e, "_eztrace_logged", True)
                     logging.raise_exception_to_log(e, str(e), stack=False)
                     raise
                 finally:
@@ -940,7 +979,7 @@ def trace(
                     start_ts = time.time()
                     # Resource snapshots
                     start_cpu = time.process_time()
-                    mem_before = _get_current_rss_kb()
+                    mem_before, mem_mode_before = _get_current_rss_snapshot()
                     logging.log_info(
                         f"called...",
                         fn_type="parent",
@@ -968,10 +1007,11 @@ def trace(
                                 duration = end - start
                                 # Metrics capture
                                 cpu_time = time.process_time() - start_cpu
-                                mem_after = _get_current_rss_kb()
+                                mem_after, mem_mode_after = _get_current_rss_snapshot()
                                 mem_delta = None
                                 if mem_after is not None and mem_before is not None:
                                     mem_delta = mem_after - mem_before
+                                mem_mode = mem_mode_after if mem_mode_after != "unavailable" else mem_mode_before
                                 logging.log_info(
                                     f"Ok.",
                                     fn_type="parent",
@@ -986,6 +1026,7 @@ def trace(
                                     mem_peak_kb=mem_after,
                                     mem_rss_kb=mem_after,
                                     mem_delta_kb=mem_delta,
+                                    mem_mode=mem_mode,
                                     result_preview=_safe_preview_value(result, redaction=redaction_to_use)
                                 )
                                 logging.record_metric(func.__qualname__, duration)
@@ -1003,6 +1044,7 @@ def trace(
                                 )
                                 error_message = f"{message} -> {str(e)}" if message else str(e)
                                 record_exception(_span, e)
+                                setattr(e, "_eztrace_logged", True)
                                 logging.raise_exception_to_log(e, error_message, stack)
                                 raise
                     finally:
@@ -1013,11 +1055,14 @@ def trace(
                             except Exception:
                                 pass  # Prevent cleanup exceptions from masking the original error
                 except Exception as e:
-                    # Fallback for catastrophic failures in the tracing setup
+                    # If the wrapped function error was already logged, propagate cleanly.
+                    if getattr(e, "_eztrace_logged", False):
+                        raise
+                    # Fallback for catastrophic tracer setup failures only.
                     print(f"TRACE ERROR: {func.__qualname__} - {str(e)}")
                     import traceback
                     traceback.print_exc()
-                    return await func(*args, **kwargs)
+                    raise
                 finally:
                     try:
                         Setup.decrement_level()
@@ -1067,7 +1112,7 @@ def trace(
                     start_ts = time.time()
                     # Resource snapshots
                     start_cpu = time.process_time()
-                    mem_before = _get_current_rss_kb()
+                    mem_before, mem_mode_before = _get_current_rss_snapshot()
                     logging.log_info(
                         f"called...",
                         fn_type="parent",
@@ -1094,10 +1139,11 @@ def trace(
                                 duration = end - start
                                 # Metrics capture
                                 cpu_time = time.process_time() - start_cpu
-                                mem_after = _get_current_rss_kb()
+                                mem_after, mem_mode_after = _get_current_rss_snapshot()
                                 mem_delta = None
                                 if mem_after is not None and mem_before is not None:
                                     mem_delta = mem_after - mem_before
+                                mem_mode = mem_mode_after if mem_mode_after != "unavailable" else mem_mode_before
                                 logging.log_info(
                                     f"Ok.",
                                     fn_type="parent",
@@ -1111,6 +1157,7 @@ def trace(
                                     mem_peak_kb=mem_after,
                                     mem_rss_kb=mem_after,
                                     mem_delta_kb=mem_delta,
+                                    mem_mode=mem_mode,
                                     result_preview=_safe_preview_value(result, redaction=redaction_to_use)
                                 )
                                 logging.record_metric(func.__qualname__, duration)
@@ -1131,6 +1178,7 @@ def trace(
                                 )
                                 error_message = f"{message} -> {str(e)}" if message else str(e)
                                 record_exception(_span, e)
+                                setattr(e, "_eztrace_logged", True)
                                 logging.raise_exception_to_log(e, error_message, stack)
                                 raise
                     finally:
@@ -1141,11 +1189,14 @@ def trace(
                             except Exception:
                                 pass  # Prevent cleanup exceptions from masking the original error
                 except Exception as e:
-                    # Fallback for catastrophic failures in the tracing setup
+                    # If the wrapped function error was already logged, propagate cleanly.
+                    if getattr(e, "_eztrace_logged", False):
+                        raise
+                    # Fallback for catastrophic tracer setup failures only.
                     print(f"TRACE ERROR: {func.__qualname__} - {str(e)}")
                     import traceback
                     traceback.print_exc()
-                    return func(*args, **kwargs)
+                    raise
                 finally:
                     try:
                         Setup.decrement_level()

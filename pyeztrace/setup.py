@@ -1,6 +1,7 @@
 import threading
 import asyncio
 import contextvars
+from typing import Optional
 from pyeztrace import exceptions
 from pyeztrace.config import config
 
@@ -19,6 +20,14 @@ class Setup:
     __async_lock = asyncio.Lock()
     __metrics_registered = False
     __testing_mode = False
+
+    @classmethod
+    def _in_async_task(cls) -> bool:
+        """Return True when called from within an active asyncio Task."""
+        try:
+            return asyncio.current_task() is not None
+        except RuntimeError:
+            return False
 
     # Methods for testing
     @classmethod
@@ -71,7 +80,60 @@ class Setup:
 
     # Synchronous methods (thread-safe)
     @classmethod
-    def initialize(cls, project="eztracer", show_metrics=False, disable_file_logging=None):
+    def _apply_runtime_config_overrides(
+        cls,
+        *,
+        log_format: Optional[str] = None,
+        console_format: Optional[str] = None,
+        file_format: Optional[str] = None,
+        log_level: Optional[str] = None,
+        log_file: Optional[str] = None,
+        log_dir: Optional[str] = None,
+        max_size: Optional[int] = None,
+        backup_count: Optional[int] = None,
+        buffer_enabled: Optional[bool] = None,
+        buffer_flush_interval: Optional[float] = None,
+    ) -> None:
+        """Apply explicit config overrides before logger initialization."""
+        if log_format is not None:
+            config.format = log_format
+        if console_format is not None:
+            config.console_format = console_format
+        if file_format is not None:
+            config.file_format = file_format
+        if log_level is not None:
+            config.log_level = log_level
+        if log_file is not None:
+            config.log_file = log_file
+        if log_dir is not None:
+            config.log_dir = log_dir
+        if max_size is not None:
+            config.max_size = max_size
+        if backup_count is not None:
+            config.backup_count = backup_count
+        if buffer_enabled is not None:
+            config.buffer_enabled = buffer_enabled
+        if buffer_flush_interval is not None:
+            config.buffer_flush_interval = buffer_flush_interval
+
+    @classmethod
+    def initialize(
+        cls,
+        project="eztracer",
+        show_metrics=False,
+        disable_file_logging=None,
+        *,
+        log_format: Optional[str] = None,
+        console_format: Optional[str] = None,
+        file_format: Optional[str] = None,
+        log_level: Optional[str] = None,
+        log_file: Optional[str] = None,
+        log_dir: Optional[str] = None,
+        max_size: Optional[int] = None,
+        backup_count: Optional[int] = None,
+        buffer_enabled: Optional[bool] = None,
+        buffer_flush_interval: Optional[float] = None,
+    ):
         with cls.__lock:
             if cls.__setup_done:
                 raise exceptions.SetupAlreadyDoneError("Setup is already done.")
@@ -79,6 +141,18 @@ class Setup:
             cls.__thread_level.value = 0
             cls.__project = project.upper()
             cls.__show_metrics = show_metrics
+            cls._apply_runtime_config_overrides(
+                log_format=log_format,
+                console_format=console_format,
+                file_format=file_format,
+                log_level=log_level,
+                log_file=log_file,
+                log_dir=log_dir,
+                max_size=max_size,
+                backup_count=backup_count,
+                buffer_enabled=buffer_enabled,
+                buffer_flush_interval=buffer_flush_interval,
+            )
             if disable_file_logging is None:
                 cls.__disable_file_logging = config.disable_file_logging
             else:
@@ -108,20 +182,30 @@ class Setup:
     @classmethod
     def increment_level(cls):
         with cls.__lock:
-            if not hasattr(cls.__thread_level, "value"):
-                cls.__thread_level.value = 0
-            cls.__thread_level.value += 1
+            if cls._in_async_task():
+                current = cls.__async_level.get()
+                cls.__async_level.set(current + 1)
+            else:
+                if not hasattr(cls.__thread_level, "value"):
+                    cls.__thread_level.value = 0
+                cls.__thread_level.value += 1
 
     @classmethod
     def decrement_level(cls):
         with cls.__lock:
-            if not hasattr(cls.__thread_level, "value"):
-                cls.__thread_level.value = 0
-            cls.__thread_level.value -= 1
+            if cls._in_async_task():
+                current = cls.__async_level.get()
+                cls.__async_level.set(current - 1)
+            else:
+                if not hasattr(cls.__thread_level, "value"):
+                    cls.__thread_level.value = 0
+                cls.__thread_level.value -= 1
 
     @classmethod
     def get_level(cls):
         with cls.__lock:
+            if cls._in_async_task():
+                return cls.__async_level.get()
             return getattr(cls.__thread_level, "value", 0)
 
     @classmethod
@@ -133,43 +217,50 @@ class Setup:
     @classmethod
     async def async_initialize(cls, project="eztracer"):
         async with cls.__async_lock:
-            if cls.__setup_done:
-                raise exceptions.SetupAlreadyDoneError("Setup is already done.")
-            cls.__setup_done = True
-            cls.__async_level.set(0)
-            cls.__project = project.upper()
+            with cls.__lock:
+                if cls.__setup_done:
+                    raise exceptions.SetupAlreadyDoneError("Setup is already done.")
+                cls.__setup_done = True
+                cls.__async_level.set(0)
+                cls.__project = project.upper()
 
     @classmethod
     async def async_is_setup_done(cls):
         async with cls.__async_lock:
-            return cls.__setup_done
+            with cls.__lock:
+                return cls.__setup_done
 
     @classmethod
     async def async_set_setup_done(cls):
         async with cls.__async_lock:
-            cls.__setup_done = True
+            with cls.__lock:
+                cls.__setup_done = True
 
     @classmethod
     async def async_increment_level(cls):
         async with cls.__async_lock:
-            current = cls.__async_level.get()
-            cls.__async_level.set(current + 1)
+            with cls.__lock:
+                current = cls.__async_level.get()
+                cls.__async_level.set(current + 1)
 
     @classmethod
     async def async_decrement_level(cls):
         async with cls.__async_lock:
-            current = cls.__async_level.get()
-            cls.__async_level.set(current - 1)
+            with cls.__lock:
+                current = cls.__async_level.get()
+                cls.__async_level.set(current - 1)
 
     @classmethod
     async def async_get_level(cls):
         async with cls.__async_lock:
-            return cls.__async_level.get()
+            with cls.__lock:
+                return cls.__async_level.get()
 
     @classmethod
     async def async_get_project(cls):
         async with cls.__async_lock:
-            return cls.__project
+            with cls.__lock:
+                return cls.__project
         
     @classmethod
     def set_show_metrics(cls, show_metrics: bool):
