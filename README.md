@@ -102,7 +102,6 @@ Setup.initialize(
 
 #### Initialization order (important)
 
-Importing `trace` no longer initializes setup.
 Initialization is lazy and occurs on first traced/logging use if you did not call `Setup.initialize(...)` yourself.
 Because logging handlers are configured once, configure before first traced call for predictable behavior.
 
@@ -309,13 +308,8 @@ def monitored_function():
 Configure automatic log rotation based on file size:
 
 ```python
-from pyeztrace.config import config
-
-config.max_size = 10 * 1024 * 1024  # 10MB
-config.backup_count = 5  # Keep 5 backup files
-config.log_dir = "logs"  # Custom log directory
-config.log_file = "app.log"  # Custom log filename
-# must be set before first traced call
+from pyeztrace.setup import Setup
+Setup.initialize("MyApp", max_size=10 * 1024 * 1024, backup_count=5, log_dir="logs", log_file="app.log")
 ```
 
 To run without writing log files (console-only output), set the configuration flag:
@@ -510,18 +504,6 @@ Setup.initialize(
     buffer_enabled=False,
     buffer_flush_interval=1.0,
 )
-
-# Via config object (advanced/legacy)
-from pyeztrace.config import config
-config.format = "json"  # legacy: sets both console and file formats
-config.console_format = "color"
-config.file_format = "json"
-config.log_level = "DEBUG"
-config.log_file = "custom.log"
-config.max_size = 10 * 1024 * 1024  # 10MB
-config.backup_count = 5
-config.buffer_enabled = False
-config.buffer_flush_interval = 1.0
 ```
 
 ## Contributing
