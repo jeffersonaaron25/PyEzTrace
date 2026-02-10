@@ -42,6 +42,9 @@ logs/
 # mypy
 .mypy_cache/
 
+# MkDocs build
+site/
+
 # Project specific
 app.log*
 

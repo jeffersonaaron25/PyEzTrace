@@ -1,0 +1,25 @@
+name: Deploy Docs
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install MkDocs and Material
+        run: pip install mkdocs mkdocs-material mkdocs-awesome-pages-plugin
+
+      - name: Deploy to GitHub Pages
+        run: mkdocs gh-deploy --force
