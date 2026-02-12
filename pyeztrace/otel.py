@@ -3,8 +3,9 @@ import json
 import time
 import gzip
 import uuid
+import sys
 from contextlib import contextmanager
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Set
 from urllib.parse import urlparse
 
 # Internal EZTrace Setup for project name
@@ -27,6 +28,7 @@ _state = _OtelState()
 
 _GCP_TELEMETRY_ENDPOINT = "https://telemetry.googleapis.com/v1/traces"
 _GCP_DEFAULT_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+_DIAGNOSTIC_ONCE_KEYS: Set[str] = set()
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
@@ -34,6 +36,83 @@ def _env_bool(key: str, default: bool = False) -> bool:
     if v is None:
         return default
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _otel_debug_enabled() -> bool:
+    return _env_bool("EZTRACE_OTEL_DEBUG", False)
+
+
+def _emit_diagnostic(
+    message: str,
+    *,
+    level: str = "WARN",
+    once_key: Optional[str] = None,
+    debug_only: bool = False,
+) -> None:
+    if debug_only and not _otel_debug_enabled():
+        return
+    if once_key and once_key in _DIAGNOSTIC_ONCE_KEYS:
+        return
+    if once_key:
+        _DIAGNOSTIC_ONCE_KEYS.add(once_key)
+    try:
+        sys.__stderr__.write(f"[PyEzTrace OTEL {level}] {message}\n")
+        sys.__stderr__.flush()
+    except Exception:
+        pass
+
+
+def _span_export_result_failure():
+    try:
+        from opentelemetry.sdk.trace.export import SpanExportResult
+        return SpanExportResult.FAILURE
+    except Exception:
+        return 1
+
+
+class _DiagnosticSpanExporter:
+    """Wrap an exporter and surface runtime export failures."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def export(self, spans: Iterable[Any]):
+        try:
+            result = self._inner.export(spans)
+        except Exception as e:
+            _state.error = f"Span export failed: {e}"
+            _emit_diagnostic(
+                f"Span export failed at runtime: {e}",
+                level="ERROR",
+                once_key=f"export-exc:{type(e).__name__}:{e}",
+            )
+            return _span_export_result_failure()
+
+        try:
+            from opentelemetry.sdk.trace.export import SpanExportResult
+            if result != SpanExportResult.SUCCESS:
+                _emit_diagnostic(
+                    f"Span exporter returned non-success result: {result}",
+                    once_key=f"export-non-success:{result}",
+                )
+        except Exception:
+            pass
+        return result
+
+    def shutdown(self):
+        fn = getattr(self._inner, "shutdown", None)
+        if callable(fn):
+            return fn()
+        return True
+
+    def force_flush(self, *args, **kwargs):
+        fn = getattr(self._inner, "force_flush", None)
+        if callable(fn):
+            return fn(*args, **kwargs)
+        return True
+
+    def __getattr__(self, item):
+        return getattr(self._inner, item)
 
 
 def _is_google_telemetry_endpoint(endpoint: str) -> bool:
@@ -273,6 +352,15 @@ def _span_to_dict(span) -> Dict[str, Any]:
 def enable_from_env() -> bool:
     """Enable OpenTelemetry if EZTRACE_OTEL_ENABLED is true. Idempotent."""
     _state.enabled = _env_bool("EZTRACE_OTEL_ENABLED", False)
+    _state.error = None
+    if not _state.enabled:
+        _emit_diagnostic(
+            "OTEL bridge is disabled (EZTRACE_OTEL_ENABLED is false). Spans will be no-op.",
+            level="DEBUG",
+            once_key="otel-disabled",
+            debug_only=True,
+        )
+        return False
     if not _state.enabled or _state.initialized:
         return _state.enabled
 
@@ -297,13 +385,22 @@ def enable_from_env() -> bool:
         exporter, err = _build_exporter(exporter_name or "otlp")
         if exporter is None:
             # If exporter fails, fallback to console if possible; otherwise disable
+            _emit_diagnostic(
+                f"Failed to initialize exporter '{exporter_name or 'otlp'}': {err}. Falling back to console exporter.",
+                once_key=f"exporter-fallback:{exporter_name or 'otlp'}:{err}",
+            )
             exporter, err2 = _build_exporter("console")
             if exporter is None:
                 _state.error = err or err2
+                _emit_diagnostic(
+                    f"OTEL disabled because no exporter could be initialized: {_state.error}",
+                    level="ERROR",
+                    once_key=f"exporter-fatal:{_state.error}",
+                )
                 _state.enabled = False
                 return False
 
-        processor = BatchSpanProcessor(exporter)
+        processor = BatchSpanProcessor(_DiagnosticSpanExporter(exporter))
         provider.add_span_processor(processor)
         ot_trace.set_tracer_provider(provider)
 
@@ -312,9 +409,19 @@ def enable_from_env() -> bool:
         _state.exporter = exporter
         _state.tracer = ot_trace.get_tracer("pyeztrace")
         _state.initialized = True
+        _emit_diagnostic(
+            f"OTEL enabled. service.name={service_name} exporter={type(exporter).__name__}",
+            level="DEBUG",
+            debug_only=True,
+        )
         return True
     except Exception as e:
         _state.error = str(e)
+        _emit_diagnostic(
+            f"OTEL initialization failed: {e}",
+            level="ERROR",
+            once_key=f"otel-init-error:{type(e).__name__}:{e}",
+        )
         _state.enabled = False
         _state.initialized = False
         return False
@@ -330,6 +437,19 @@ def get_tracer():
     if not _state.initialized:
         enable_from_env()
     return _state.tracer
+
+
+def get_otel_status() -> Dict[str, Any]:
+    exporter = _state.exporter
+    return {
+        "enabled": bool(_state.enabled),
+        "initialized": bool(_state.initialized),
+        "error": _state.error,
+        "exporter": type(exporter).__name__ if exporter is not None else None,
+        "otel_enabled_env": os.environ.get("EZTRACE_OTEL_ENABLED"),
+        "otel_exporter_env": os.environ.get("EZTRACE_OTEL_EXPORTER"),
+        "otlp_endpoint_env": os.environ.get("EZTRACE_OTLP_ENDPOINT"),
+    }
 
 
 @contextmanager
@@ -348,8 +468,24 @@ def start_span(name: str, attributes: Optional[Dict[str, Any]] = None):
                 yield span
         except Exception:
             # If anything goes wrong, degrade gracefully to no-op
+            _emit_diagnostic(
+                f"start_span('{name}') degraded to no-op due to tracer runtime error.",
+                once_key=f"start-span-runtime-noop:{name}",
+                debug_only=True,
+            )
             yield None
     else:
+        if _state.error:
+            _emit_diagnostic(
+                f"start_span('{name}') is no-op because OTEL failed to initialize: {_state.error}",
+                once_key=f"start-span-init-error:{_state.error}",
+            )
+        else:
+            _emit_diagnostic(
+                f"start_span('{name}') is no-op because OTEL is disabled.",
+                once_key=f"start-span-disabled:{name}",
+                debug_only=True,
+            )
         yield None
 
 
@@ -369,6 +505,10 @@ def record_exception(span, exc: BaseException):
             pass
     except Exception:
         pass
+
+
+def _reset_diagnostics_state_for_tests():
+    _DIAGNOSTIC_ONCE_KEYS.clear()
 
 
 # -----------------

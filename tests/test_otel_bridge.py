@@ -37,6 +37,8 @@ def reset_otel_state(monkeypatch):
     ]
     Setup.reset()
     otel._state = otel._OtelState()
+    if hasattr(otel, "_reset_diagnostics_state_for_tests"):
+        otel._reset_diagnostics_state_for_tests()
     _reset_tracer_provider()
     for key in keys:
         monkeypatch.delenv(key, raising=False)
@@ -53,6 +55,8 @@ def reset_otel_state(monkeypatch):
         pass
     Setup.reset()
     otel._state = otel._OtelState()
+    if hasattr(otel, "_reset_diagnostics_state_for_tests"):
+        otel._reset_diagnostics_state_for_tests()
     _reset_tracer_provider()
 
 
@@ -230,6 +234,45 @@ def test_otlp_exporter_google_auth_falls_back_to_bearer_header(monkeypatch):
     assert captured["endpoint"] == "https://telemetry.googleapis.com/v1/traces"
     assert captured["headers"]["x-tenant"] == "abc"
     assert captured["headers"]["Authorization"] == "Bearer unit-token"
+
+
+def test_otel_init_failure_surfaces_diagnostic_and_status(monkeypatch):
+    Setup.initialize("BROKEN_OTEL_APP", show_metrics=False)
+    monkeypatch.setenv("EZTRACE_OTEL_ENABLED", "true")
+    monkeypatch.setenv("EZTRACE_OTEL_EXPORTER", "otlp")
+
+    def fake_build_exporter(_name):
+        return None, "unit-exporter-failure"
+
+    stderr = io.StringIO()
+    monkeypatch.setattr(otel, "_build_exporter", fake_build_exporter)
+    monkeypatch.setattr(sys, "__stderr__", stderr)
+
+    assert otel.enable_from_env() is False
+    status = otel.get_otel_status()
+    assert status["enabled"] is False
+    assert status["initialized"] is False
+    assert status["error"] == "unit-exporter-failure"
+    assert "unit-exporter-failure" in stderr.getvalue()
+
+
+def test_runtime_export_failure_is_surfaced(monkeypatch):
+    class FailingExporter:
+        def export(self, _spans):
+            raise RuntimeError("network-down")
+
+        def shutdown(self):
+            return True
+
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "__stderr__", stderr)
+
+    wrapped = otel._DiagnosticSpanExporter(FailingExporter())
+    result = wrapped.export([])
+
+    from opentelemetry.sdk.trace.export import SpanExportResult
+    assert result == SpanExportResult.FAILURE
+    assert "network-down" in stderr.getvalue()
 
 
 def test_s3_exporter_writes_span_batch(monkeypatch):

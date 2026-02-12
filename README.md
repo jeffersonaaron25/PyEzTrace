@@ -433,6 +433,8 @@ Notes:
 - The bridge is lazy-loaded; if OTEL packages are missing, the library remains functional without spans.
 - Spans are created for both parent and child wrappers using function `__qualname__` as span names.
 - Exceptions are recorded on the active span when OTEL is enabled.
+- Set `EZTRACE_OTEL_DEBUG=true` to emit one-time OTEL diagnostics to stderr (startup status and no-op reasons).
+- Inspect runtime OTEL state with `from pyeztrace import otel; print(otel.get_otel_status())`.
 
 ## Advanced Usage
 
