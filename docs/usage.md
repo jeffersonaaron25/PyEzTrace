@@ -246,6 +246,18 @@ export EZTRACE_OTLP_ENDPOINT="http://localhost:4318/v1/traces"
 # optional: export EZTRACE_SERVICE_NAME="my-service"
 ```
 
+**Google Cloud Trace (OTLP + ADC):**
+
+```bash
+pip install "pyeztrace[otel,gcp]"
+export EZTRACE_OTEL_ENABLED=true
+export EZTRACE_OTEL_EXPORTER=gcp
+# optional override; defaults to telemetry endpoint for exporter=gcp
+export EZTRACE_OTLP_ENDPOINT="https://telemetry.googleapis.com/v1/traces"
+# optional explicit toggle
+export EZTRACE_OTLP_GCP_AUTH=true
+```
+
 **Console (local dev):**
 
 ```bash

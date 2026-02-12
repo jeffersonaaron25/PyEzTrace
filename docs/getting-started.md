@@ -11,6 +11,7 @@ Optional extras (library stays dependency-free by default):
 | Extra | Purpose |
 |-------|---------|
 | `pyeztrace[otel]` | OpenTelemetry SDK and OTLP exporter |
+| `pyeztrace[gcp]` | Google ADC auth for OTLP to Cloud Trace |
 | `pyeztrace[s3]` | S3 exporter for span batches |
 | `pyeztrace[azure]` | Azure Blob exporter |
 | `pyeztrace[all]` | All optional dependencies |

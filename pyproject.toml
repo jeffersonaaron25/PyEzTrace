@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyeztrace"
-version = "0.1.0"
+version = "0.1.1"
 description = "A dependency-free, lightweight Python tracing and logging library"
 readme = "README.md"
 authors = [{ name = "Jefferson Nelsson", email = "jefferson.nelsson@gmail.com" }]
@@ -40,6 +40,9 @@ otel = [
     "opentelemetry-sdk>=1.23.0",
     "opentelemetry-exporter-otlp>=1.23.0",
 ]
+gcp = [
+    "google-auth>=2.23.0",
+]
 s3 = [
     "boto3>=1.28.0",
 ]
@@ -47,7 +50,7 @@ azure = [
     "azure-storage-blob>=12.14.0",
 ]
 all = [
-    "pyeztrace[otel,s3,azure]",
+    "pyeztrace[otel,gcp,s3,azure]",
 ]
 
 [tool.pytest.ini_options]

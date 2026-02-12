@@ -5,6 +5,7 @@ import gzip
 import uuid
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, Optional
+from urllib.parse import urlparse
 
 # Internal EZTrace Setup for project name
 from pyeztrace.setup import Setup
@@ -24,6 +25,10 @@ class _OtelState:
 _state = _OtelState()
 
 
+_GCP_TELEMETRY_ENDPOINT = "https://telemetry.googleapis.com/v1/traces"
+_GCP_DEFAULT_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+
+
 def _env_bool(key: str, default: bool = False) -> bool:
     v = os.environ.get(key)
     if v is None:
@@ -31,10 +36,132 @@ def _env_bool(key: str, default: bool = False) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _is_google_telemetry_endpoint(endpoint: str) -> bool:
+    if not endpoint:
+        return False
+    try:
+        host = (urlparse(endpoint).netloc or "").lower()
+        if not host:
+            host = endpoint.lower()
+        return "telemetry.googleapis.com" in host
+    except Exception:
+        return False
+
+
+def _has_authorization_header(headers: Dict[str, str]) -> bool:
+    for k in headers.keys():
+        if str(k).strip().lower() == "authorization":
+            return True
+    return False
+
+
+def _parse_scopes(raw_scopes: str):
+    if not raw_scopes:
+        return [_GCP_DEFAULT_SCOPE]
+    cleaned = raw_scopes.replace(",", " ")
+    scopes = [s.strip() for s in cleaned.split() if s.strip()]
+    return scopes or [_GCP_DEFAULT_SCOPE]
+
+
+def _should_use_gcp_auth(endpoint: str, exporter_name: str) -> bool:
+    explicit = os.environ.get("EZTRACE_OTLP_GCP_AUTH")
+    if explicit is not None:
+        return explicit.strip().lower() in ("1", "true", "yes", "y", "on")
+
+    name = (exporter_name or "").strip().lower()
+    if name in ("gcp", "google", "googlecloud", "google-cloud"):
+        return True
+
+    return _is_google_telemetry_endpoint(endpoint)
+
+
+def _load_google_credentials():
+    try:
+        import google.auth
+    except Exception as e:
+        return None, f"GCP auth requires google-auth: {e}"
+
+    scopes = _parse_scopes(os.environ.get("EZTRACE_GCP_SCOPES", ""))
+    try:
+        credentials, _project = google.auth.default(scopes=scopes)
+        if credentials is None:
+            return None, "Unable to load Google credentials from ADC."
+        return credentials, None
+    except Exception as e:
+        return None, f"Unable to load Google credentials from ADC: {e}"
+
+
+def _build_google_authorized_session(credentials):
+    try:
+        from google.auth.transport.requests import AuthorizedSession
+        return AuthorizedSession(credentials), None
+    except Exception as e:
+        return None, f"Unable to create Google AuthorizedSession: {e}"
+
+
+def _refresh_google_access_token(credentials):
+    try:
+        from google.auth.transport.requests import Request
+    except Exception as e:
+        return None, f"Unable to create Google auth request transport: {e}"
+
+    try:
+        credentials.refresh(Request())
+        token = getattr(credentials, "token", None)
+        if not token:
+            return None, "Google credentials did not provide an access token."
+        return token, None
+    except Exception as e:
+        return None, f"Unable to refresh Google credentials: {e}"
+
+
+def _build_otlp_http_exporter(endpoint: str, headers: Dict[str, str], exporter_name: str):
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    except Exception as e:
+        return None, f"OTLP HTTP exporter requires opentelemetry-exporter-otlp: {e}"
+
+    resolved_headers = dict(headers or {})
+    use_gcp_auth = _should_use_gcp_auth(endpoint, exporter_name) and not _has_authorization_header(resolved_headers)
+
+    if not use_gcp_auth:
+        try:
+            return OTLPSpanExporter(endpoint=endpoint, headers=resolved_headers or None), None
+        except Exception as e:
+            return None, f"Error creating OTLP HTTP exporter: {e}"
+
+    credentials, cred_err = _load_google_credentials()
+    if credentials is None:
+        return None, cred_err
+
+    session, session_err = _build_google_authorized_session(credentials)
+    if session is not None:
+        try:
+            return OTLPSpanExporter(endpoint=endpoint, headers=resolved_headers or None, session=session), None
+        except TypeError as e:
+            # Older OTLP exporter versions do not accept "session"; fallback to bearer token header.
+            if "session" not in str(e):
+                return None, f"Error creating OTLP HTTP exporter with Google session auth: {e}"
+        except Exception as e:
+            return None, f"Error creating OTLP HTTP exporter with Google session auth: {e}"
+    else:
+        session_err = session_err or "Unknown error creating Google AuthorizedSession."
+
+    token, token_err = _refresh_google_access_token(credentials)
+    if token is None:
+        return None, f"{session_err} Fallback bearer token setup failed: {token_err}"
+
+    resolved_headers["Authorization"] = f"Bearer {token}"
+    try:
+        return OTLPSpanExporter(endpoint=endpoint, headers=resolved_headers or None), None
+    except Exception as e:
+        return None, f"Error creating OTLP HTTP exporter with Google bearer auth: {e}"
+
+
 def _build_exporter(exporter_name: str):
     """
     Build an exporter instance based on name. Import heavy libs only on demand.
-    Supported: 'console', 'otlp', 's3', 'azure'.
+    Supported: 'console', 'otlp', 'gcp', 's3', 'azure'.
     Returns (exporter, error_str)
     """
     name = (exporter_name or "").strip().lower()
@@ -48,14 +175,11 @@ def _build_exporter(exporter_name: str):
             return None, f"Console exporter requires OpenTelemetry SDK: {e}"
 
     # OTLP HTTP exporter (default OTEL path)
-    if name in ("otlp", "otlphttp", "otlp-http"):
-        endpoint = os.environ.get("EZTRACE_OTLP_ENDPOINT", "http://localhost:4318/v1/traces")
+    if name in ("otlp", "otlphttp", "otlp-http", "gcp", "google", "googlecloud", "google-cloud"):
+        default_endpoint = _GCP_TELEMETRY_ENDPOINT if name in ("gcp", "google", "googlecloud", "google-cloud") else "http://localhost:4318/v1/traces"
+        endpoint = os.environ.get("EZTRACE_OTLP_ENDPOINT", default_endpoint)
         headers = _parse_headers(os.environ.get("EZTRACE_OTLP_HEADERS", ""))
-        try:
-            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-            return OTLPSpanExporter(endpoint=endpoint, headers=headers or None), None
-        except Exception as e:
-            return None, f"OTLP HTTP exporter requires opentelemetry-exporter-otlp: {e}"
+        return _build_otlp_http_exporter(endpoint=endpoint, headers=headers, exporter_name=name)
 
     # S3 exporter (optional, requires boto3)
     if name in ("s3",):
@@ -141,7 +265,7 @@ def _span_to_dict(span) -> Dict[str, Any]:
         "resource": getattr(getattr(span, "resource", None), "attributes", {}) or {},
         "instrumentation": {
             "name": "pyeztrace",
-            "version": "0.0.7",
+            "version": "0.1.1",
         },
     }
 
@@ -165,7 +289,7 @@ def enable_from_env() -> bool:
         resource = Resource.create({
             "service.name": service_name,
             "library.name": "pyeztrace",
-            "library.version": "0.0.7",
+            "library.version": "0.1.1",
         })
 
         provider = TracerProvider(resource=resource)
@@ -351,4 +475,3 @@ class _AzureBlobSpanExporter(_BaseJsonBatchExporter):
             return SpanExportResult.SUCCESS
         except Exception:
             return 0
-

@@ -29,6 +29,9 @@ Optional extras (keep default dependency-free):
 # OpenTelemetry SDK and OTLP exporter
 pip install "pyeztrace[otel]"
 
+# Google Cloud ADC auth for OTLP (App Engine, GCE, GKE, Cloud Run)
+pip install "pyeztrace[otel,gcp]"
+
 # S3 exporter
 pip install "pyeztrace[s3]"
 
@@ -376,6 +379,22 @@ export EZTRACE_OTLP_HEADERS=""
 # Optional: override service name (defaults to Setup project)
 export EZTRACE_SERVICE_NAME="my-service"
 ```
+
+Google Cloud Trace (OTLP + ADC, including App Engine service accounts):
+
+```bash
+pip install "pyeztrace[otel,gcp]"
+export EZTRACE_OTEL_ENABLED=true
+export EZTRACE_OTEL_EXPORTER=gcp
+# optional override; defaults to https://telemetry.googleapis.com/v1/traces for exporter=gcp
+export EZTRACE_OTLP_ENDPOINT="https://telemetry.googleapis.com/v1/traces"
+# optional explicit toggle; defaults true for exporter=gcp or telemetry endpoint
+export EZTRACE_OTLP_GCP_AUTH=true
+# optional custom scopes (comma/space separated)
+export EZTRACE_GCP_SCOPES="https://www.googleapis.com/auth/cloud-platform"
+```
+
+If your endpoint is `telemetry.googleapis.com`, `EZTRACE_OTEL_EXPORTER=otlp` also auto-enables ADC auth unless an `Authorization` header is already provided via `EZTRACE_OTLP_HEADERS`.
 
 Use console exporter for local development:
 
