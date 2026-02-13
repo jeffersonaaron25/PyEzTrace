@@ -47,6 +47,41 @@ def test_trace_decorator_include_exclude(monkeypatch):
     assert "baz" in called  # baz is not traced, but still called
 
 
+def test_recursive_trace_initializes_otel_before_patching(monkeypatch):
+    setup.Setup.initialize("EZTRACER_TEST_ORDER", show_metrics=False)
+    order = []
+
+    import types
+    mod = types.ModuleType("order_mod")
+
+    def child():
+        return "ok"
+
+    mod.child = child
+
+    original_enter = tracer.trace_children_in_module.__enter__
+
+    def wrapped_is_enabled():
+        order.append("is_enabled")
+        return False
+
+    def wrapped_enter(self):
+        order.append("enter")
+        return original_enter(self)
+
+    monkeypatch.setattr(tracer, "is_enabled", wrapped_is_enabled)
+    monkeypatch.setattr(tracer.trace_children_in_module, "__enter__", wrapped_enter)
+
+    @tracer.trace(modules_or_classes=[mod], recursive_depth=1)
+    def parent():
+        return mod.child()
+
+    assert parent() == "ok"
+    assert "is_enabled" in order
+    assert "enter" in order
+    assert order.index("is_enabled") < order.index("enter")
+
+
 def test_child_trace_decorator_tracing(monkeypatch):
     setup.Setup.initialize("EZTRACER_TEST3", show_metrics=False)
 
