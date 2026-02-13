@@ -21,11 +21,16 @@ def reset_otel_state(monkeypatch):
     keys = [
         "EZTRACE_OTEL_ENABLED",
         "EZTRACE_OTEL_EXPORTER",
+        "EZTRACE_OTEL_DEBUG",
         "EZTRACE_SERVICE_NAME",
         "EZTRACE_OTLP_ENDPOINT",
         "EZTRACE_OTLP_HEADERS",
         "EZTRACE_OTLP_GCP_AUTH",
+        "EZTRACE_GCP_PROJECT_ID",
         "EZTRACE_GCP_SCOPES",
+        "GOOGLE_CLOUD_PROJECT",
+        "GCLOUD_PROJECT",
+        "GCP_PROJECT",
         "EZTRACE_S3_BUCKET",
         "EZTRACE_S3_PREFIX",
         "EZTRACE_S3_REGION",
@@ -273,6 +278,35 @@ def test_runtime_export_failure_is_surfaced(monkeypatch):
     from opentelemetry.sdk.trace.export import SpanExportResult
     assert result == SpanExportResult.FAILURE
     assert "network-down" in stderr.getvalue()
+
+
+def test_gcp_resource_has_project_id(monkeypatch):
+    Setup.initialize("GCP_APP", show_metrics=False)
+    monkeypatch.setenv("EZTRACE_OTEL_ENABLED", "true")
+    monkeypatch.setenv("EZTRACE_OTEL_EXPORTER", "gcp")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "unit-gcp-project")
+
+    from opentelemetry.sdk.trace.export import ConsoleSpanExporter
+
+    def fake_build_exporter(_name):
+        return ConsoleSpanExporter(), None
+
+    monkeypatch.setattr(otel, "_build_exporter", fake_build_exporter)
+
+    assert otel.enable_from_env() is True
+    attrs = dict(otel._state.tracer_provider.resource.attributes)
+    assert attrs.get("gcp.project_id") == "unit-gcp-project"
+
+
+def test_start_span_propagates_user_exception_without_contextmanager_error(monkeypatch):
+    Setup.initialize("SPAN_ERR_APP", show_metrics=False)
+    monkeypatch.setenv("EZTRACE_OTEL_ENABLED", "true")
+    monkeypatch.setenv("EZTRACE_OTEL_EXPORTER", "console")
+
+    assert otel.enable_from_env() is True
+    with pytest.raises(ValueError):
+        with otel.start_span("boom-span"):
+            raise ValueError("boom")
 
 
 def test_s3_exporter_writes_span_batch(monkeypatch):

@@ -395,6 +395,8 @@ export EZTRACE_GCP_SCOPES="https://www.googleapis.com/auth/cloud-platform"
 ```
 
 If your endpoint is `telemetry.googleapis.com`, `EZTRACE_OTEL_EXPORTER=otlp` also auto-enables ADC auth unless an `Authorization` header is already provided via `EZTRACE_OTLP_HEADERS`.
+If Cloud Trace rejects spans with `Resource is missing required attribute "gcp.project_id"`, set one of:
+`EZTRACE_GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, `GCLOUD_PROJECT`, or `GCP_PROJECT`.
 
 Use console exporter for local development:
 
@@ -434,7 +436,7 @@ Notes:
 - Spans are created for both parent and child wrappers using function `__qualname__` as span names.
 - Exceptions are recorded on the active span when OTEL is enabled.
 - Set `EZTRACE_OTEL_DEBUG=true` to emit one-time OTEL diagnostics to stderr (startup status and no-op reasons).
-- Inspect runtime OTEL state with `from pyeztrace import otel; print(otel.get_otel_status())`.
+- Inspect runtime OTEL state with `from pyeztrace import otel; print(otel.get_otel_status())` (available in newer builds after `0.1.1`).
 
 ## Advanced Usage
 

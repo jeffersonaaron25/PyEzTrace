@@ -258,6 +258,9 @@ export EZTRACE_OTLP_ENDPOINT="https://telemetry.googleapis.com/v1/traces"
 export EZTRACE_OTLP_GCP_AUTH=true
 ```
 
+If Cloud Trace returns `Resource is missing required attribute "gcp.project_id"`, set:
+`EZTRACE_GCP_PROJECT_ID` (or `GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT` / `GCP_PROJECT`).
+
 **Console (local dev):**
 
 ```bash
@@ -281,3 +284,5 @@ And inspect runtime OTEL state in code:
 from pyeztrace import otel
 print(otel.get_otel_status())
 ```
+
+`otel.get_otel_status()` is available in newer builds after `0.1.1`.

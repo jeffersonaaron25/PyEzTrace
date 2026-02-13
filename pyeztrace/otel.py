@@ -28,6 +28,13 @@ _state = _OtelState()
 
 _GCP_TELEMETRY_ENDPOINT = "https://telemetry.googleapis.com/v1/traces"
 _GCP_DEFAULT_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+_GCP_EXPORTER_NAMES = {"gcp", "google", "googlecloud", "google-cloud"}
+_GCP_PROJECT_ENV_KEYS = (
+    "EZTRACE_GCP_PROJECT_ID",
+    "GOOGLE_CLOUD_PROJECT",
+    "GCLOUD_PROJECT",
+    "GCP_PROJECT",
+)
 _DIAGNOSTIC_ONCE_KEYS: Set[str] = set()
 
 
@@ -148,10 +155,32 @@ def _should_use_gcp_auth(endpoint: str, exporter_name: str) -> bool:
         return explicit.strip().lower() in ("1", "true", "yes", "y", "on")
 
     name = (exporter_name or "").strip().lower()
-    if name in ("gcp", "google", "googlecloud", "google-cloud"):
+    if name in _GCP_EXPORTER_NAMES:
         return True
 
     return _is_google_telemetry_endpoint(endpoint)
+
+
+def _resolve_otlp_endpoint(exporter_name: str) -> str:
+    name = (exporter_name or "").strip().lower()
+    default_endpoint = _GCP_TELEMETRY_ENDPOINT if name in _GCP_EXPORTER_NAMES else "http://localhost:4318/v1/traces"
+    return os.environ.get("EZTRACE_OTLP_ENDPOINT", default_endpoint)
+
+
+def _resolve_gcp_project_id() -> Optional[str]:
+    for key in _GCP_PROJECT_ENV_KEYS:
+        value = os.environ.get(key)
+        if value and value.strip():
+            return value.strip()
+
+    try:
+        import google.auth
+        _credentials, project_id = google.auth.default(scopes=_parse_scopes(os.environ.get("EZTRACE_GCP_SCOPES", "")))
+        if project_id:
+            return str(project_id)
+    except Exception:
+        pass
+    return None
 
 
 def _load_google_credentials():
@@ -255,8 +284,7 @@ def _build_exporter(exporter_name: str):
 
     # OTLP HTTP exporter (default OTEL path)
     if name in ("otlp", "otlphttp", "otlp-http", "gcp", "google", "googlecloud", "google-cloud"):
-        default_endpoint = _GCP_TELEMETRY_ENDPOINT if name in ("gcp", "google", "googlecloud", "google-cloud") else "http://localhost:4318/v1/traces"
-        endpoint = os.environ.get("EZTRACE_OTLP_ENDPOINT", default_endpoint)
+        endpoint = _resolve_otlp_endpoint(name)
         headers = _parse_headers(os.environ.get("EZTRACE_OTLP_HEADERS", ""))
         return _build_otlp_http_exporter(endpoint=endpoint, headers=headers, exporter_name=name)
 
@@ -365,6 +393,8 @@ def enable_from_env() -> bool:
         return _state.enabled
 
     exporter_name = os.environ.get("EZTRACE_OTEL_EXPORTER", "")
+    resolved_exporter_name = exporter_name or "otlp"
+    otlp_endpoint = _resolve_otlp_endpoint(resolved_exporter_name)
     service_name = os.environ.get("EZTRACE_SERVICE_NAME") or (Setup.get_project() if Setup.is_setup_done() else "PyEzTrace")
 
     try:
@@ -374,20 +404,33 @@ def enable_from_env() -> bool:
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-        resource = Resource.create({
+        resource_attrs: Dict[str, Any] = {
             "service.name": service_name,
             "library.name": "pyeztrace",
             "library.version": "0.1.1",
-        })
+        }
+
+        if _should_use_gcp_auth(otlp_endpoint, resolved_exporter_name):
+            project_id = _resolve_gcp_project_id()
+            if project_id:
+                resource_attrs["gcp.project_id"] = project_id
+            else:
+                _emit_diagnostic(
+                    "Unable to resolve GCP project id for OTLP. "
+                    "Cloud Trace may reject spans without resource attribute 'gcp.project_id'.",
+                    once_key="missing-gcp-project-id",
+                )
+
+        resource = Resource.create(resource_attrs)
 
         provider = TracerProvider(resource=resource)
 
-        exporter, err = _build_exporter(exporter_name or "otlp")
+        exporter, err = _build_exporter(resolved_exporter_name)
         if exporter is None:
             # If exporter fails, fallback to console if possible; otherwise disable
             _emit_diagnostic(
-                f"Failed to initialize exporter '{exporter_name or 'otlp'}': {err}. Falling back to console exporter.",
-                once_key=f"exporter-fallback:{exporter_name or 'otlp'}:{err}",
+                f"Failed to initialize exporter '{resolved_exporter_name}': {err}. Falling back to console exporter.",
+                once_key=f"exporter-fallback:{resolved_exporter_name}:{err}",
             )
             exporter, err2 = _build_exporter("console")
             if exporter is None:
@@ -460,20 +503,51 @@ def start_span(name: str, attributes: Optional[Dict[str, Any]] = None):
     """
     if is_enabled():
         tracer = get_tracer()
+        if attributes is None:
+            attributes = {}
+
         try:
-            if attributes is None:
-                attributes = {}
-            # Always add function-friendly attribute names
-            with tracer.start_as_current_span(name, attributes=attributes) as span:
-                yield span
-        except Exception:
-            # If anything goes wrong, degrade gracefully to no-op
+            span_cm = tracer.start_as_current_span(name, attributes=attributes)
+        except Exception as e:
             _emit_diagnostic(
-                f"start_span('{name}') degraded to no-op due to tracer runtime error.",
-                once_key=f"start-span-runtime-noop:{name}",
-                debug_only=True,
+                f"start_span('{name}') degraded to no-op: unable to create span context manager ({e}).",
+                once_key=f"start-span-create-failed:{type(e).__name__}:{e}",
             )
             yield None
+            return
+
+        try:
+            span = span_cm.__enter__()
+        except Exception as e:
+            _emit_diagnostic(
+                f"start_span('{name}') degraded to no-op: unable to enter span context ({e}).",
+                once_key=f"start-span-enter-failed:{type(e).__name__}:{e}",
+            )
+            yield None
+            return
+
+        try:
+            yield span
+        except Exception:
+            exc_type, exc_value, exc_tb = sys.exc_info()
+            try:
+                span_cm.__exit__(exc_type, exc_value, exc_tb)
+            except Exception as e:
+                _emit_diagnostic(
+                    f"Error while closing span for '{name}' after exception: {e}",
+                    level="ERROR",
+                    once_key=f"start-span-exit-after-error:{type(e).__name__}:{e}",
+                )
+            raise
+        else:
+            try:
+                span_cm.__exit__(None, None, None)
+            except Exception as e:
+                _emit_diagnostic(
+                    f"Error while closing span for '{name}': {e}",
+                    level="ERROR",
+                    once_key=f"start-span-exit:{type(e).__name__}:{e}",
+                )
     else:
         if _state.error:
             _emit_diagnostic(
