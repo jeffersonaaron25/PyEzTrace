@@ -1,5 +1,11 @@
 # PyEzTrace
 
+[![PyPI version](https://img.shields.io/pypi/v/pyeztrace.svg)](https://pypi.org/project/pyeztrace/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/pyeztrace.svg)](https://pypi.org/project/pyeztrace/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/jeffersonaaron25/PyEzTrace/actions/workflows/ci.yml/badge.svg)](https://github.com/jeffersonaaron25/PyEzTrace/actions/workflows/ci.yml)
+[![GitHub Pages](https://img.shields.io/badge/docs-GitHub%20Pages-blue?logo=github)](https://jeffersonaaron25.github.io/PyEzTrace/)
+
 A dependency-free, lightweight Python tracing and logging library with hierarchical logging, context management, and performance metrics.
 
 ## Features
