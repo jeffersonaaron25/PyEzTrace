@@ -246,6 +246,21 @@ export EZTRACE_OTLP_ENDPOINT="http://localhost:4318/v1/traces"
 # optional: export EZTRACE_SERVICE_NAME="my-service"
 ```
 
+**Google Cloud Trace (OTLP + ADC):**
+
+```bash
+pip install "pyeztrace[otel,gcp]"
+export EZTRACE_OTEL_ENABLED=true
+export EZTRACE_OTEL_EXPORTER=gcp
+# optional override; defaults to telemetry endpoint for exporter=gcp
+export EZTRACE_OTLP_ENDPOINT="https://telemetry.googleapis.com/v1/traces"
+# optional explicit toggle
+export EZTRACE_OTLP_GCP_AUTH=true
+```
+
+If Cloud Trace returns `Resource is missing required attribute "gcp.project_id"`, set:
+`EZTRACE_GCP_PROJECT_ID` (or `GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT` / `GCP_PROJECT`).
+
 **Console (local dev):**
 
 ```bash
@@ -256,3 +271,18 @@ export EZTRACE_OTEL_EXPORTER=console
 **S3 / Azure:** Install `pyeztrace[s3]` or `pyeztrace[azure]`, set `EZTRACE_OTEL_EXPORTER=s3` or `azure`, and the bucket/container and credential env vars. See the [README OpenTelemetry section](https://github.com/jeffersonaaron25/pyeztrace#10-opentelemetry-spans-optional) for full S3/Azure options.
 
 The bridge is lazy-loaded; if OTEL packages are missing, the library still works without spans. Spans use function `__qualname__`; exceptions are recorded on the active span.
+
+For troubleshooting, enable OTEL diagnostics:
+
+```bash
+export EZTRACE_OTEL_DEBUG=true
+```
+
+And inspect runtime OTEL state in code:
+
+```python
+from pyeztrace import otel
+print(otel.get_otel_status())
+```
+
+`otel.get_otel_status()` is available in newer builds after `0.1.1`.

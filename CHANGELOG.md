@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.1.1
+- Added Google Cloud OTLP support with ADC-based authentication for App Engine/GCP runtimes.
+- Added `gcp` optional extra (`google-auth`) and updated OTEL documentation/examples for Cloud Trace endpoint usage.
+- Updated package and OTEL resource version metadata to `0.1.1`.
+
+## v0.1.0
+- **Breaking (behavior):** trace() now initializes lazily on first use instead of automatically during module import.
+- Improved viewer with more useful data.
+
+## v0.0.14
+- Added a convenience function `print()` for printing to the console with default EzTrace logger.
+- New logging sinks for file and console
+- Improvements to redaction
+
 ## v0.0.13
 - **Breaking (behavior):** When file logging is enabled, the default file format is now JSON while the console remains colored output.
 - Added `EZTRACE_CONSOLE_LOG_FORMAT` and `EZTRACE_FILE_LOG_FORMAT` to configure formats independently (legacy `EZTRACE_LOG_FORMAT` still sets both).

@@ -17,7 +17,7 @@ except Exception:
     resource = None  # type: ignore
 from pyeztrace.setup import Setup
 from pyeztrace.custom_logging import Logging
-from pyeztrace.otel import start_span, record_exception
+from pyeztrace.otel import start_span, record_exception, is_enabled
 
 # Marker attribute for wrapped functions
 _TRACED_ATTRIBUTE = '_pyeztrace_wrapped'
@@ -156,6 +156,15 @@ def _redaction_from_env() -> Optional[RedactionSettings]:
 _global_redaction_override: Optional[RedactionSettings] = None
 _logger_lock = threading.Lock()
 _logger_instance: Optional[Logging] = None
+
+
+def _ensure_otel_initialized_early() -> None:
+    """Initialize OTEL before recursive monkey-patching starts."""
+    try:
+        is_enabled()
+    except Exception:
+        # OTEL failures are handled by otel.py; tracing should keep working.
+        pass
 
 
 def set_global_redaction(
@@ -570,7 +579,8 @@ def child_trace_decorator(func: F) -> F:
             start = time.time()
             with start_span(func.__qualname__, {"fn.type": "child"}) as _span:
                 try:
-                    result = await func(*args, **kwargs)
+                    with logging.with_context(call_id=call_id, parent_id=parent_id):
+                        result = await func(*args, **kwargs)
                     end = time.time()
                     duration = end - start
                     # Metrics capture
@@ -675,7 +685,8 @@ def child_trace_decorator(func: F) -> F:
             start = time.time()
             with start_span(func.__qualname__, {"fn.type": "child"}) as _span:
                 try:
-                    result = func(*args, **kwargs)
+                    with logging.with_context(call_id=call_id, parent_id=parent_id):
+                        result = func(*args, **kwargs)
                     end = time.time()
                     duration = end - start
                     # Metrics capture
@@ -870,16 +881,6 @@ def trace(
                         for mod in recursive_mods:
                             if id(mod) not in [id(t) for t in targets]:
                                 targets.append(mod)
-                
-                # Log the modules being traced if in debug mode
-                if hasattr(logging, 'log_debug'):
-                    mod_names = [getattr(m, '__name__', str(m)) for m in targets]
-                    logging.log_debug(
-                        f"Recursive tracing activated with depth={recursive_depth}. "
-                        f"Tracing {len(targets)} modules: {', '.join(mod_names[:5])}" + 
-                        (f"... and {len(mod_names)-5} more" if len(mod_names) > 5 else "")
-                    )
-                    
             return targets
 
         # Special case: decorator applied to a class
@@ -953,6 +954,7 @@ def trace(
                 try:
                     # Initialize if not already done
                     ensure_initialized()
+                    _ensure_otel_initialized_early()
                     redaction_to_use = _resolve_redaction(configured_redaction)
                     redaction_token = _active_redaction.set(redaction_to_use)
                     token = tracing_active.set(True)
@@ -1002,7 +1004,8 @@ def trace(
                                 await m.__aenter__()
                         with start_span(func.__qualname__, {"fn.type": "parent"}) as _span:
                             try:
-                                result = await func(*args, **kwargs)
+                                with logging.with_context(call_id=call_id, parent_id=parent_id):
+                                    result = await func(*args, **kwargs)
                                 end = time.time()
                                 duration = end - start
                                 # Metrics capture
@@ -1086,6 +1089,7 @@ def trace(
                 try:
                     # Initialize if not already done
                     ensure_initialized()
+                    _ensure_otel_initialized_early()
                     redaction_to_use = _resolve_redaction(configured_redaction)
                     redaction_token = _active_redaction.set(redaction_to_use)
                     token = tracing_active.set(True)
@@ -1134,7 +1138,8 @@ def trace(
                                 m.__enter__()
                         with start_span(func.__qualname__, {"fn.type": "parent"}) as _span:
                             try:
-                                result = func(*args, **kwargs)
+                                with logging.with_context(call_id=call_id, parent_id=parent_id):
+                                    result = func(*args, **kwargs)
                                 end = time.time()
                                 duration = end - start
                                 # Metrics capture

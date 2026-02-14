@@ -21,9 +21,16 @@ def reset_otel_state(monkeypatch):
     keys = [
         "EZTRACE_OTEL_ENABLED",
         "EZTRACE_OTEL_EXPORTER",
+        "EZTRACE_OTEL_DEBUG",
         "EZTRACE_SERVICE_NAME",
         "EZTRACE_OTLP_ENDPOINT",
         "EZTRACE_OTLP_HEADERS",
+        "EZTRACE_OTLP_GCP_AUTH",
+        "EZTRACE_GCP_PROJECT_ID",
+        "EZTRACE_GCP_SCOPES",
+        "GOOGLE_CLOUD_PROJECT",
+        "GCLOUD_PROJECT",
+        "GCP_PROJECT",
         "EZTRACE_S3_BUCKET",
         "EZTRACE_S3_PREFIX",
         "EZTRACE_S3_REGION",
@@ -35,6 +42,8 @@ def reset_otel_state(monkeypatch):
     ]
     Setup.reset()
     otel._state = otel._OtelState()
+    if hasattr(otel, "_reset_diagnostics_state_for_tests"):
+        otel._reset_diagnostics_state_for_tests()
     _reset_tracer_provider()
     for key in keys:
         monkeypatch.delenv(key, raising=False)
@@ -51,6 +60,8 @@ def reset_otel_state(monkeypatch):
         pass
     Setup.reset()
     otel._state = otel._OtelState()
+    if hasattr(otel, "_reset_diagnostics_state_for_tests"):
+        otel._reset_diagnostics_state_for_tests()
     _reset_tracer_provider()
 
 
@@ -121,6 +132,252 @@ def test_otlp_exporter_sends_data_to_local_collector(monkeypatch):
     finally:
         server.shutdown()
         thread.join(timeout=2)
+
+
+def test_otlp_exporter_uses_google_authorized_session(monkeypatch):
+    captured = {}
+
+    class FakeOTLPSpanExporter:
+        def __init__(self, endpoint=None, headers=None, session=None):
+            captured["endpoint"] = endpoint
+            captured["headers"] = headers or {}
+            captured["session"] = session
+
+    class FakeCreds:
+        token = None
+
+        def refresh(self, _request):
+            self.token = "should-not-be-needed"
+
+    class FakeAuthorizedSession:
+        def __init__(self, credentials):
+            self.credentials = credentials
+
+    class FakeRequest:
+        pass
+
+    trace_exporter_module = types.ModuleType("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+    trace_exporter_module.OTLPSpanExporter = FakeOTLPSpanExporter
+
+    google_module = types.ModuleType("google")
+    google_auth_module = types.ModuleType("google.auth")
+    google_transport_module = types.ModuleType("google.auth.transport")
+    google_requests_module = types.ModuleType("google.auth.transport.requests")
+
+    google_auth_module.default = lambda scopes=None: (FakeCreds(), "unit-project")
+    google_requests_module.AuthorizedSession = FakeAuthorizedSession
+    google_requests_module.Request = FakeRequest
+    google_auth_module.transport = google_transport_module
+    google_transport_module.requests = google_requests_module
+    google_module.auth = google_auth_module
+
+    monkeypatch.setitem(sys.modules, "opentelemetry.exporter.otlp.proto.http.trace_exporter", trace_exporter_module)
+    monkeypatch.setitem(sys.modules, "google", google_module)
+    monkeypatch.setitem(sys.modules, "google.auth", google_auth_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport", google_transport_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport.requests", google_requests_module)
+
+    monkeypatch.setenv("EZTRACE_OTLP_ENDPOINT", "https://telemetry.googleapis.com/v1/traces")
+    monkeypatch.setenv("EZTRACE_OTLP_HEADERS", "x-tenant=abc")
+
+    exporter, err = otel._build_exporter("otlp")
+    assert err is None
+    assert isinstance(exporter, FakeOTLPSpanExporter)
+    assert captured["endpoint"] == "https://telemetry.googleapis.com/v1/traces"
+    assert captured["headers"]["x-tenant"] == "abc"
+    assert isinstance(captured["session"], FakeAuthorizedSession)
+
+
+def test_otlp_exporter_google_auth_falls_back_to_bearer_header(monkeypatch):
+    captured = {}
+
+    class FakeOTLPSpanExporter:
+        def __init__(self, endpoint=None, headers=None):
+            captured["endpoint"] = endpoint
+            captured["headers"] = headers or {}
+            self._headers = dict(headers or {})
+
+        def export(self, _spans):
+            return True
+
+    class FakeCreds:
+        token = None
+
+        def refresh(self, _request):
+            self.token = "unit-token"
+
+    class FakeAuthorizedSession:
+        def __init__(self, credentials):
+            self.credentials = credentials
+
+    class FakeRequest:
+        pass
+
+    trace_exporter_module = types.ModuleType("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+    trace_exporter_module.OTLPSpanExporter = FakeOTLPSpanExporter
+
+    google_module = types.ModuleType("google")
+    google_auth_module = types.ModuleType("google.auth")
+    google_transport_module = types.ModuleType("google.auth.transport")
+    google_requests_module = types.ModuleType("google.auth.transport.requests")
+
+    google_auth_module.default = lambda scopes=None: (FakeCreds(), "unit-project")
+    google_requests_module.AuthorizedSession = FakeAuthorizedSession
+    google_requests_module.Request = FakeRequest
+    google_auth_module.transport = google_transport_module
+    google_transport_module.requests = google_requests_module
+    google_module.auth = google_auth_module
+
+    monkeypatch.setitem(sys.modules, "opentelemetry.exporter.otlp.proto.http.trace_exporter", trace_exporter_module)
+    monkeypatch.setitem(sys.modules, "google", google_module)
+    monkeypatch.setitem(sys.modules, "google.auth", google_auth_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport", google_transport_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport.requests", google_requests_module)
+
+    monkeypatch.delenv("EZTRACE_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setenv("EZTRACE_OTLP_HEADERS", "x-tenant=abc")
+
+    exporter, err = otel._build_exporter("gcp")
+    assert err is None
+    assert isinstance(exporter, otel._RefreshingGoogleBearerSpanExporter)
+    assert isinstance(exporter._inner, FakeOTLPSpanExporter)
+    assert captured["endpoint"] == "https://telemetry.googleapis.com/v1/traces"
+    assert captured["headers"]["x-tenant"] == "abc"
+    assert captured["headers"]["Authorization"] == "Bearer unit-token"
+
+
+def test_otlp_exporter_google_bearer_fallback_refreshes_token_per_export(monkeypatch):
+    export_headers = []
+    created = {}
+
+    class FakeOTLPSpanExporter:
+        def __init__(self, endpoint=None, headers=None):
+            self._headers = dict(headers or {})
+            self._session = types.SimpleNamespace(headers=dict(headers or {}))
+
+        def export(self, _spans):
+            export_headers.append(self._headers.get("Authorization"))
+            return True
+
+    class FakeCreds:
+        def __init__(self):
+            self.token = None
+            self.refresh_calls = 0
+
+        def refresh(self, _request):
+            self.refresh_calls += 1
+            self.token = f"unit-token-{self.refresh_calls}"
+
+    class FakeAuthorizedSession:
+        def __init__(self, credentials):
+            self.credentials = credentials
+
+    class FakeRequest:
+        pass
+
+    trace_exporter_module = types.ModuleType("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+    trace_exporter_module.OTLPSpanExporter = FakeOTLPSpanExporter
+
+    google_module = types.ModuleType("google")
+    google_auth_module = types.ModuleType("google.auth")
+    google_transport_module = types.ModuleType("google.auth.transport")
+    google_requests_module = types.ModuleType("google.auth.transport.requests")
+
+    def fake_default(scopes=None):  # noqa: ARG001
+        creds = FakeCreds()
+        created["credentials"] = creds
+        return creds, "unit-project"
+
+    google_auth_module.default = fake_default
+    google_requests_module.AuthorizedSession = FakeAuthorizedSession
+    google_requests_module.Request = FakeRequest
+    google_auth_module.transport = google_transport_module
+    google_transport_module.requests = google_requests_module
+    google_module.auth = google_auth_module
+
+    monkeypatch.setitem(sys.modules, "opentelemetry.exporter.otlp.proto.http.trace_exporter", trace_exporter_module)
+    monkeypatch.setitem(sys.modules, "google", google_module)
+    monkeypatch.setitem(sys.modules, "google.auth", google_auth_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport", google_transport_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport.requests", google_requests_module)
+
+    exporter, err = otel._build_exporter("gcp")
+    assert err is None
+    assert isinstance(exporter, otel._RefreshingGoogleBearerSpanExporter)
+
+    exporter.export([])
+    exporter.export([])
+
+    assert export_headers == ["Bearer unit-token-2", "Bearer unit-token-3"]
+    assert created["credentials"].refresh_calls == 3
+
+
+def test_otel_init_failure_surfaces_diagnostic_and_status(monkeypatch):
+    Setup.initialize("BROKEN_OTEL_APP", show_metrics=False)
+    monkeypatch.setenv("EZTRACE_OTEL_ENABLED", "true")
+    monkeypatch.setenv("EZTRACE_OTEL_EXPORTER", "otlp")
+
+    def fake_build_exporter(_name):
+        return None, "unit-exporter-failure"
+
+    stderr = io.StringIO()
+    monkeypatch.setattr(otel, "_build_exporter", fake_build_exporter)
+    monkeypatch.setattr(sys, "__stderr__", stderr)
+
+    assert otel.enable_from_env() is False
+    status = otel.get_otel_status()
+    assert status["enabled"] is False
+    assert status["initialized"] is False
+    assert status["error"] == "unit-exporter-failure"
+    assert "unit-exporter-failure" in stderr.getvalue()
+
+
+def test_runtime_export_failure_is_surfaced(monkeypatch):
+    class FailingExporter:
+        def export(self, _spans):
+            raise RuntimeError("network-down")
+
+        def shutdown(self):
+            return True
+
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "__stderr__", stderr)
+
+    wrapped = otel._DiagnosticSpanExporter(FailingExporter())
+    result = wrapped.export([])
+
+    from opentelemetry.sdk.trace.export import SpanExportResult
+    assert result == SpanExportResult.FAILURE
+    assert "network-down" in stderr.getvalue()
+
+
+def test_gcp_resource_has_project_id(monkeypatch):
+    Setup.initialize("GCP_APP", show_metrics=False)
+    monkeypatch.setenv("EZTRACE_OTEL_ENABLED", "true")
+    monkeypatch.setenv("EZTRACE_OTEL_EXPORTER", "gcp")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "unit-gcp-project")
+
+    from opentelemetry.sdk.trace.export import ConsoleSpanExporter
+
+    def fake_build_exporter(_name):
+        return ConsoleSpanExporter(), None
+
+    monkeypatch.setattr(otel, "_build_exporter", fake_build_exporter)
+
+    assert otel.enable_from_env() is True
+    attrs = dict(otel._state.tracer_provider.resource.attributes)
+    assert attrs.get("gcp.project_id") == "unit-gcp-project"
+
+
+def test_start_span_propagates_user_exception_without_contextmanager_error(monkeypatch):
+    Setup.initialize("SPAN_ERR_APP", show_metrics=False)
+    monkeypatch.setenv("EZTRACE_OTEL_ENABLED", "true")
+    monkeypatch.setenv("EZTRACE_OTEL_EXPORTER", "console")
+
+    assert otel.enable_from_env() is True
+    with pytest.raises(ValueError):
+        with otel.start_span("boom-span"):
+            raise ValueError("boom")
 
 
 def test_s3_exporter_writes_span_batch(monkeypatch):

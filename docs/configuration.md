@@ -61,7 +61,7 @@ Setup.initialize("MyApp", disable_file_logging=True)
 Log files are rotated by size. Configure before first use:
 
 ```python
-# In Setup.initialize() or config
+# In Setup.initialize()
 max_size=10 * 1024 * 1024,  # 10MB per file
 backup_count=5,              # Keep 5 rotated files
 log_dir="logs",

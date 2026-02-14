@@ -29,6 +29,9 @@ Optional extras (keep default dependency-free):
 # OpenTelemetry SDK and OTLP exporter
 pip install "pyeztrace[otel]"
 
+# Google Cloud ADC auth for OTLP (App Engine, GCE, GKE, Cloud Run)
+pip install "pyeztrace[otel,gcp]"
+
 # S3 exporter
 pip install "pyeztrace[s3]"
 
@@ -377,6 +380,24 @@ export EZTRACE_OTLP_HEADERS=""
 export EZTRACE_SERVICE_NAME="my-service"
 ```
 
+Google Cloud Trace (OTLP + ADC, including App Engine service accounts):
+
+```bash
+pip install "pyeztrace[otel,gcp]"
+export EZTRACE_OTEL_ENABLED=true
+export EZTRACE_OTEL_EXPORTER=gcp
+# optional override; defaults to https://telemetry.googleapis.com/v1/traces for exporter=gcp
+export EZTRACE_OTLP_ENDPOINT="https://telemetry.googleapis.com/v1/traces"
+# optional explicit toggle; defaults true for exporter=gcp or telemetry endpoint
+export EZTRACE_OTLP_GCP_AUTH=true
+# optional custom scopes (comma/space separated)
+export EZTRACE_GCP_SCOPES="https://www.googleapis.com/auth/cloud-platform"
+```
+
+If your endpoint is `telemetry.googleapis.com`, `EZTRACE_OTEL_EXPORTER=otlp` also auto-enables ADC auth unless an `Authorization` header is already provided via `EZTRACE_OTLP_HEADERS`.
+If Cloud Trace rejects spans with `Resource is missing required attribute "gcp.project_id"`, set one of:
+`EZTRACE_GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, `GCLOUD_PROJECT`, or `GCP_PROJECT`.
+
 Use console exporter for local development:
 
 ```bash
@@ -414,6 +435,8 @@ Notes:
 - The bridge is lazy-loaded; if OTEL packages are missing, the library remains functional without spans.
 - Spans are created for both parent and child wrappers using function `__qualname__` as span names.
 - Exceptions are recorded on the active span when OTEL is enabled.
+- Set `EZTRACE_OTEL_DEBUG=true` to emit one-time OTEL diagnostics to stderr (startup status and no-op reasons).
+- Inspect runtime OTEL state with `from pyeztrace import otel; print(otel.get_otel_status())` (available in newer builds after `0.1.1`).
 
 ## Advanced Usage
 

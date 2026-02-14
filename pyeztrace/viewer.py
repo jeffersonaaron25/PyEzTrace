@@ -1,7 +1,7 @@
 import json
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 import time
@@ -15,6 +15,18 @@ class _TraceTreeBuilder:
             self.log_file = log_file.expanduser().resolve(strict=False)
         except Exception:
             self.log_file = Path(str(log_file)).expanduser()
+        self._entries_lock = threading.Lock()
+        self._cached_entries: List[Dict[str, Any]] = []
+        self._cached_offset = 0
+        self._cached_inode: Optional[tuple[int, int]] = None
+        self._cached_remainder = ""
+
+    def _stat_inode(self) -> Optional[tuple[int, int]]:
+        try:
+            st = self.log_file.stat()
+            return (int(st.st_dev), int(st.st_ino))
+        except Exception:
+            return None
 
     def _metrics_file(self) -> Path:
         return Path(str(self.log_file) + ".metrics")
@@ -27,6 +39,60 @@ class _TraceTreeBuilder:
                 return f.readlines()
         except Exception:
             return []
+
+    def _read_entries_cached(self) -> List[Dict[str, Any]]:
+        with self._entries_lock:
+            if not self.log_file.exists():
+                self._cached_entries = []
+                self._cached_offset = 0
+                self._cached_inode = None
+                self._cached_remainder = ""
+                return []
+
+            inode = self._stat_inode()
+            try:
+                st = self.log_file.stat()
+                size_now = int(st.st_size)
+            except Exception:
+                size_now = 0
+
+            rotated_or_truncated = (
+                self._cached_inode is not None
+                and inode is not None
+                and self._cached_inode != inode
+            ) or size_now < self._cached_offset
+
+            if rotated_or_truncated:
+                self._cached_entries = []
+                self._cached_offset = 0
+                self._cached_remainder = ""
+
+            self._cached_inode = inode
+
+            try:
+                with self.log_file.open("r", encoding="utf-8", errors="ignore") as f:
+                    if self._cached_offset > 0:
+                        f.seek(self._cached_offset)
+                    chunk = f.read()
+                    self._cached_offset = f.tell()
+            except Exception:
+                return list(self._cached_entries)
+
+            if not chunk:
+                return list(self._cached_entries)
+
+            text = self._cached_remainder + chunk
+            lines = text.splitlines(keepends=True)
+            if text and not text.endswith("\n"):
+                self._cached_remainder = lines.pop() if lines else text
+            else:
+                self._cached_remainder = ""
+
+            parsed = self._parse_json_lines(lines)
+            if parsed:
+                self._cached_entries.extend(parsed)
+
+            return list(self._cached_entries)
 
     def _parse_json_lines(self, lines: List[str]) -> List[Dict[str, Any]]:
         entries = []
@@ -75,9 +141,94 @@ class _TraceTreeBuilder:
         except Exception:
             return time.time()
 
+    def _safe_json_dumps(self, value: Any) -> str:
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            return json.dumps(str(value), ensure_ascii=False)
+
+    def _build_log_record(
+        self,
+        entry: Dict[str, Any],
+        entry_idx: int,
+        payload_preview_chars: int = 1200,
+    ) -> Dict[str, Any]:
+        data = entry.get("data")
+        if not isinstance(data, dict):
+            data = {}
+        call_id = data.get("call_id")
+        parent_id = data.get("parent_id")
+        event = data.get("event")
+        payload_json = self._safe_json_dumps(data)
+        payload_truncated = len(payload_json) > payload_preview_chars
+        payload_preview = payload_json[:payload_preview_chars]
+        if payload_truncated:
+            payload_preview += "…"
+
+        ts_epoch = data.get("time_epoch")
+        if ts_epoch is None:
+            ts_epoch = self._to_epoch(entry.get("timestamp", ""))
+
+        return {
+            "id": entry_idx,
+            "timestamp": entry.get("timestamp"),
+            "timestamp_epoch": ts_epoch,
+            "level": entry.get("level"),
+            "project": entry.get("project"),
+            "fn_type": entry.get("fn_type"),
+            "function": entry.get("function"),
+            "message": entry.get("message"),
+            "call_id": call_id,
+            "parent_id": parent_id,
+            "event": event,
+            "status": data.get("status"),
+            "linked_to_trace": bool(call_id),
+            "is_trace_event": event in {"start", "end", "error"},
+            "payload_preview": payload_preview,
+            "payload_size": len(payload_json),
+            "payload_truncated": payload_truncated,
+            "payload_keys": sorted([str(k) for k in data.keys()])[:40],
+        }
+
+    def build_logs(self, limit: int = 2000, payload_preview_chars: int = 1200) -> Dict[str, Any]:
+        entries = self._read_entries_cached()
+        total_entries = len(entries)
+        start_idx = 0
+        if limit > 0 and total_entries > limit:
+            start_idx = total_entries - limit
+            entries_window = entries[start_idx:]
+        else:
+            entries_window = entries
+
+        records = [
+            self._build_log_record(entry, start_idx + i, payload_preview_chars=payload_preview_chars)
+            for i, entry in enumerate(entries_window)
+        ]
+        return {
+            "generated_at": time.time(),
+            "log_file": str(self.log_file),
+            "total_entries": total_entries,
+            "logs": records,
+        }
+
+    def get_log_payload(self, entry_idx: int) -> Optional[Dict[str, Any]]:
+        entries = self._read_entries_cached()
+        if entry_idx < 0 or entry_idx >= len(entries):
+            return None
+        entry = entries[entry_idx]
+        data = entry.get("data")
+        if not isinstance(data, dict):
+            data = {}
+        return {
+            "id": entry_idx,
+            "entry": entry,
+            "payload": data,
+            "payload_json": self._safe_json_dumps(data),
+            "payload_size": len(self._safe_json_dumps(data)),
+        }
+
     def build_tree(self) -> Dict[str, Any]:
-        lines = self._read_lines()
-        entries = self._parse_json_lines(lines)
+        entries = self._read_entries_cached()
         nodes: Dict[str, Dict[str, Any]] = {}
         metrics_entries_from_log: List[Dict[str, Any]] = []
         roots: List[str] = []
@@ -228,6 +379,7 @@ class TraceViewerServer:
 
             def do_GET(self):  # noqa: N802 (keep stdlib name)
                 parsed = urlparse(self.path)
+                query = parse_qs(parsed.query)
                 if parsed.path == '/':
                     self._send(200, outer._html_page().encode('utf-8'), 'text/html; charset=utf-8')
                 elif parsed.path == '/app.js':
@@ -235,10 +387,32 @@ class TraceViewerServer:
                 elif parsed.path == '/api/tree':
                     data = outer._builder.build_tree()
                     self._send(200, json.dumps(data).encode('utf-8'), 'application/json')
+                elif parsed.path == '/api/logs':
+                    try:
+                        limit = int((query.get('limit') or ['2000'])[0])
+                    except Exception:
+                        limit = 2000
+                    try:
+                        preview = int((query.get('preview') or ['1200'])[0])
+                    except Exception:
+                        preview = 1200
+                    limit = max(100, min(limit, 10000))
+                    preview = max(100, min(preview, 50000))
+                    data = outer._builder.build_logs(limit=limit, payload_preview_chars=preview)
+                    self._send(200, json.dumps(data).encode('utf-8'), 'application/json')
+                elif parsed.path == '/api/logs/payload':
+                    try:
+                        entry_id = int((query.get('id') or ['-1'])[0])
+                    except Exception:
+                        entry_id = -1
+                    payload = outer._builder.get_log_payload(entry_id)
+                    if payload is None:
+                        self._send(404, b'Not Found', 'text/plain')
+                    else:
+                        self._send(200, json.dumps(payload).encode('utf-8'), 'application/json')
                 elif parsed.path == '/api/entries':
                     # raw entries for debugging
-                    lines = outer._builder._read_lines()
-                    entries = outer._builder._parse_json_lines(lines)
+                    entries = outer._builder._read_entries_cached()
                     self._send(200, json.dumps(entries[-1000:]).encode('utf-8'), 'application/json')
                 else:
                     self._send(404, b'Not Found', 'text/plain')
@@ -325,6 +499,7 @@ class TraceViewerServer:
     .metrics-table tr:last-child td { border-bottom: none; }
     .metrics-table .function-name { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-weight: 600; color: var(--accent); }
     .metrics-table .number { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; text-align: right; }
+    .text-action { cursor: pointer; }
     .metrics-table .bad { color: var(--error); }
     .metrics-table .good { color: var(--success); }
     .metrics-summary { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
@@ -413,10 +588,48 @@ class TraceViewerServer:
     .detail-error .detail-error-title { display: flex; align-items: center; gap: 6px; color: #fecaca; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; font-weight: 700; }
     .kv.error-kv { border-color: rgba(239,68,68,0.6); background: rgba(239,68,68,0.14); color: #ffe4e6; white-space: pre-wrap; word-break: break-word; }
     #trace-details { min-height: 0; flex: 1; overflow: auto; padding-right: 4px; }
+    .logs-wrap { display: grid; grid-template-columns: minmax(380px, 1fr) minmax(380px, 1fr); gap: 12px; }
+    .logs-controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+    .logs-list-wrap { height: 70vh; max-height: 70vh; min-height: 320px; border: 1px solid var(--border); border-radius: 8px; background: rgba(17,24,39,0.45); overflow: hidden; }
+    .logs-list-wrap .virtual-viewport { height: 100%; border: none; background: transparent; }
+    .logs-detail-col { padding: 10px; max-height: 70vh; min-height: 320px; border: 1px solid var(--border); border-radius: 8px; background: rgba(17,24,39,0.45); overflow-y: scroll; overflow-x: hidden; }
+    .log-row { padding: 8px 10px; border-bottom: 1px solid var(--border); cursor: pointer; }
+    .log-row:hover { background: var(--surface-soft); }
+    .log-row.active { background: rgba(56,189,248,0.14); box-shadow: inset 0 0 0 1px rgba(56,189,248,0.4); }
+    .log-row-title { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; }
+    .log-row-msg { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .log-row-meta { font-size: 11px; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap; }
+    .code-block { border: 1px solid var(--border); border-radius: 8px; background: rgba(17,24,39,0.7); padding: 10px; margin-top: 8px; max-height: 48vh; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+    .log-detail-header { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+    .pretty-card { border: 1px solid var(--border); border-radius: 10px; background: rgba(17,24,39,0.68); padding: 10px; margin-top: 8px; }
+    .pretty-grid { display: grid; grid-template-columns: minmax(120px, 180px) 1fr; gap: 8px 10px; }
+    .pretty-key { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .pretty-value { color: var(--text); font-size: 12px; line-height: 1.35; min-width: 0; overflow-wrap: anywhere; }
+    .pretty-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .pretty-badge-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    .pretty-json { margin-top: 8px; border: 1px solid var(--border); border-radius: 8px; background: rgba(2,6,23,0.65); padding: 10px; max-height: 34vh; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+    .payload-tree-controls { display: flex; gap: 8px; margin-top: 8px; }
+    .payload-tree { margin-top: 8px; border: 1px solid var(--border); border-radius: 8px; background: rgba(2,6,23,0.65); padding: 10px; max-height: 34vh; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
+    .payload-tree-node > summary { cursor: pointer; user-select: none; list-style: none; display: flex; gap: 8px; align-items: center; padding: 2px 0; }
+    .payload-tree-node > summary::-webkit-details-marker { display: none; }
+    .payload-tree-node > summary::before { content: '▸'; color: var(--muted); width: 10px; display: inline-block; }
+    .payload-tree-node[open] > summary::before { content: '▾'; }
+    .payload-tree-children { margin-left: 14px; padding-left: 10px; border-left: 1px dashed var(--border); }
+    .payload-tree-leaf { display: flex; gap: 6px; padding: 2px 0; align-items: baseline; min-width: 0; }
+    .payload-tree-key { color: #93c5fd; word-break: break-word; }
+    .payload-tree-meta { color: var(--muted); font-size: 11px; }
+    .payload-tree-sep { color: var(--muted); }
+    .payload-tree-value { min-width: 0; white-space: pre-wrap; word-break: break-word; }
+    .payload-tree-value.string { color: #86efac; }
+    .payload-tree-value.number { color: #fcd34d; }
+    .payload-tree-value.boolean { color: #67e8f9; }
+    .payload-tree-value.null { color: #c4b5fd; }
+    .payload-tree-empty { color: var(--muted); padding: 2px 0; }
     @media (max-width: 1080px) {
       header .meta { justify-content: flex-start; text-align: left; }
       .split-layout { grid-template-columns: 1fr; }
       .overview-columns { grid-template-columns: 1fr; }
+      .logs-wrap { grid-template-columns: 1fr; }
       .header-right { width: 100%; justify-content: space-between; }
     }
   </style>
@@ -546,9 +759,12 @@ class TraceViewerServer:
   const copyFilteredEl = document.getElementById('copy-filtered');
 
   let tree = [];
+  let logs = [];
+  let logsVersion = 0;
   let total = 0;
   let metrics = [];
   let generatedAt = null;
+  let logsGeneratedAt = null;
   let statusFilter = 'all';
   let minDurationMs = 0;
   let fnTypeFilter = 'all';
@@ -568,9 +784,29 @@ class TraceViewerServer:
   let slowThresholdMs = 10;
   let visibleTraceNodes = [];
   let traceMap = new Map();
+  let callToRunMap = new Map();
   let runScrollTop = 0;
   let selectionHistory = [];
   let historyIndex = -1;
+  let logQuery = '';
+  let logLevelFilter = 'all';
+  let logLinkFilter = 'all';
+  let logViewMode = 'console';
+  let payloadMode = 'pretty';
+  let selectedLogId = null;
+  let logScrollTop = 0;
+  let logDetailScrollTop = 0;
+  let pendingLogAnchorId = null;
+  let pendingLogAnchorOffset = 0;
+  let visibleLogs = [];
+  let payloadTreeOpenStateByKey = new Map();
+  let panelScrollTopByKey = new Map();
+  let filteredLogsCacheKey = '';
+  let filteredLogsCache = [];
+  let logSearchDebounce = null;
+  let logsFetchCounter = 0;
+  let fetchTreeInFlight = false;
+  const fullPayloadCache = new Map();
 
   const STATE_KEY = 'pyeztrace_viewer_ui_v1';
 
@@ -579,7 +815,8 @@ class TraceViewerServer:
       localStorage.setItem(STATE_KEY, JSON.stringify({
         statusFilter, minDurationMs, fnTypeFilter, sortMode, showPayloads,
         metricsTab, insightTab, autoRefreshEnabled, runQuery, runGroupBy,
-        runCompact, focusMode, depthLimit, selectedRunId
+        runCompact, focusMode, depthLimit, selectedRunId, logQuery,
+        logLevelFilter, logLinkFilter, logViewMode, payloadMode
       }));
     } catch (_e) {}
   }
@@ -603,6 +840,14 @@ class TraceViewerServer:
       focusMode = s.focusMode || focusMode;
       depthLimit = Number(s.depthLimit || depthLimit);
       selectedRunId = s.selectedRunId || null;
+      logQuery = s.logQuery || '';
+      logLevelFilter = s.logLevelFilter || logLevelFilter;
+      logLinkFilter = s.logLinkFilter || logLinkFilter;
+      logViewMode = s.logViewMode || logViewMode;
+      payloadMode = s.payloadMode || payloadMode;
+      if(payloadMode !== 'raw' && payloadMode !== 'pretty'){
+        payloadMode = 'pretty';
+      }
     } catch (_e) {}
   }
 
@@ -667,6 +912,392 @@ class TraceViewerServer:
 
   function getRunNode(runId){
     return tree.find(n=>n.call_id === runId) || null;
+  }
+
+  function rebuildCallToRunMap(){
+    const out = new Map();
+    tree.forEach(root=>{
+      const runId = root.call_id || null;
+      flattenNodes([root]).forEach(n=>{
+        if(n.call_id) out.set(n.call_id, runId);
+      });
+    });
+    callToRunMap = out;
+  }
+
+  function filteredLogs(){
+    const cacheKey = `${logsVersion}|${logQuery}|${logLevelFilter}|${logLinkFilter}`;
+    if(cacheKey === filteredLogsCacheKey){
+      return filteredLogsCache;
+    }
+    const q = (logQuery || '').toLowerCase().trim();
+    const out = logs.filter(l=>{
+      if(logLevelFilter !== 'all' && String(l.level || '').toUpperCase() !== logLevelFilter) return false;
+      if(logLinkFilter === 'linked' && !l.linked_to_trace) return false;
+      if(logLinkFilter === 'unlinked' && l.linked_to_trace) return false;
+      if(!q) return true;
+      const hay = [
+        l.message || '',
+        l.function || '',
+        l.fn_type || '',
+        l.level || '',
+        l.call_id || '',
+        l.parent_id || '',
+        l.event || '',
+        l.payload_preview || ''
+      ].join(' ').toLowerCase();
+      return hay.includes(q);
+    }).sort((a,b)=> (b.timestamp_epoch || 0) - (a.timestamp_epoch || 0));
+    filteredLogsCacheKey = cacheKey;
+    filteredLogsCache = out;
+    return out;
+  }
+
+  function getLogsScrollEl(){
+    const viewport = document.getElementById('logs-viewport');
+    const wrapper = document.getElementById('logs-list-wrap');
+    if(wrapper && wrapper.scrollTop > 0 && (!viewport || viewport.scrollTop === 0)){
+      return wrapper;
+    }
+    return viewport || wrapper || null;
+  }
+
+  function getLogsDetailEl(){
+    return document.getElementById('logs-detail-col');
+  }
+
+  function captureScrollGroup(baseKey, selector){
+    const nodes = document.querySelectorAll(selector);
+    nodes.forEach((node, idx)=>{
+      panelScrollTopByKey.set(`${baseKey}:${idx}`, node.scrollTop || 0);
+    });
+  }
+
+  function restoreScrollGroup(baseKey, selector){
+    const nodes = document.querySelectorAll(selector);
+    nodes.forEach((node, idx)=>{
+      const key = `${baseKey}:${idx}`;
+      if(!panelScrollTopByKey.has(key)) return;
+      const wanted = Number(panelScrollTopByKey.get(key) || 0);
+      const maxTop = Math.max(0, node.scrollHeight - node.clientHeight);
+      node.scrollTop = Math.min(wanted, maxTop);
+    });
+  }
+
+  function captureUiScrollState(){
+    const listEl = getLogsScrollEl();
+    if(listEl){
+      logScrollTop = listEl.scrollTop || 0;
+    }
+    const detailEl = getLogsDetailEl();
+    if(detailEl){
+      logDetailScrollTop = detailEl.scrollTop || 0;
+    }
+    captureScrollGroup('trace-tree', '#trace-tree');
+    captureScrollGroup('trace-details', '#trace-details');
+    captureScrollGroup('run-viewport', '#run-viewport');
+    captureScrollGroup('flame-scroll', '.flame-scroll');
+    captureScrollGroup('metrics-scroll', '.metrics-scroll');
+    captureScrollGroup('overview-scroll', '.overview-scroll');
+    captureScrollGroup('code-block', '.code-block');
+    captureScrollGroup('payload-tree', '.payload-tree');
+  }
+
+  function restoreUiScrollState(){
+    const listEl = getLogsScrollEl();
+    if(listEl){
+      const maxTop = Math.max(0, listEl.scrollHeight - listEl.clientHeight);
+      listEl.scrollTop = Math.min(logScrollTop || 0, maxTop);
+    }
+    const detailEl = getLogsDetailEl();
+    if(detailEl){
+      const maxTop = Math.max(0, detailEl.scrollHeight - detailEl.clientHeight);
+      detailEl.scrollTop = Math.min(logDetailScrollTop || 0, maxTop);
+    }
+    restoreScrollGroup('trace-tree', '#trace-tree');
+    restoreScrollGroup('trace-details', '#trace-details');
+    restoreScrollGroup('run-viewport', '#run-viewport');
+    restoreScrollGroup('flame-scroll', '.flame-scroll');
+    restoreScrollGroup('metrics-scroll', '.metrics-scroll');
+    restoreScrollGroup('overview-scroll', '.overview-scroll');
+    restoreScrollGroup('code-block', '.code-block');
+    restoreScrollGroup('payload-tree', '.payload-tree');
+  }
+
+  function captureLogListAnchor(){
+    const viewport = getLogsScrollEl();
+    if(!viewport || !visibleLogs.length){
+      pendingLogAnchorId = null;
+      pendingLogAnchorOffset = 0;
+      return;
+    }
+    const rowH = 72;
+    const top = viewport.scrollTop || logScrollTop || 0;
+    const topIndex = Math.max(0, Math.min(visibleLogs.length - 1, Math.floor(top / rowH)));
+    const topLog = visibleLogs[topIndex];
+    if(!topLog){
+      pendingLogAnchorId = null;
+      pendingLogAnchorOffset = 0;
+      return;
+    }
+    pendingLogAnchorId = String(topLog.id);
+    pendingLogAnchorOffset = top - (topIndex * rowH);
+  }
+
+  function getSelectedVisibleLog(){
+    if(!visibleLogs.length) return null;
+    return visibleLogs.find(l=>String(l.id) === String(selectedLogId)) || visibleLogs[0] || null;
+  }
+
+  function renderLogsRows(){
+    const viewport = document.getElementById('logs-viewport');
+    const spacer = document.getElementById('logs-spacer');
+    const layer = document.getElementById('logs-layer');
+    if(!viewport || !spacer || !layer) return;
+    const rowH = 72;
+    const totalH = visibleLogs.length * rowH;
+    spacer.style.height = `${totalH}px`;
+    const viewH = viewport.clientHeight || 560;
+    if(pendingLogAnchorId !== null){
+      const anchorIndex = visibleLogs.findIndex(l=>String(l.id) === String(pendingLogAnchorId));
+      if(anchorIndex >= 0){
+        logScrollTop = (anchorIndex * rowH) + (pendingLogAnchorOffset || 0);
+      }
+      pendingLogAnchorId = null;
+      pendingLogAnchorOffset = 0;
+    }
+    const maxScroll = Math.max(0, totalH - viewH);
+    if((logScrollTop || 0) > maxScroll){
+      logScrollTop = maxScroll;
+    }
+    const scrollEl = getLogsScrollEl();
+    if(scrollEl && scrollEl.scrollTop !== (logScrollTop || 0)){
+      scrollEl.scrollTop = logScrollTop || 0;
+    }
+    const top = logScrollTop || (scrollEl ? scrollEl.scrollTop : 0) || 0;
+    const start = Math.max(0, Math.floor(top / rowH) - 4);
+    const end = Math.min(visibleLogs.length, start + Math.ceil(viewH / rowH) + 8);
+    const slice = visibleLogs.slice(start, end);
+    layer.style.transform = `translateY(${start * rowH}px)`;
+    layer.innerHTML = slice.map(l=>`
+      <div class="log-row ${String(selectedLogId)===String(l.id) ? 'active' : ''}" data-action="select-log" data-log-id="${escapeAttr(String(l.id))}" style="height:${rowH-6}px;">
+        <div class="log-row-title">
+          <span class="pill ${String(l.level||'').toUpperCase()==='ERROR' ? 'error' : 'success'}">${escapeHtml(String(l.level || '-').toUpperCase())}</span>
+          ${l.linked_to_trace ? '<span class="pill">trace</span>' : '<span class="pill">orphan</span>'}
+          ${l.payload_truncated ? '<span class="pill">truncated</span>' : ''}
+          <span class="muted">${escapeHtml(l.timestamp || '-')}</span>
+        </div>
+        <div class="log-row-msg">${escapeHtml(l.message || '(no message)')}</div>
+        <div class="log-row-meta">
+          <span>${escapeHtml(cleanFnName(l.function || '-'))}</span>
+          <span>call=${escapeHtml((l.call_id || '-').slice(0, 12))}</span>
+          <span>event=${escapeHtml(l.event || '-')}</span>
+        </div>
+      </div>
+    `).join('') || '<div class="log-row"><span class="muted">No logs for current filters.</span></div>';
+  }
+
+  function logConsoleLine(log){
+    const ts = log.timestamp || '-';
+    const level = (log.level || '-').toUpperCase();
+    const fn = cleanFnName(log.function || '-');
+    const msg = log.message || '';
+    const cid = log.call_id ? ` call_id=${log.call_id}` : '';
+    return `${ts} ${level} ${fn} ${msg}${cid}`;
+  }
+
+  function parsedPayload(log){
+    const loaded = fullPayloadCache.get(String(log.id));
+    if(loaded && loaded.payload && typeof loaded.payload === 'object'){
+      return loaded.payload;
+    }
+    try {
+      const raw = log.payload_preview || '{}';
+      const parsed = JSON.parse(raw);
+      if(parsed && typeof parsed === 'object') return parsed;
+    } catch (_e) {}
+    return null;
+  }
+
+  function payloadTreeDomId(log){
+    return `payload-tree-${String(log.id || 'x').replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+  }
+
+  function payloadTreeStateKey(log){
+    if(!log) return '';
+    return [
+      String(log.id || ''),
+      String(log.timestamp_epoch || log.timestamp || ''),
+      String(log.call_id || ''),
+      String(log.message || ''),
+    ].join('|');
+  }
+
+  function payloadTreeChildPath(basePath, childKey){
+    return `${basePath}/${encodeURIComponent(String(childKey))}`;
+  }
+
+  function isPayloadContainer(value){
+    return Array.isArray(value) || (!!value && typeof value === 'object');
+  }
+
+  function renderPayloadScalar(value){
+    if(value === null){
+      return '<span class="payload-tree-value null">null</span>';
+    }
+    const t = typeof value;
+    if(t === 'string'){
+      return `<span class="payload-tree-value string">"${escapeHtml(value)}"</span>`;
+    }
+    if(t === 'number'){
+      return `<span class="payload-tree-value number">${escapeHtml(String(value))}</span>`;
+    }
+    if(t === 'boolean'){
+      return `<span class="payload-tree-value boolean">${escapeHtml(String(value))}</span>`;
+    }
+    return `<span class="payload-tree-value">${escapeHtml(String(value))}</span>`;
+  }
+
+  function renderPayloadTreeNode(key, value, depth=0, nodePath='/', openSet=null){
+    const keyHtml = escapeHtml(String(key));
+    if(!isPayloadContainer(value)){
+      return `
+        <div class="payload-tree-leaf">
+          <span class="payload-tree-key">${keyHtml}</span>
+          <span class="payload-tree-sep">:</span>
+          ${renderPayloadScalar(value)}
+        </div>
+      `;
+    }
+
+    const entries = Array.isArray(value)
+      ? value.map((item, idx)=>([idx, item]))
+      : Object.entries(value || {});
+    const isOpen = openSet ? openSet.has(nodePath) : depth <= 1;
+    const openAttr = isOpen ? 'open' : '';
+    const shape = Array.isArray(value)
+      ? `list[${entries.length}]`
+      : `dict{${entries.length}}`;
+    const children = entries.length
+      ? entries.map(([childKey, childValue])=>renderPayloadTreeNode(
+          childKey,
+          childValue,
+          depth + 1,
+          payloadTreeChildPath(nodePath, childKey),
+          openSet
+        )).join('')
+      : '<div class="payload-tree-empty">empty</div>';
+
+    return `
+      <details class="payload-tree-node" data-node-path="${escapeAttr(nodePath)}" ${openAttr}>
+        <summary>
+          <span class="payload-tree-key">${keyHtml}</span>
+          <span class="payload-tree-meta">${shape}</span>
+        </summary>
+        <div class="payload-tree-children">${children}</div>
+      </details>
+    `;
+  }
+
+  function collectPayloadTreeOpenSet(treeEl){
+    const openSet = new Set();
+    if(!treeEl) return openSet;
+    treeEl.querySelectorAll('details.payload-tree-node[data-node-path]').forEach(node=>{
+      if(node.open){
+        openSet.add(node.getAttribute('data-node-path') || '/');
+      }
+    });
+    return openSet;
+  }
+
+  function persistPayloadTreeStateForSelected(){
+    const selected = getSelectedVisibleLog();
+    if(!selected) return;
+    const treeEl = document.getElementById(payloadTreeDomId(selected));
+    if(!treeEl) return;
+    payloadTreeOpenStateByKey.set(payloadTreeStateKey(selected), collectPayloadTreeOpenSet(treeEl));
+  }
+
+  function snapshotPayloadTreeState(){
+    persistPayloadTreeStateForSelected();
+  }
+
+  function setPayloadTreeExpansion(treeId, expanded){
+    if(!treeId) return;
+    const treeEl = document.getElementById(treeId);
+    if(!treeEl) return;
+    treeEl.querySelectorAll('details.payload-tree-node').forEach(el=>{
+      el.open = !!expanded;
+    });
+    persistPayloadTreeStateForSelected();
+  }
+
+  function compactLogObject(log){
+    return {
+      id: log.id,
+      timestamp: log.timestamp,
+      level: log.level,
+      project: log.project,
+      fn_type: log.fn_type,
+      function: log.function,
+      message: log.message,
+      call_id: log.call_id,
+      parent_id: log.parent_id,
+      event: log.event,
+      status: log.status,
+      payload_preview: log.payload_preview
+    };
+  }
+
+  function renderFormattedLogView(log){
+    const obj = compactLogObject(log);
+    return `
+      <div class="pretty-card">
+        <div class="pretty-badge-row">
+          <span class="pill ${String(log.level||'').toUpperCase()==='ERROR' ? 'error' : 'success'}">${escapeHtml(String(log.level || '-').toUpperCase())}</span>
+          ${log.linked_to_trace ? '<span class="pill">trace-linked</span>' : '<span class="pill">unlinked</span>'}
+          ${log.event ? `<span class="pill">${escapeHtml(log.event)}</span>` : ''}
+          ${log.payload_truncated ? '<span class="pill">payload preview</span>' : '<span class="pill">full payload</span>'}
+        </div>
+        <div class="pretty-grid">
+          <div class="pretty-key">Timestamp</div><div class="pretty-value">${escapeHtml(log.timestamp || '-')}</div>
+          <div class="pretty-key">Function</div><div class="pretty-value">${escapeHtml(cleanFnName(log.function || '-'))}</div>
+          <div class="pretty-key">Message</div><div class="pretty-value">${escapeHtml(log.message || '-')}</div>
+          <div class="pretty-key">Call ID</div><div class="pretty-value pretty-mono">${escapeHtml(log.call_id || '-')}</div>
+          <div class="pretty-key">Parent ID</div><div class="pretty-value pretty-mono">${escapeHtml(log.parent_id || '-')}</div>
+          <div class="pretty-key">Status</div><div class="pretty-value">${escapeHtml(log.status || '-')}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderFormattedPayloadView(log){
+    const payload = parsedPayload(log);
+    if(!payload){
+      return `<div class="pretty-card"><div class="muted">Payload unavailable for formatted view.</div></div>`;
+    }
+    const treeId = payloadTreeDomId(log);
+    const rootKey = 'root';
+    const openSet = payloadTreeOpenStateByKey.get(payloadTreeStateKey(log)) || null;
+    const treeHtml = renderPayloadTreeNode(rootKey, payload, 0, '/', openSet);
+    const topLevelCount = Array.isArray(payload)
+      ? payload.length
+      : Object.keys(payload || {}).length;
+    return `
+      <div class="pretty-card">
+        <div class="pretty-badge-row">
+          <span class="pill">${topLevelCount} top-level</span>
+          ${log.payload_truncated ? '<span class="pill">preview data</span>' : '<span class="pill">full data</span>'}
+        </div>
+        <div class="payload-tree-controls">
+          <button class="btn small" data-action="payload-expand-all" data-tree-id="${escapeAttr(treeId)}">Expand all</button>
+          <button class="btn small" data-action="payload-collapse-all" data-tree-id="${escapeAttr(treeId)}">Collapse all</button>
+        </div>
+        <div id="${escapeAttr(treeId)}" class="payload-tree">
+          ${treeHtml}
+        </div>
+      </div>
+    `;
   }
 
   function currentTree(){
@@ -904,19 +1535,141 @@ class TraceViewerServer:
         <div class="panel-title">Issue debugger (${issues.length})</div>
         ${issues.length ? `
           <table class="issue-table">
-            <thead><tr><th>Function</th><th>Error</th><th>Call ID</th><th></th></tr></thead>
+            <thead><tr><th>Function</th><th>Error</th><th>Call ID</th><th>Actions</th></tr></thead>
             <tbody>
-              ${issues.slice(0,60).map(n=>`
+              ${issues.slice(0,60).map(n=>{
+                  const callId = n.call_id || '';
+                  const hasTraceTarget = !!(callId && callToRunMap.has(callId));
+                  const callIdCell = callId
+                    ? (hasTraceTarget
+                        ? `<button class="btn small" data-action="go-trace-from-log" data-call-id="${escapeAttr(callId)}">${escapeHtml(callId)}</button>`
+                        : `<span class="muted">${escapeHtml(callId)}</span>`)
+                    : '-';
+                  return `
                 <tr>
                   <td>${escapeHtml(cleanFnName(n.function || '-'))}</td>
                   <td>${escapeHtml(n.error || '-')}</td>
-                  <td class="muted">${n.call_id || '-'}</td>
-                  <td><button class="btn small" data-action="copy-text" data-copy="${escapeAttr(encodeURIComponent(n.call_id || ''))}">Copy</button></td>
+                  <td>${callIdCell}</td>
+                  <td>
+                    ${hasTraceTarget ? `<button class="btn small primary" data-action="go-trace-from-log" data-call-id="${escapeAttr(callId)}">Open trace</button>` : `<span class="muted">No trace</span>`}
+                    <button class="btn small" data-action="copy-text" data-copy="${escapeAttr(encodeURIComponent(callId))}">Copy</button>
+                  </td>
                 </tr>
-              `).join('')}
+                  `;
+                }).join('')}
             </tbody>
           </table>
         ` : '<div class="muted">No errors for current filters.</div>'}
+      </div>
+    `;
+  }
+
+  function formatPayload(log){
+    const loaded = fullPayloadCache.get(String(log.id));
+    const payload = loaded ? loaded.payload : null;
+    if(payloadMode === 'raw'){
+      if(loaded) return loaded.payload_json || JSON.stringify(payload);
+      return log.payload_preview || '{}';
+    }
+    if(loaded) return JSON.stringify(payload, null, 2);
+    try {
+      return JSON.stringify(JSON.parse(log.payload_preview || '{}'), null, 2);
+    } catch (_e) {
+      return log.payload_preview || '{}';
+    }
+  }
+
+  function logPrimaryView(log){
+    if(logViewMode === 'console'){
+      return logConsoleLine(log);
+    }
+    if(logViewMode === 'json'){
+      return JSON.stringify(compactLogObject(log));
+    }
+    return JSON.stringify(compactLogObject(log), null, 2);
+  }
+
+  function buildLogsPanel(){
+    const visible = filteredLogs();
+    visibleLogs = visible;
+    const levelSet = new Set(['all']);
+    logs.forEach(l=> {
+      const level = String(l.level || '').toUpperCase().trim();
+      if(level) levelSet.add(level);
+    });
+    const levels = [...levelSet].filter(Boolean);
+    if(!levels.includes(logLevelFilter)){
+      logLevelFilter = 'all';
+    }
+    if(!selectedLogId && visible.length){
+      selectedLogId = String(visible[0].id);
+    }
+    if(selectedLogId && !visible.some(l=>String(l.id) === String(selectedLogId))){
+      selectedLogId = visible.length ? String(visible[0].id) : null;
+    }
+    const selected = getSelectedVisibleLog();
+    const hasTraceTarget = selected && selected.call_id && callToRunMap.has(selected.call_id);
+    const payloadText = selected ? formatPayload(selected) : '';
+    const loadedPayload = selected ? fullPayloadCache.get(String(selected.id)) : null;
+    const payloadState = selected ? (selected.payload_truncated && !loadedPayload ? 'preview' : 'full') : 'preview';
+    const logViewBody = selected
+      ? (logViewMode === 'pretty'
+        ? renderFormattedLogView(selected)
+        : `<div class="code-block">${escapeHtml(logPrimaryView(selected))}</div>`)
+      : '<div class="muted">Select a log to inspect details.</div>';
+    const payloadViewBody = selected
+      ? (payloadMode === 'pretty'
+        ? renderFormattedPayloadView(selected)
+        : `<div class="code-block">${escapeHtml(payloadText)}</div>`)
+      : '<div class="muted">Select a log to inspect payload.</div>';
+    return `
+      <div id="logs-panel-shell" class="insight-panel">
+        <div id="logs-panel-title" class="panel-title">Logs explorer (${visible.length}/${logs.length})</div>
+        <div id="logs-panel-controls" class="logs-controls">
+          <input id="log-search" class="run-search" placeholder="Search logs, payloads, IDs..." value="${escapeAttr(logQuery)}" />
+          <select id="log-level" class="select">
+            ${levels.map(l=>`<option value="${escapeAttr(l)}" ${logLevelFilter===l ? 'selected' : ''}>${escapeHtml(l === 'all' ? 'All levels' : l)}</option>`).join('')}
+          </select>
+          <select id="log-link-filter" class="select">
+            <option value="all" ${logLinkFilter==='all' ? 'selected' : ''}>All logs</option>
+            <option value="linked" ${logLinkFilter==='linked' ? 'selected' : ''}>Trace-linked</option>
+            <option value="unlinked" ${logLinkFilter==='unlinked' ? 'selected' : ''}>Unlinked</option>
+          </select>
+          <select id="log-view-mode" class="select">
+            <option value="console" ${logViewMode==='console' ? 'selected' : ''}>Console style</option>
+            <option value="json" ${logViewMode==='json' ? 'selected' : ''}>JSON compact</option>
+            <option value="pretty" ${logViewMode==='pretty' ? 'selected' : ''}>JSON formatted</option>
+          </select>
+          <select id="payload-mode" class="select">
+            <option value="raw" ${payloadMode==='raw' ? 'selected' : ''}>Payload raw</option>
+            <option value="pretty" ${payloadMode==='pretty' ? 'selected' : ''}>Payload formatted</option>
+          </select>
+        </div>
+        <div id="logs-panel-body" class="logs-wrap">
+          <div>
+            <div id="logs-list-wrap" class="logs-list-wrap">
+              <div id="logs-viewport" class="virtual-viewport">
+                <div id="logs-spacer" class="virtual-spacer"></div>
+                <div id="logs-layer" class="virtual-layer"></div>
+              </div>
+            </div>
+          </div>
+          <div id="logs-detail-col" class="logs-detail-col">
+            ${selected ? `
+              <div class="log-detail-header">
+                <button class="btn small" data-action="copy-selected-log">Copy selected</button>
+                ${hasTraceTarget ? `<button class="btn small primary" data-action="go-trace-from-log" data-call-id="${escapeAttr(selected.call_id || '')}">Go to trace</button>` : ''}
+                ${selected.call_id ? `<button class="btn small" data-action="copy-selected-log-call-id">Copy call_id</button>` : ''}
+                ${selected.payload_truncated && !loadedPayload ? `<button class="btn small" data-action="load-log-payload" data-log-id="${escapeAttr(String(selected.id))}">Load full payload</button>` : ''}
+                <span class="muted">payload ${payloadState} (${selected.payload_size} chars)</span>
+              </div>
+              <div class="detail-title">Log view</div>
+              ${logViewBody}
+              <div class="detail-title" style="margin-top:8px;">Payload</div>
+              ${payloadViewBody}
+            ` : '<div class="muted">Select a log to inspect details.</div>'}
+          </div>
+        </div>
       </div>
     `;
   }
@@ -943,6 +1696,7 @@ class TraceViewerServer:
     const missingEnd = allNodes.filter(n=>n.start_time && !n.end_time).length;
 
     const fnMap = new Map();
+    const functionTraceTarget = new Map();
     let cpuTotal = 0;
     let memDeltaNet = 0;
     let memDeltaPositive = 0;
@@ -980,6 +1734,13 @@ class TraceViewerServer:
         memModes.add(String(n.mem_mode));
       }
       if(n.error || n.status === 'error') row.errors += 1;
+      if(n.call_id){
+        const prev = functionTraceTarget.get(key);
+        const duration = Number(n.duration) || 0;
+        if(!prev || duration > prev.duration){
+          functionTraceTarget.set(key, { call_id: n.call_id, duration });
+        }
+      }
     });
     const hotspots = [...fnMap.values()]
       .sort((a,b)=> b.totalMs - a.totalMs)
@@ -990,8 +1751,10 @@ class TraceViewerServer:
     const errMap = new Map();
     errorNodes.forEach(n=>{
       const sig = String(n.error || 'error').split('\\n')[0].slice(0, 140);
-      if(!errMap.has(sig)) errMap.set(sig, { sig, count: 0, fn: cleanFnName(n.function || '-') });
-      errMap.get(sig).count += 1;
+      if(!errMap.has(sig)) errMap.set(sig, { sig, count: 0, fn: cleanFnName(n.function || '-'), call_id: n.call_id || null });
+      const row = errMap.get(sig);
+      row.count += 1;
+      if(!row.call_id && n.call_id) row.call_id = n.call_id;
     });
     const errorSigs = [...errMap.values()].sort((a,b)=> b.count - a.count).slice(0, 12);
 
@@ -1084,15 +1847,23 @@ class TraceViewerServer:
               <table class="metrics-table">
                 <thead><tr><th>Function</th><th class="number">Calls</th><th class="number">Total</th><th class="number">Max</th><th class="number">Errors</th></tr></thead>
                 <tbody>
-                  ${hotspots.map(r=>`
+                  ${hotspots.map(r=>{
+                    const target = functionTraceTarget.get(r.fn);
+                    const callId = target && target.call_id ? target.call_id : '';
+                    const hasTraceTarget = !!(callId && callToRunMap.has(callId));
+                    const fnText = hasTraceTarget
+                      ? `<span class="function-name text-action" data-action="go-trace-from-log" data-call-id="${escapeAttr(callId)}">${escapeHtml(r.fn)}</span>`
+                      : `<span class="function-name">${escapeHtml(r.fn)}</span>`;
+                    return `
                     <tr>
-                      <td class="function-name">${escapeHtml(r.fn)}</td>
+                      <td>${fnText}</td>
                       <td class="number">${r.calls}</td>
                       <td class="number">${r.totalMs.toFixed(1)}ms</td>
                       <td class="number">${r.maxMs.toFixed(1)}ms</td>
                       <td class="number">${r.errors}</td>
                     </tr>
-                  `).join('') || `<tr><td class="muted" colspan="5">No hotspot data</td></tr>`}
+                  `;
+                  }).join('') || `<tr><td class="muted" colspan="5">No hotspot data</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -1103,13 +1874,23 @@ class TraceViewerServer:
               <table class="metrics-table">
                 <thead><tr><th>Signature</th><th>Function</th><th class="number">Count</th></tr></thead>
                 <tbody>
-                  ${errorSigs.map(r=>`
+                  ${errorSigs.map(r=>{
+                    const callId = r.call_id || '';
+                    const hasTraceTarget = !!(callId && callToRunMap.has(callId));
+                    const sigText = hasTraceTarget
+                      ? `<span class="text-action" data-action="go-trace-from-log" data-call-id="${escapeAttr(callId)}">${escapeHtml(r.sig)}</span>`
+                      : escapeHtml(r.sig);
+                    const fnText = hasTraceTarget
+                      ? `<span class="function-name text-action" data-action="go-trace-from-log" data-call-id="${escapeAttr(callId)}">${escapeHtml(r.fn)}</span>`
+                      : `<span class="function-name">${escapeHtml(r.fn)}</span>`;
+                    return `
                     <tr>
-                      <td>${escapeHtml(r.sig)}</td>
-                      <td class="function-name">${escapeHtml(r.fn)}</td>
+                      <td>${sigText}</td>
+                      <td>${fnText}</td>
                       <td class="number">${r.count}</td>
                     </tr>
-                  `).join('') || `<tr><td class="muted" colspan="3">No errors detected</td></tr>`}
+                  `;
+                  }).join('') || `<tr><td class="muted" colspan="3">No errors detected</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -1120,13 +1901,21 @@ class TraceViewerServer:
               <table class="metrics-table">
                 <thead><tr><th>Function</th><th class="number">CPU</th><th class="number">Calls</th></tr></thead>
                 <tbody>
-                  ${cpuHotspots.map(r=>`
+                  ${cpuHotspots.map(r=>{
+                    const target = functionTraceTarget.get(r.fn);
+                    const callId = target && target.call_id ? target.call_id : '';
+                    const hasTraceTarget = !!(callId && callToRunMap.has(callId));
+                    const fnText = hasTraceTarget
+                      ? `<span class="function-name text-action" data-action="go-trace-from-log" data-call-id="${escapeAttr(callId)}">${escapeHtml(r.fn)}</span>`
+                      : `<span class="function-name">${escapeHtml(r.fn)}</span>`;
+                    return `
                     <tr>
-                      <td class="function-name">${escapeHtml(r.fn)}</td>
+                      <td>${fnText}</td>
                       <td class="number">${r.cpuS.toFixed(4)}s</td>
                       <td class="number">${r.calls}</td>
                     </tr>
-                  `).join('') || `<tr><td class="muted" colspan="3">No CPU data</td></tr>`}
+                  `;
+                  }).join('') || `<tr><td class="muted" colspan="3">No CPU data</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -1137,13 +1926,21 @@ class TraceViewerServer:
               <table class="metrics-table">
                 <thead><tr><th>Function</th><th class="number">Duration</th><th class="number">Start</th></tr></thead>
                 <tbody>
-                  ${recentSlow.map(n=>`
+                  ${recentSlow.map(n=>{
+                    const callId = n.call_id || '';
+                    const hasTraceTarget = !!(callId && callToRunMap.has(callId));
+                    const fnText = escapeHtml(cleanFnName(n.function || n.call_id || '-'));
+                    const linkedFnText = hasTraceTarget
+                      ? `<span class="function-name text-action" data-action="go-trace-from-log" data-call-id="${escapeAttr(callId)}">${fnText}</span>`
+                      : `<span class="function-name">${fnText}</span>`;
+                    return `
                     <tr>
-                      <td class="function-name">${escapeHtml(cleanFnName(n.function || n.call_id || '-'))}</td>
+                      <td>${linkedFnText}</td>
                       <td class="number">${(n.duration * 1000).toFixed(1)}ms</td>
                       <td class="number">${n.start_time ? new Date(n.start_time*1000).toLocaleTimeString() : '-'}</td>
                     </tr>
-                  `).join('') || `<tr><td class="muted" colspan="3">No recent calls</td></tr>`}
+                  `;
+                  }).join('') || `<tr><td class="muted" colspan="3">No recent calls</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -1154,13 +1951,21 @@ class TraceViewerServer:
               <table class="metrics-table">
                 <thead><tr><th>Function</th><th class="number">MemΔ</th><th class="number">Calls</th></tr></thead>
                 <tbody>
-                  ${memHotspots.map(r=>`
+                  ${memHotspots.map(r=>{
+                    const target = functionTraceTarget.get(r.fn);
+                    const callId = target && target.call_id ? target.call_id : '';
+                    const hasTraceTarget = !!(callId && callToRunMap.has(callId));
+                    const fnText = hasTraceTarget
+                      ? `<span class="function-name text-action" data-action="go-trace-from-log" data-call-id="${escapeAttr(callId)}">${escapeHtml(r.fn)}</span>`
+                      : `<span class="function-name">${escapeHtml(r.fn)}</span>`;
+                    return `
                     <tr>
-                      <td class="function-name">${escapeHtml(r.fn)}</td>
+                      <td>${fnText}</td>
                       <td class="number">${r.memDeltaKb.toFixed(0)} KB</td>
                       <td class="number">${r.calls}</td>
                     </tr>
-                  `).join('') || `<tr><td class="muted" colspan="3">No memory delta data</td></tr>`}
+                  `;
+                  }).join('') || `<tr><td class="muted" colspan="3">No memory delta data</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -1350,6 +2155,7 @@ class TraceViewerServer:
     const kwargs = node.kwargs_preview!=null ? JSON.stringify(node.kwargs_preview, null, 2) : '-';
     const result = node.result_preview!=null ? JSON.stringify(node.result_preview, null, 2) : '-';
     const hasError = !!(node.error || node.status === 'error');
+    const relatedLogs = logs.filter(l=>l.call_id && l.call_id === node.call_id).slice(0, 12);
     const error = node.error ? `
       <div class="detail-error">
         <div class="detail-error-title">Error detected</div>
@@ -1370,6 +2176,23 @@ class TraceViewerServer:
       <div class="detail-block"><div class="detail-title">Args</div><div class="kv">${escapeHtml(args)}</div></div>
       <div class="detail-block"><div class="detail-title">Kwargs</div><div class="kv">${escapeHtml(kwargs)}</div></div>
       <div class="detail-block"><div class="detail-title">Result</div><div class="kv">${escapeHtml(result)}</div></div>
+      <div class="detail-block">
+        <div class="detail-title">Linked logs (${relatedLogs.length})</div>
+        ${relatedLogs.length ? relatedLogs.map(l=>`
+          <div class="kv">
+            <strong>${escapeHtml(String(l.level || '-').toUpperCase())}</strong>
+            <span class="muted">${escapeHtml(l.timestamp || '-')}</span>
+            <div>${escapeHtml(l.message || '')}</div>
+            <div class="flex" style="margin-top:6px;">
+              <button class="btn small" data-action="select-log" data-log-id="${escapeAttr(String(l.id))}">Open log</button>
+              <button class="btn small" data-action="copy-text" data-copy="${escapeAttr(encodeURIComponent(String(l.id)))}">Copy log id</button>
+            </div>
+          </div>
+        `).join('') : '<div class="muted">No logs linked to this call ID.</div>'}
+        <div class="flex" style="margin-top:6px;">
+          <button class="btn small" data-action="open-logs-tab">Open logs tab</button>
+        </div>
+      </div>
       <div class="detail-block"><button class="btn small" data-action="copy-text" data-copy="${escapeAttr(encodeURIComponent(JSON.stringify(node, null, 2)))}">Copy JSON</button></div>
     `;
   }
@@ -1401,15 +2224,17 @@ class TraceViewerServer:
   }
 
   function render(){
+    captureUiScrollState();
     syncControlState();
     const q = (searchEl.value||'').toLowerCase().trim();
     const activeTree = currentTree();
     overviewEl.innerHTML = '';
 
-    const overviewPanel = buildOverviewPanel();
-    const metricsPanel = buildMetricsPanel();
-    const flamePanel = buildFlameGraph(activeTree, q);
-    const issuesPanel = buildIssuesPanel(activeTree, q);
+    const overviewPanel = insightTab === 'overview' ? buildOverviewPanel() : '';
+    const metricsPanel = insightTab === 'metrics' ? buildMetricsPanel() : '';
+    const flamePanel = insightTab === 'flame' ? buildFlameGraph(activeTree, q) : '';
+    const issuesPanel = insightTab === 'issues' ? buildIssuesPanel(activeTree, q) : '';
+    const logsPanel = insightTab === 'logs' ? buildLogsPanel() : '';
 
     rootEl.innerHTML = `
       <div class="tab-row">
@@ -1417,6 +2242,7 @@ class TraceViewerServer:
         <button class="tab-btn ${insightTab==='flame' ? 'active' : ''}" data-action="select-insight-tab" data-tab="flame">Traces</button>
         <button class="tab-btn ${insightTab==='issues' ? 'active' : ''}" data-action="select-insight-tab" data-tab="issues">Issues</button>
         <button class="tab-btn ${insightTab==='metrics' ? 'active' : ''}" data-action="select-insight-tab" data-tab="metrics">Metrics</button>
+        <button class="tab-btn ${insightTab==='logs' ? 'active' : ''}" data-action="select-insight-tab" data-tab="logs">Logs</button>
         <span class="tab-spacer"></span>
         ${insightTab==='metrics' ? `
           <div class="tab-secondary">
@@ -1432,6 +2258,7 @@ class TraceViewerServer:
       </div>
       <div class="${insightTab==='issues' ? '' : 'hidden-panel'}">${issuesPanel}</div>
       <div class="${insightTab==='metrics' ? '' : 'hidden-panel'}">${metricsPanel}</div>
+      <div class="${insightTab==='logs' ? '' : 'hidden-panel'}">${logsPanel}</div>
     `;
 
     const traceSettingsSlot = document.getElementById('trace-settings-slot');
@@ -1446,28 +2273,82 @@ class TraceViewerServer:
       splitLayoutEl.classList.toggle('hidden-panel', insightTab !== 'flame');
     }
 
-    renderRuns();
-    renderTraceTree(activeTree, q);
-    renderTraceDetails(activeTree);
+    if(insightTab === 'flame'){
+      renderRuns();
+      renderTraceTree(activeTree, q);
+      renderTraceDetails(activeTree);
+    }
+    if(insightTab === 'logs'){
+      bindLogsControls();
+      renderLogsRows();
+    }
+    restoreUiScrollState();
+    saveState();
+  }
+
+  function renderLogsOnly(){
+    const shell = document.getElementById('logs-panel-shell');
+    if(!shell) return;
+    snapshotPayloadTreeState();
+    captureLogListAnchor();
+    captureUiScrollState();
+    const temp = document.createElement('div');
+    temp.innerHTML = buildLogsPanel();
+    const nextTitle = temp.querySelector('#logs-panel-title');
+    const nextBody = temp.querySelector('#logs-panel-body');
+    const curTitle = document.getElementById('logs-panel-title');
+    const curBody = document.getElementById('logs-panel-body');
+    if(nextTitle && curTitle){
+      curTitle.textContent = nextTitle.textContent || curTitle.textContent;
+    }
+    if(nextBody && curBody){
+      curBody.innerHTML = nextBody.innerHTML;
+      bindLogsControls();
+      renderLogsRows();
+      restoreUiScrollState();
+    }
     saveState();
   }
 
   async function fetchTree(){
-    const res = await fetch('/api/tree');
-    const data = await res.json();
+    if(fetchTreeInFlight) return;
+    fetchTreeInFlight = true;
+    try {
+    const shouldFetchLogs = (insightTab === 'logs') || logs.length === 0 || (logsFetchCounter % 3 === 0);
+    logsFetchCounter += 1;
+    const [treeRes, logsRes] = await Promise.all([
+      fetch('/api/tree'),
+      shouldFetchLogs ? fetch('/api/logs?limit=2500&preview=1800') : Promise.resolve(null)
+    ]);
+    const data = await treeRes.json();
+    const logsData = logsRes ? await logsRes.json() : null;
     tree = data.roots || [];
+    if(logsData){
+      logs = logsData.logs || [];
+      fullPayloadCache.clear();
+      logsGeneratedAt = logsData.generated_at || null;
+      logsVersion += 1;
+    }
     total = data.total_nodes || 0;
     metrics = data.metrics || [];
     generatedAt = data.generated_at || null;
+    rebuildCallToRunMap();
     renderFnTypeOptions();
-    metaEl.textContent = `${generatedAt ? new Date(generatedAt*1000).toLocaleString() : ''} • ${data.log_file} • ${total} nodes`;
+    metaEl.textContent = `${generatedAt ? new Date(generatedAt*1000).toLocaleString() : ''} • ${data.log_file} • ${total} nodes • ${logs.length} logs`;
     if(!selectedRunId && tree.length) selectedRunId = tree[0].call_id || null;
     const runStillExists = selectedRunId ? !!getRunNode(selectedRunId) : false;
     if(!runStillExists && tree.length){
       selectedRunId = tree[0].call_id || null;
       selectedCallId = null;
     }
-    render();
+    if(insightTab === 'logs' && document.getElementById('logs-panel-shell')){
+      renderLogsOnly();
+    } else {
+      render();
+    }
+    } finally {
+      fetchTreeInFlight = false;
+    }
   }
 
   window.__copyText = function(text){
@@ -1489,6 +2370,73 @@ class TraceViewerServer:
     render();
   };
 
+  window.__selectLog = function(logId){
+    selectedLogId = String(logId);
+    insightTab = 'logs';
+    render();
+  };
+
+  async function loadLogPayload(logId){
+    const key = String(logId);
+    if(fullPayloadCache.has(key)) return;
+    const res = await fetch(`/api/logs/payload?id=${encodeURIComponent(key)}`);
+    if(!res.ok) return;
+    const data = await res.json();
+    fullPayloadCache.set(key, data);
+    render();
+  }
+
+  function goToTraceFromCallId(callId){
+    if(!callId) return;
+    const runId = callToRunMap.get(callId);
+    if(!runId) return;
+    selectedRunId = runId;
+    selectedCallId = callId;
+    insightTab = 'flame';
+    pushHistory(selectedRunId, selectedCallId);
+    render();
+  }
+
+  function bindLogsControls(){
+    const logSearchEl = document.getElementById('log-search');
+    const logLevelEl = document.getElementById('log-level');
+    const logLinkEl = document.getElementById('log-link-filter');
+    const logViewModeEl = document.getElementById('log-view-mode');
+    const payloadModeEl = document.getElementById('payload-mode');
+    const logsViewportEl = document.getElementById('logs-viewport');
+    const logsListWrapEl = document.getElementById('logs-list-wrap');
+    const logsDetailEl = document.getElementById('logs-detail-col');
+    if(logSearchEl) logSearchEl.oninput = (e)=>{
+      logQuery = e.target.value || '';
+      if(logSearchDebounce) clearTimeout(logSearchDebounce);
+      logSearchDebounce = setTimeout(()=>{ renderLogsOnly(); }, 140);
+    };
+    if(logLevelEl) logLevelEl.onchange = (e)=>{ logLevelFilter = e.target.value || 'all'; renderLogsOnly(); };
+    if(logLinkEl) logLinkEl.onchange = (e)=>{ logLinkFilter = e.target.value || 'all'; renderLogsOnly(); };
+    if(logViewModeEl) logViewModeEl.onchange = (e)=>{ logViewMode = e.target.value || 'console'; renderLogsOnly(); };
+    if(payloadModeEl) payloadModeEl.onchange = (e)=>{ payloadMode = e.target.value || 'pretty'; renderLogsOnly(); };
+    if(logsViewportEl && !logsViewportEl.dataset.bound){
+      logsViewportEl.dataset.bound = '1';
+      logsViewportEl.addEventListener('scroll', ()=>{
+        logScrollTop = logsViewportEl.scrollTop || 0;
+        renderLogsRows();
+      });
+    }
+    if(logsListWrapEl && !logsListWrapEl.dataset.bound){
+      logsListWrapEl.dataset.bound = '1';
+      logsListWrapEl.addEventListener('scroll', ()=>{
+        logScrollTop = logsListWrapEl.scrollTop || 0;
+        renderLogsRows();
+      });
+    }
+    if(logsDetailEl && !logsDetailEl.dataset.bound){
+      logsDetailEl.dataset.bound = '1';
+      logsDetailEl.addEventListener('scroll', ()=>{
+        logDetailScrollTop = logsDetailEl.scrollTop || 0;
+      });
+    }
+  }
+
   document.addEventListener('click', (e)=>{
     const el = e.target && e.target.closest ? e.target.closest('[data-action]') : null;
     if(!el) return;
@@ -1499,6 +2447,45 @@ class TraceViewerServer:
     }
     if(action === 'select-call'){
       window.__selectCall(el.getAttribute('data-call-id') || null);
+      return;
+    }
+    if(action === 'select-log'){
+      window.__selectLog(el.getAttribute('data-log-id') || null);
+      return;
+    }
+    if(action === 'open-logs-tab'){
+      insightTab = 'logs';
+      render();
+      return;
+    }
+    if(action === 'go-trace-from-log'){
+      goToTraceFromCallId(el.getAttribute('data-call-id') || null);
+      return;
+    }
+    if(action === 'load-log-payload'){
+      loadLogPayload(el.getAttribute('data-log-id') || null);
+      return;
+    }
+    if(action === 'copy-selected-log'){
+      const selected = getSelectedVisibleLog();
+      if(selected){
+        window.__copyText(logPrimaryView(selected));
+      }
+      return;
+    }
+    if(action === 'copy-selected-log-call-id'){
+      const selected = getSelectedVisibleLog();
+      if(selected && selected.call_id){
+        window.__copyText(String(selected.call_id));
+      }
+      return;
+    }
+    if(action === 'payload-expand-all'){
+      setPayloadTreeExpansion(el.getAttribute('data-tree-id') || '', true);
+      return;
+    }
+    if(action === 'payload-collapse-all'){
+      setPayloadTreeExpansion(el.getAttribute('data-tree-id') || '', false);
       return;
     }
     if(action === 'copy-text'){
@@ -1534,6 +2521,14 @@ class TraceViewerServer:
       return;
     }
   });
+
+  document.addEventListener('toggle', (e)=>{
+    const el = e.target;
+    if(!el || !el.matches || !el.matches('details.payload-tree-node')){
+      return;
+    }
+    persistPayloadTreeStateForSelected();
+  }, true);
 
   function setStatusFilter(val){
     statusFilter = val;
@@ -1592,11 +2587,16 @@ class TraceViewerServer:
   function scheduleRefresh(immediate=false){
     if(refreshTimer) clearInterval(refreshTimer);
     if(!autoRefreshEnabled) return;
-    refreshTimer = setInterval(()=>{ if(autoRefreshEnabled) fetchTree(); }, 2500);
+    refreshTimer = setInterval(()=>{ if(autoRefreshEnabled && !document.hidden) fetchTree(); }, 2500);
     if(immediate) fetchTree();
   }
 
-  window.addEventListener('resize', ()=> renderRuns());
+  window.addEventListener('resize', ()=>{
+    renderRuns();
+    if(insightTab === 'logs'){
+      renderLogsRows();
+    }
+  });
 
   loadState();
   syncControlState();
