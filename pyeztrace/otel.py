@@ -122,6 +122,58 @@ class _DiagnosticSpanExporter:
         return getattr(self._inner, item)
 
 
+class _RefreshingGoogleBearerSpanExporter:
+    """
+    Wraps an OTLP exporter and refreshes GCP bearer auth before each export.
+    Used for OTLP exporter versions that do not support a custom requests session.
+    """
+
+    def __init__(self, inner, credentials):
+        self._inner = inner
+        self._credentials = credentials
+
+    def _set_authorization_header(self, token: str) -> None:
+        authorization = f"Bearer {token}"
+
+        headers = getattr(self._inner, "_headers", None)
+        if isinstance(headers, dict):
+            headers["Authorization"] = authorization
+
+        session = getattr(self._inner, "_session", None)
+        session_headers = getattr(session, "headers", None)
+        if isinstance(session_headers, dict):
+            session_headers["Authorization"] = authorization
+
+    def export(self, spans: Iterable[Any]):
+        token, err = _refresh_google_access_token(self._credentials)
+        if token is None:
+            _state.error = f"Google bearer token refresh failed: {err}"
+            _emit_diagnostic(
+                f"Google bearer token refresh failed: {err}",
+                level="ERROR",
+                once_key=f"gcp-token-refresh-failed:{err}",
+            )
+            return _span_export_result_failure()
+
+        self._set_authorization_header(token)
+        return self._inner.export(spans)
+
+    def shutdown(self):
+        fn = getattr(self._inner, "shutdown", None)
+        if callable(fn):
+            return fn()
+        return True
+
+    def force_flush(self, *args, **kwargs):
+        fn = getattr(self._inner, "force_flush", None)
+        if callable(fn):
+            return fn(*args, **kwargs)
+        return True
+
+    def __getattr__(self, item):
+        return getattr(self._inner, item)
+
+
 def _is_google_telemetry_endpoint(endpoint: str) -> bool:
     if not endpoint:
         return False
@@ -261,7 +313,8 @@ def _build_otlp_http_exporter(endpoint: str, headers: Dict[str, str], exporter_n
 
     resolved_headers["Authorization"] = f"Bearer {token}"
     try:
-        return OTLPSpanExporter(endpoint=endpoint, headers=resolved_headers or None), None
+        exporter = OTLPSpanExporter(endpoint=endpoint, headers=resolved_headers or None)
+        return _RefreshingGoogleBearerSpanExporter(exporter, credentials), None
     except Exception as e:
         return None, f"Error creating OTLP HTTP exporter with Google bearer auth: {e}"
 

@@ -579,7 +579,8 @@ def child_trace_decorator(func: F) -> F:
             start = time.time()
             with start_span(func.__qualname__, {"fn.type": "child"}) as _span:
                 try:
-                    result = await func(*args, **kwargs)
+                    with logging.with_context(call_id=call_id, parent_id=parent_id):
+                        result = await func(*args, **kwargs)
                     end = time.time()
                     duration = end - start
                     # Metrics capture
@@ -684,7 +685,8 @@ def child_trace_decorator(func: F) -> F:
             start = time.time()
             with start_span(func.__qualname__, {"fn.type": "child"}) as _span:
                 try:
-                    result = func(*args, **kwargs)
+                    with logging.with_context(call_id=call_id, parent_id=parent_id):
+                        result = func(*args, **kwargs)
                     end = time.time()
                     duration = end - start
                     # Metrics capture
@@ -1002,7 +1004,8 @@ def trace(
                                 await m.__aenter__()
                         with start_span(func.__qualname__, {"fn.type": "parent"}) as _span:
                             try:
-                                result = await func(*args, **kwargs)
+                                with logging.with_context(call_id=call_id, parent_id=parent_id):
+                                    result = await func(*args, **kwargs)
                                 end = time.time()
                                 duration = end - start
                                 # Metrics capture
@@ -1135,7 +1138,8 @@ def trace(
                                 m.__enter__()
                         with start_span(func.__qualname__, {"fn.type": "parent"}) as _span:
                             try:
-                                result = func(*args, **kwargs)
+                                with logging.with_context(call_id=call_id, parent_id=parent_id):
+                                    result = func(*args, **kwargs)
                                 end = time.time()
                                 duration = end - start
                                 # Metrics capture
