@@ -8,6 +8,9 @@ Fine-grained control with the `@trace()` decorator:
 @trace(
     message="Custom trace message",
     stack=True,  # Include stack trace on errors
+    sample_rate=0.5,  # Optional local override for this trace
+    adaptive_sampling=True,  # Optional local adaptive override
+    adaptive_slow_threshold=0.25,  # Optional local slow-threshold override (seconds)
     modules_or_classes=[my_module],
     include=["specific_function_*"],
     exclude=["ignored_function_*"],
@@ -17,6 +20,28 @@ Fine-grained control with the `@trace()` decorator:
 def function():
     pass
 ```
+
+### Sampling
+
+Global env controls:
+
+- `EZTRACE_SAMPLE_RATE` (`0.0` to `1.0`, default `1.0`)
+- `EZTRACE_ADAPTIVE_SAMPLING` (`true`/`false`, default `false`)
+- `EZTRACE_ADAPTIVE_SLOW_THRESHOLD` (seconds, `>= 0.0`, default `1.0`)
+
+Local override:
+
+```python
+@trace(
+    sample_rate=1.0,            # Force this trace to always be kept
+    adaptive_sampling=True,     # Local adaptive mode override
+    adaptive_slow_threshold=0.1 # Local slow threshold override
+)
+def critical_path():
+    pass
+```
+
+Adaptive mode keeps slow/error traces at 100% and samples normal traces using the configured rate.
 
 ### Recursive tracing
 
@@ -88,6 +113,8 @@ Open `http://127.0.0.1:8765`. You get:
 - Hierarchical tree (parent/child calls)
 - Input/output previews, duration, CPU, memory
 - Filters (function, error, min duration), auto-refresh
+
+> **Note:** The trace viewer UI (`pyeztrace serve`) is designed for **local development and analysis**—it is **not** intended to be used as a hosted or production solution.
 
 ## Async support
 

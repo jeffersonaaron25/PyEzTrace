@@ -3,11 +3,14 @@ site_name: PyEzTrace
 site_description: Lightweight Python tracing and logging with hierarchical output and an interactive viewer
 site_url: https://jeffersonaaron25.github.io/pyeztrace/
 repo_url: https://github.com/jeffersonaaron25/pyeztrace
+repo_name: jeffersonaaron25/pyeztrace
+edit_uri: edit/main/docs/
 
 theme:
   name: material
   language: en
   icon:
+    logo: material/graph-outline
     repo: fontawesome/brands/github
   palette:
     - media: "(prefers-color-scheme: light)"
@@ -25,13 +28,16 @@ theme:
         icon: material/weather-sunny
         name: Switch to light mode
   font:
-    text: Roboto
-    code: Fira Mono
+    text: Space Grotesk
+    code: JetBrains Mono
   features:
     - navigation.instant
     - navigation.tracking
     - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.sections
+    - navigation.expand
+    - navigation.indexes
     - navigation.path
     - navigation.top
     - navigation.footer
@@ -53,6 +59,26 @@ plugins:
   - git-revision-date-localized:
       enable_creation_date: true
       fallback_to_build_date: true
+  - llmstxt:
+      markdown_description: Lightweight Python tracing and logging documentation for PyEzTrace.
+      full_output: llms-full.txt
+      sections:
+        Documentation:
+          - index.md: Project overview and quick start.
+          - getting-started.md: Installation and initialization guide.
+          - usage.md: Tracing, logging, and viewer usage.
+          - configuration.md: Configuration reference.
+          - contributing.md: Contribution workflow.
+  - copy-to-llm:
+      repo_url: "https://raw.githubusercontent.com/jeffersonaaron25/pyeztrace/main/"
+      base_path: "/pyeztrace"
+      minify: true
+      buttons:
+        copy_page: true
+        copy_markdown_link: true
+        view_as_markdown: true
+        open_in_chatgpt: true
+        open_in_claude: true
 
 nav:
   - Home: index.md
@@ -61,7 +87,20 @@ nav:
   - Configuration: configuration.md
   - Contributing: contributing.md
 
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/jeffersonaaron25/pyeztrace
+
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - javascripts/copy-page-fix.js
+
 markdown_extensions:
+  - attr_list
+  - md_in_html
   - pymdownx.highlight:
       anchor_linenums: true
       linenums_style: table

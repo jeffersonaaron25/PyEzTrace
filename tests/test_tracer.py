@@ -1,4 +1,5 @@
 import warnings
+import builtins
 import pytest
 from pyeztrace import setup, tracer
 
@@ -289,3 +290,253 @@ def test_trace_applies_value_pattern_environment_redaction(monkeypatch):
 
     result_log = next(log for log in reversed(logs) if "result_preview" in log)
     assert result_log["result_preview"]["response"] == "<redacted>"
+
+
+def test_trace_sampling_fixed_rate_drops_all_when_zero(monkeypatch):
+    monkeypatch.setenv("EZTRACE_SAMPLE_RATE", "0")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SAMPLING", "false")
+    setup.Setup.initialize("EZTRACER_SAMPLING_DROP", show_metrics=False)
+
+    logs = []
+
+    def capture_log_info(message, **kwargs):
+        logs.append({"level": "INFO", "message": message, **kwargs})
+
+    def capture_log_error(message, **kwargs):
+        logs.append({"level": "ERROR", "message": message, **kwargs})
+
+    monkeypatch.setattr(tracer.logging, "log_info", capture_log_info)
+    monkeypatch.setattr(tracer.logging, "log_error", capture_log_error)
+    monkeypatch.setattr(tracer.logging, "record_metric", lambda *args, **kwargs: None)
+
+    @tracer.trace()
+    def fast():
+        return "ok"
+
+    assert fast() == "ok"
+    assert logs == []
+
+
+def test_trace_sampling_local_sample_rate_overrides_global(monkeypatch):
+    monkeypatch.setenv("EZTRACE_SAMPLE_RATE", "0")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SAMPLING", "false")
+    setup.Setup.initialize("EZTRACER_SAMPLING_OVERRIDE", show_metrics=False)
+
+    logs = []
+
+    def capture_log_info(message, **kwargs):
+        logs.append({"level": "INFO", "message": message, **kwargs})
+
+    monkeypatch.setattr(tracer.logging, "log_info", capture_log_info)
+    monkeypatch.setattr(tracer.logging, "record_metric", lambda *args, **kwargs: None)
+
+    @tracer.trace(sample_rate=1.0)
+    def always_traced():
+        return "ok"
+
+    assert always_traced() == "ok"
+    assert any(log.get("event") == "start" and "always_traced" in str(log.get("function")) for log in logs)
+
+
+def test_trace_sampling_adaptive_keeps_error_traces(monkeypatch):
+    monkeypatch.setenv("EZTRACE_SAMPLE_RATE", "0")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SAMPLING", "true")
+    setup.Setup.initialize("EZTRACER_SAMPLING_ADAPTIVE_ERROR", show_metrics=False)
+
+    logs = []
+
+    def capture_log_info(message, **kwargs):
+        logs.append({"level": "INFO", "message": message, **kwargs})
+
+    def capture_log_error(message, **kwargs):
+        logs.append({"level": "ERROR", "message": message, **kwargs})
+
+    monkeypatch.setattr(tracer.logging, "log_info", capture_log_info)
+    monkeypatch.setattr(tracer.logging, "log_error", capture_log_error)
+    monkeypatch.setattr(tracer.logging, "record_metric", lambda *args, **kwargs: None)
+
+    @tracer.trace()
+    def boom():
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError):
+        boom()
+
+    assert any(log.get("event") == "start" for log in logs)
+    assert any(log.get("event") == "error" for log in logs)
+
+
+def test_trace_sampling_adaptive_keeps_slow_traces(monkeypatch):
+    monkeypatch.setenv("EZTRACE_SAMPLE_RATE", "0")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SAMPLING", "true")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SLOW_THRESHOLD", "0.001")
+    setup.Setup.initialize("EZTRACER_SAMPLING_ADAPTIVE_SLOW", show_metrics=False)
+
+    logs = []
+
+    def capture_log_info(message, **kwargs):
+        logs.append({"level": "INFO", "message": message, **kwargs})
+
+    monkeypatch.setattr(tracer.logging, "log_info", capture_log_info)
+    monkeypatch.setattr(tracer.logging, "record_metric", lambda *args, **kwargs: None)
+
+    @tracer.trace()
+    def slow():
+        import time
+        time.sleep(0.01)
+        return "ok"
+
+    assert slow() == "ok"
+    assert any(log.get("event") == "start" for log in logs)
+    assert any(log.get("event") == "end" for log in logs)
+
+
+def test_trace_sampling_adaptive_drops_fast_non_error_traces(monkeypatch):
+    monkeypatch.setenv("EZTRACE_SAMPLE_RATE", "0")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SAMPLING", "true")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SLOW_THRESHOLD", "0.5")
+    setup.Setup.initialize("EZTRACER_SAMPLING_ADAPTIVE_DROP_FAST", show_metrics=False)
+
+    logs = []
+
+    def capture_log_info(message, **kwargs):
+        logs.append({"level": "INFO", "message": message, **kwargs})
+
+    monkeypatch.setattr(tracer.logging, "log_info", capture_log_info)
+    monkeypatch.setattr(tracer.logging, "record_metric", lambda *args, **kwargs: None)
+
+    @tracer.trace()
+    def fast():
+        return "ok"
+
+    assert fast() == "ok"
+    assert logs == []
+
+
+def test_trace_sampling_local_adaptive_override(monkeypatch):
+    monkeypatch.setenv("EZTRACE_SAMPLE_RATE", "0")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SAMPLING", "false")
+    setup.Setup.initialize("EZTRACER_SAMPLING_LOCAL_ADAPTIVE", show_metrics=False)
+
+    logs = []
+
+    def capture_log_info(message, **kwargs):
+        logs.append({"level": "INFO", "message": message, **kwargs})
+
+    def capture_log_error(message, **kwargs):
+        logs.append({"level": "ERROR", "message": message, **kwargs})
+
+    monkeypatch.setattr(tracer.logging, "log_info", capture_log_info)
+    monkeypatch.setattr(tracer.logging, "log_error", capture_log_error)
+    monkeypatch.setattr(tracer.logging, "record_metric", lambda *args, **kwargs: None)
+
+    @tracer.trace(adaptive_sampling=True)
+    def boom():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        boom()
+
+    assert any(log.get("event") == "start" for log in logs)
+    assert any(log.get("event") == "error" for log in logs)
+
+
+def test_trace_sampling_local_threshold_override(monkeypatch):
+    monkeypatch.setenv("EZTRACE_SAMPLE_RATE", "0")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SAMPLING", "true")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SLOW_THRESHOLD", "10.0")
+    setup.Setup.initialize("EZTRACER_SAMPLING_LOCAL_THRESHOLD", show_metrics=False)
+
+    logs = []
+
+    def capture_log_info(message, **kwargs):
+        logs.append({"level": "INFO", "message": message, **kwargs})
+
+    monkeypatch.setattr(tracer.logging, "log_info", capture_log_info)
+    monkeypatch.setattr(tracer.logging, "record_metric", lambda *args, **kwargs: None)
+
+    @tracer.trace(adaptive_slow_threshold=0.001)
+    def slow():
+        import time
+        time.sleep(0.01)
+        return "ok"
+
+    assert slow() == "ok"
+    assert any(log.get("event") == "start" for log in logs)
+    assert any(log.get("event") == "end" for log in logs)
+
+
+def test_trace_sampling_parent_selection_includes_children(monkeypatch):
+    monkeypatch.setenv("EZTRACE_SAMPLE_RATE", "0")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SAMPLING", "false")
+    setup.Setup.initialize("EZTRACER_SAMPLING_PARENT_CHILD", show_metrics=False)
+
+    logs = []
+
+    def capture_log_info(message, **kwargs):
+        logs.append({"level": "INFO", "message": message, **kwargs})
+
+    monkeypatch.setattr(tracer.logging, "log_info", capture_log_info)
+    monkeypatch.setattr(tracer.logging, "record_metric", lambda *args, **kwargs: None)
+
+    import types
+    mod = types.ModuleType("sample_tree_mod")
+
+    def child():
+        return "child-ok"
+
+    mod.child = child
+
+    @tracer.trace(sample_rate=1.0, modules_or_classes=[mod])
+    def parent():
+        return mod.child()
+
+    assert parent() == "child-ok"
+    assert any("parent" in str(log.get("function")) for log in logs)
+    assert any("child" in str(log.get("function")) for log in logs)
+
+
+def test_trace_sampling_drop_exceptions_do_not_emit_trace_error_sync(monkeypatch):
+    monkeypatch.setenv("EZTRACE_SAMPLE_RATE", "0")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SAMPLING", "false")
+    setup.Setup.initialize("EZTRACER_SAMPLING_DROP_ERROR_SYNC", show_metrics=False)
+
+    prints = []
+
+    def capture_print(*args, **kwargs):
+        prints.append(" ".join(str(a) for a in args))
+
+    monkeypatch.setattr(builtins, "print", capture_print)
+
+    @tracer.trace()
+    def boom():
+        raise ValueError("expected-sync")
+
+    with pytest.raises(ValueError, match="expected-sync"):
+        boom()
+
+    assert not any("TRACE ERROR:" in line for line in prints)
+
+
+def test_trace_sampling_drop_exceptions_do_not_emit_trace_error_async(monkeypatch):
+    import asyncio
+
+    monkeypatch.setenv("EZTRACE_SAMPLE_RATE", "0")
+    monkeypatch.setenv("EZTRACE_ADAPTIVE_SAMPLING", "false")
+    setup.Setup.initialize("EZTRACER_SAMPLING_DROP_ERROR_ASYNC", show_metrics=False)
+
+    prints = []
+
+    def capture_print(*args, **kwargs):
+        prints.append(" ".join(str(a) for a in args))
+
+    monkeypatch.setattr(builtins, "print", capture_print)
+
+    @tracer.trace()
+    async def boom():
+        raise ValueError("expected-async")
+
+    with pytest.raises(ValueError, match="expected-async"):
+        asyncio.run(boom())
+
+    assert not any("TRACE ERROR:" in line for line in prints)

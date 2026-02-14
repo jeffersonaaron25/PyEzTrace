@@ -29,17 +29,20 @@ Setup.initialize(
 ## Via environment variables
 
 ```bash
-export EZTRACE_LOG_FORMAT="json"
+export EZTRACE_LOG_FORMAT="json" # legacy: sets both console and file
 export EZTRACE_CONSOLE_LOG_FORMAT="color"
 export EZTRACE_FILE_LOG_FORMAT="json"
 export EZTRACE_LOG_LEVEL="DEBUG"
 export EZTRACE_LOG_FILE="app.log"
 export EZTRACE_LOG_DIR="logs"
-export EZTRACE_MAX_SIZE="10485760"
-export EZTRACE_BACKUP_COUNT="5"
+export EZTRACE_MAX_SIZE="10485760" # 10MB
+export EZTRACE_BACKUP_COUNT="5" # Keep 5 rotated files
 export EZTRACE_DISABLE_FILE_LOGGING="0"
-export EZTRACE_BUFFER_ENABLED="false"
-export EZTRACE_BUFFER_FLUSH_INTERVAL="1.0"
+export EZTRACE_BUFFER_ENABLED="false" # Disable buffering by default (configurable via env)
+export EZTRACE_BUFFER_FLUSH_INTERVAL="1.0" # Seconds between flushes when buffering
+export EZTRACE_SAMPLE_RATE="1.0" # Global fixed sampling rate in [0.0, 1.0]
+export EZTRACE_ADAPTIVE_SAMPLING="false" # Keep slow/error traces at 100%, sample normal traces
+export EZTRACE_ADAPTIVE_SLOW_THRESHOLD="1.0" # Seconds; slow traces are always kept when adaptive is enabled
 ```
 
 Set these **before** the first traced or logging use so they apply when the logger is created.
@@ -89,3 +92,11 @@ export EZTRACE_REDACT_PRESETS="pii,phi"
 ```
 
 For programmatic defaults, use `set_global_redaction()` — see [Usage: Global redaction](usage.md#global-redaction-programmatic).
+
+## Sampling
+
+- **Global fixed sampling:** `EZTRACE_SAMPLE_RATE` (float from `0.0` to `1.0`, default `1.0`)
+- **Global adaptive mode:** `EZTRACE_ADAPTIVE_SAMPLING` (`true`/`false`, default `false`)
+- **Global adaptive slow threshold:** `EZTRACE_ADAPTIVE_SLOW_THRESHOLD` (float seconds, `>= 0.0`, default `1.0`)
+
+When adaptive sampling is enabled, slow/error traces are always kept; normal traces use the configured sample rate.

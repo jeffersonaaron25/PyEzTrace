@@ -2,13 +2,14 @@ import contextvars
 import fnmatch
 import inspect
 import os
+import random
 import re
 import sys
 import threading
 import time
 import types
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Pattern, Sequence, Set, TypeVar, Union
 import warnings
 try:
@@ -424,6 +425,208 @@ def _preview_args_kwargs(
 # ContextVar to indicate tracing is active
 tracing_active = contextvars.ContextVar("tracing_active", default=False)
 
+_SAMPLE_RATE_ENV = "EZTRACE_SAMPLE_RATE"
+_ADAPTIVE_SAMPLING_ENV = "EZTRACE_ADAPTIVE_SAMPLING"
+_ADAPTIVE_SLOW_THRESHOLD_ENV = "EZTRACE_ADAPTIVE_SLOW_THRESHOLD"
+_DEFAULT_ADAPTIVE_SLOW_THRESHOLD_SECONDS = 1.0
+
+
+@dataclass
+class _SamplingState:
+    mode: str  # "emit" | "drop" | "buffer"
+    adaptive_slow_threshold_seconds: float = _DEFAULT_ADAPTIVE_SLOW_THRESHOLD_SECONDS
+    forced_keep: bool = False
+    buffered_events: List[Dict[str, Any]] = field(default_factory=list)
+
+
+_active_sampling = contextvars.ContextVar("_pyeztrace_active_sampling", default=None)
+
+
+def _parse_sample_rate(value: Any, source: str, default: float = 1.0) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        warnings.warn(f"Ignoring invalid {source}={value!r}; expected float in [0.0, 1.0].")
+        return default
+    if parsed < 0.0 or parsed > 1.0:
+        warnings.warn(f"Ignoring invalid {source}={value!r}; expected float in [0.0, 1.0].")
+        return default
+    return parsed
+
+
+def _parse_sample_rate_override(sample_rate: Optional[float]) -> Optional[float]:
+    if sample_rate is None:
+        return None
+    try:
+        parsed = float(sample_rate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("trace(sample_rate=...) must be a float in [0.0, 1.0].") from exc
+    if parsed < 0.0 or parsed > 1.0:
+        raise ValueError("trace(sample_rate=...) must be a float in [0.0, 1.0].")
+    return parsed
+
+
+def _parse_bool_override(name: str, value: Optional[bool]) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"trace({name}=...) must be a bool.")
+
+
+def _parse_non_negative_float_override(name: str, value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"trace({name}=...) must be a float >= 0.0.") from exc
+    if parsed < 0.0:
+        raise ValueError(f"trace({name}=...) must be a float >= 0.0.")
+    return parsed
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_sample_rate(local_sample_rate: Optional[float]) -> float:
+    if local_sample_rate is not None:
+        return local_sample_rate
+    return _parse_sample_rate(os.environ.get(_SAMPLE_RATE_ENV), _SAMPLE_RATE_ENV, default=1.0)
+
+
+def _resolve_adaptive_sampling(local_adaptive_sampling: Optional[bool]) -> bool:
+    if local_adaptive_sampling is not None:
+        return local_adaptive_sampling
+    return _env_bool(_ADAPTIVE_SAMPLING_ENV, default=False)
+
+
+def _resolve_adaptive_slow_threshold(local_threshold: Optional[float]) -> float:
+    if local_threshold is not None:
+        return local_threshold
+    value = os.environ.get(_ADAPTIVE_SLOW_THRESHOLD_ENV)
+    if value is None:
+        return _DEFAULT_ADAPTIVE_SLOW_THRESHOLD_SECONDS
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        warnings.warn(
+            f"Ignoring invalid {_ADAPTIVE_SLOW_THRESHOLD_ENV}={value!r}; expected float >= 0.0."
+        )
+        return _DEFAULT_ADAPTIVE_SLOW_THRESHOLD_SECONDS
+    if parsed < 0.0:
+        warnings.warn(
+            f"Ignoring invalid {_ADAPTIVE_SLOW_THRESHOLD_ENV}={value!r}; expected float >= 0.0."
+        )
+        return _DEFAULT_ADAPTIVE_SLOW_THRESHOLD_SECONDS
+    return parsed
+
+
+def _decide_sampling_mode(sample_rate: float, adaptive: bool) -> str:
+    if sample_rate >= 1.0:
+        return "emit"
+    keep = random.random() < sample_rate
+    if keep:
+        return "emit"
+    return "buffer" if adaptive else "drop"
+
+
+def _start_sampling_scope(
+    local_sample_rate: Optional[float],
+    local_adaptive_sampling: Optional[bool],
+    local_adaptive_slow_threshold: Optional[float],
+) -> tuple[_SamplingState, Any, bool]:
+    current = _active_sampling.get()
+    if current is not None:
+        return current, None, False
+
+    sample_rate = _resolve_sample_rate(local_sample_rate)
+    adaptive = _resolve_adaptive_sampling(local_adaptive_sampling)
+    threshold = _resolve_adaptive_slow_threshold(local_adaptive_slow_threshold)
+    state = _SamplingState(
+        mode=_decide_sampling_mode(sample_rate, adaptive),
+        adaptive_slow_threshold_seconds=threshold,
+    )
+    token = _active_sampling.set(state)
+    return state, token, True
+
+
+def _emit_log(level: str, message: str, **kwargs: Any) -> None:
+    emit_kwargs = dict(kwargs)
+    level_override = emit_kwargs.pop("_eztrace_level_override", None)
+    if level_override is not None:
+        emit_kwargs["_eztrace_level_override"] = level_override
+    if level == "INFO":
+        logging.log_info(message, **emit_kwargs)
+    else:
+        logging.log_error(message, **emit_kwargs)
+
+
+def _sampled_log(level: str, message: str, **kwargs: Any) -> None:
+    state = _active_sampling.get()
+    if state is None or state.mode == "emit":
+        _emit_log(level, message, **kwargs)
+        return
+    if state.mode == "drop":
+        return
+    event_kwargs = dict(kwargs)
+    event_kwargs["_eztrace_level_override"] = Setup.get_level()
+    state.buffered_events.append({"kind": "log", "level": level, "message": message, "kwargs": event_kwargs})
+    if level == "ERROR":
+        state.forced_keep = True
+
+
+def _sampled_log_info(message: str, **kwargs: Any) -> None:
+    _sampled_log("INFO", message, **kwargs)
+
+
+def _sampled_log_error(message: str, **kwargs: Any) -> None:
+    _sampled_log("ERROR", message, **kwargs)
+
+
+def _sampled_record_metric(func_name: str, duration: float) -> None:
+    state = _active_sampling.get()
+    if state is None or state.mode == "emit":
+        logging.record_metric(func_name, duration)
+        return
+    if state.mode == "drop":
+        return
+    state.buffered_events.append({"kind": "metric", "func_name": func_name, "duration": duration})
+
+
+def _finalize_sampling_scope(
+    state: _SamplingState,
+    token: Any,
+    is_root_scope: bool,
+    *,
+    duration: Optional[float] = None,
+    had_error: bool = False,
+) -> None:
+    if not is_root_scope:
+        return
+    try:
+        if state.mode == "buffer":
+            if had_error:
+                state.forced_keep = True
+            if duration is not None and duration >= state.adaptive_slow_threshold_seconds:
+                state.forced_keep = True
+            if state.forced_keep:
+                for event in state.buffered_events:
+                    if event["kind"] == "log":
+                        _emit_log(event["level"], event["message"], **event["kwargs"])
+                    elif event["kind"] == "metric":
+                        logging.record_metric(event["func_name"], event["duration"])
+            state.buffered_events.clear()
+    finally:
+        if token is not None:
+            _active_sampling.reset(token)
+
 class trace_children_in_module:
     """
     Context manager to monkey-patch all functions in a module (or class) with a child-tracing decorator.
@@ -565,7 +768,7 @@ def child_trace_decorator(func: F) -> F:
             # Resource snapshots
             start_cpu = time.process_time()
             mem_before, mem_mode_before = _get_current_rss_snapshot()
-            logging.log_info(
+            _sampled_log_info(
                 f"called...",
                 fn_type="child",
                 function=func.__qualname__,
@@ -590,7 +793,7 @@ def child_trace_decorator(func: F) -> F:
                     if mem_after is not None and mem_before is not None:
                         mem_delta = mem_after - mem_before
                     mem_mode = mem_mode_after if mem_mode_after != "unavailable" else mem_mode_before
-                    logging.log_info(
+                    _sampled_log_info(
                         f"Ok.",
                         fn_type="child",
                         function=func.__qualname__,
@@ -607,10 +810,10 @@ def child_trace_decorator(func: F) -> F:
                         mem_mode=mem_mode,
                         result_preview=_safe_preview_value(result, redaction=redaction)
                     )
-                    logging.record_metric(func.__qualname__, duration)
+                    _sampled_record_metric(func.__qualname__, duration)
                     return result
                 except Exception as e:
-                    logging.log_error(
+                    _sampled_log_error(
                         f"Error: {str(e)}",
                         fn_type="child",
                         function=func.__qualname__,
@@ -622,7 +825,6 @@ def child_trace_decorator(func: F) -> F:
                     )
                     record_exception(_span, e)
                     setattr(e, "_eztrace_logged", True)
-                    logging.raise_exception_to_log(e, str(e), stack=False)
                     raise
                 finally:
                     Setup.decrement_level()
@@ -671,7 +873,7 @@ def child_trace_decorator(func: F) -> F:
             # Resource snapshots
             start_cpu = time.process_time()
             mem_before, mem_mode_before = _get_current_rss_snapshot()
-            logging.log_info(
+            _sampled_log_info(
                 f"called...",
                 fn_type="child",
                 function=func.__qualname__,
@@ -696,7 +898,7 @@ def child_trace_decorator(func: F) -> F:
                     if mem_after is not None and mem_before is not None:
                         mem_delta = mem_after - mem_before
                     mem_mode = mem_mode_after if mem_mode_after != "unavailable" else mem_mode_before
-                    logging.log_info(
+                    _sampled_log_info(
                         f"Ok.",
                         fn_type="child",
                         function=func.__qualname__,
@@ -713,10 +915,10 @@ def child_trace_decorator(func: F) -> F:
                         mem_mode=mem_mode,
                         result_preview=_safe_preview_value(result, redaction=redaction)
                     )
-                    logging.record_metric(func.__qualname__, duration)
+                    _sampled_record_metric(func.__qualname__, duration)
                     return result
                 except Exception as e:
-                    logging.log_error(
+                    _sampled_log_error(
                         f"Error: {str(e)}",
                         fn_type="child",
                         function=func.__qualname__,
@@ -728,7 +930,6 @@ def child_trace_decorator(func: F) -> F:
                     )
                     record_exception(_span, e)
                     setattr(e, "_eztrace_logged", True)
-                    logging.raise_exception_to_log(e, str(e), stack=False)
                     raise
                 finally:
                     Setup.decrement_level()
@@ -747,6 +948,9 @@ T = TypeVar("T")
 def trace(
     message: Optional[str] = None,
     stack: bool = False,
+    sample_rate: Optional[float] = None,
+    adaptive_sampling: Optional[bool] = None,
+    adaptive_slow_threshold: Optional[float] = None,
     modules_or_classes: Optional[Union[Any, Sequence[Any]]] = None,
     include: Optional[Sequence[str]] = None,
     exclude: Optional[Sequence[str]] = None,
@@ -768,6 +972,9 @@ def trace(
     Parameters:
         message: Optional message to include in error logs
         stack: Whether to show stack trace for errors
+        sample_rate: Optional local sampling rate override in [0.0, 1.0]
+        adaptive_sampling: Optional local adaptive sampling override
+        adaptive_slow_threshold: Optional local slow-threshold override (seconds, >= 0.0)
         modules_or_classes: Modules or classes to trace
         include: Function names to include (glob patterns)
         exclude: Function names to exclude (glob patterns)
@@ -780,6 +987,11 @@ def trace(
     """
     configured_redaction = _build_redaction_settings(
         redact_keys, redact_pattern, redact_value_patterns, redact_presets
+    )
+    local_sample_rate = _parse_sample_rate_override(sample_rate)
+    local_adaptive_sampling = _parse_bool_override("adaptive_sampling", adaptive_sampling)
+    local_adaptive_slow_threshold = _parse_non_negative_float_override(
+        "adaptive_slow_threshold", adaptive_slow_threshold
     )
 
     def _should_trace(func_name: str) -> bool:
@@ -920,6 +1132,9 @@ def trace(
                 method_trace = trace(
                     message=message,
                     stack=stack,
+                    sample_rate=local_sample_rate,
+                    adaptive_sampling=local_adaptive_sampling,
+                    adaptive_slow_threshold=local_adaptive_slow_threshold,
                     include=include,
                     exclude=exclude,
                     redact_keys=redact_keys,
@@ -951,10 +1166,24 @@ def trace(
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
                 redaction_token = None
+                token = None
+                tracing_token = None
+                stack_token = None
+                sampling_state = None
+                sampling_token = None
+                sampling_root_scope = False
+                trace_duration: Optional[float] = None
+                trace_had_error = False
                 try:
                     # Initialize if not already done
                     ensure_initialized()
                     _ensure_otel_initialized_early()
+                    sampling_state, sampling_token, sampling_root_scope = _start_sampling_scope(
+                        local_sample_rate, local_adaptive_sampling, local_adaptive_slow_threshold
+                    )
+                    if sampling_state.mode == "drop":
+                        return await func(*args, **kwargs)
+
                     redaction_to_use = _resolve_redaction(configured_redaction)
                     redaction_token = _active_redaction.set(redaction_to_use)
                     token = tracing_active.set(True)
@@ -982,7 +1211,7 @@ def trace(
                     # Resource snapshots
                     start_cpu = time.process_time()
                     mem_before, mem_mode_before = _get_current_rss_snapshot()
-                    logging.log_info(
+                    _sampled_log_info(
                         f"called...",
                         fn_type="parent",
                         function=func.__qualname__,
@@ -1008,6 +1237,7 @@ def trace(
                                     result = await func(*args, **kwargs)
                                 end = time.time()
                                 duration = end - start
+                                trace_duration = duration
                                 # Metrics capture
                                 cpu_time = time.process_time() - start_cpu
                                 mem_after, mem_mode_after = _get_current_rss_snapshot()
@@ -1015,7 +1245,7 @@ def trace(
                                 if mem_after is not None and mem_before is not None:
                                     mem_delta = mem_after - mem_before
                                 mem_mode = mem_mode_after if mem_mode_after != "unavailable" else mem_mode_before
-                                logging.log_info(
+                                _sampled_log_info(
                                     f"Ok.",
                                     fn_type="parent",
                                     function=func.__qualname__,
@@ -1032,23 +1262,38 @@ def trace(
                                     mem_mode=mem_mode,
                                     result_preview=_safe_preview_value(result, redaction=redaction_to_use)
                                 )
-                                logging.record_metric(func.__qualname__, duration)
+                                _sampled_record_metric(func.__qualname__, duration)
                                 return result
                             except Exception as e:
-                                logging.log_error(
-                                    f"Error: {str(e)}",
+                                end = time.time()
+                                trace_duration = end - start
+                                trace_had_error = True
+                                error_message = f"{message} -> {str(e)}" if message else str(e)
+                                _sampled_log_error(
+                                    f"Error: {error_message}",
                                     fn_type="parent",
                                     function=func.__qualname__,
+                                    duration=trace_duration,
                                     event="error",
                                     status="error",
                                     call_id=call_id,
                                     parent_id=parent_id,
-                                    time_epoch=time.time()
+                                    time_epoch=end
                                 )
-                                error_message = f"{message} -> {str(e)}" if message else str(e)
                                 record_exception(_span, e)
                                 setattr(e, "_eztrace_logged", True)
-                                logging.raise_exception_to_log(e, error_message, stack)
+                                if stack:
+                                    import traceback
+                                    _sampled_log_error(
+                                        traceback.format_exc(),
+                                        fn_type="parent",
+                                        function=func.__qualname__,
+                                        event="stack",
+                                        status="error",
+                                        call_id=call_id,
+                                        parent_id=parent_id,
+                                        time_epoch=time.time(),
+                                    )
                                 raise
                     finally:
                         # Clean up context managers even if an exception occurs
@@ -1058,6 +1303,9 @@ def trace(
                             except Exception:
                                 pass  # Prevent cleanup exceptions from masking the original error
                 except Exception as e:
+                    # In drop mode, function errors are application errors, not tracer failures.
+                    if sampling_state is not None and sampling_state.mode == "drop":
+                        raise
                     # If the wrapped function error was already logged, propagate cleanly.
                     if getattr(e, "_eztrace_logged", False):
                         raise
@@ -1068,16 +1316,25 @@ def trace(
                     raise
                 finally:
                     try:
-                        Setup.decrement_level()
-                        tracing_active.reset(token)
+                        if token is not None:
+                            Setup.decrement_level()
+                            tracing_active.reset(token)
                         if redaction_token is not None:
                             _active_redaction.reset(redaction_token)
-                        if 'tracing_token' in locals():
+                        if tracing_token is not None:
                             _currently_tracing.reset(tracing_token)
-                        if 'stack_token' in locals():
+                        if stack_token is not None:
                             _call_stack_ids.reset(stack_token)
                     except Exception:
                         pass  # Last-resort exception handling
+                    if sampling_state is not None:
+                        _finalize_sampling_scope(
+                            sampling_state,
+                            sampling_token,
+                            sampling_root_scope,
+                            duration=trace_duration,
+                            had_error=trace_had_error,
+                        )
             
             # Mark as wrapped            
             setattr(async_wrapper, _TRACED_ATTRIBUTE, True)
@@ -1086,10 +1343,24 @@ def trace(
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
                 redaction_token = None
+                token = None
+                tracing_token = None
+                stack_token = None
+                sampling_state = None
+                sampling_token = None
+                sampling_root_scope = False
+                trace_duration: Optional[float] = None
+                trace_had_error = False
                 try:
                     # Initialize if not already done
                     ensure_initialized()
                     _ensure_otel_initialized_early()
+                    sampling_state, sampling_token, sampling_root_scope = _start_sampling_scope(
+                        local_sample_rate, local_adaptive_sampling, local_adaptive_slow_threshold
+                    )
+                    if sampling_state.mode == "drop":
+                        return func(*args, **kwargs)
+
                     redaction_to_use = _resolve_redaction(configured_redaction)
                     redaction_token = _active_redaction.set(redaction_to_use)
                     token = tracing_active.set(True)
@@ -1117,7 +1388,7 @@ def trace(
                     # Resource snapshots
                     start_cpu = time.process_time()
                     mem_before, mem_mode_before = _get_current_rss_snapshot()
-                    logging.log_info(
+                    _sampled_log_info(
                         f"called...",
                         fn_type="parent",
                         function=func.__qualname__,
@@ -1142,6 +1413,7 @@ def trace(
                                     result = func(*args, **kwargs)
                                 end = time.time()
                                 duration = end - start
+                                trace_duration = duration
                                 # Metrics capture
                                 cpu_time = time.process_time() - start_cpu
                                 mem_after, mem_mode_after = _get_current_rss_snapshot()
@@ -1149,7 +1421,7 @@ def trace(
                                 if mem_after is not None and mem_before is not None:
                                     mem_delta = mem_after - mem_before
                                 mem_mode = mem_mode_after if mem_mode_after != "unavailable" else mem_mode_before
-                                logging.log_info(
+                                _sampled_log_info(
                                     f"Ok.",
                                     fn_type="parent",
                                     function=func.__qualname__,
@@ -1165,13 +1437,16 @@ def trace(
                                     mem_mode=mem_mode,
                                     result_preview=_safe_preview_value(result, redaction=redaction_to_use)
                                 )
-                                logging.record_metric(func.__qualname__, duration)
+                                _sampled_record_metric(func.__qualname__, duration)
                                 return result
                             except Exception as e:
                                 end = time.time()
                                 duration = end - start
-                                logging.log_error(
-                                    f"Error: {str(e)}",
+                                trace_duration = duration
+                                trace_had_error = True
+                                error_message = f"{message} -> {str(e)}" if message else str(e)
+                                _sampled_log_error(
+                                    f"Error: {error_message}",
                                     fn_type="parent",
                                     function=func.__qualname__,
                                     duration=duration,
@@ -1181,10 +1456,20 @@ def trace(
                                     parent_id=parent_id,
                                     time_epoch=end
                                 )
-                                error_message = f"{message} -> {str(e)}" if message else str(e)
                                 record_exception(_span, e)
                                 setattr(e, "_eztrace_logged", True)
-                                logging.raise_exception_to_log(e, error_message, stack)
+                                if stack:
+                                    import traceback
+                                    _sampled_log_error(
+                                        traceback.format_exc(),
+                                        fn_type="parent",
+                                        function=func.__qualname__,
+                                        event="stack",
+                                        status="error",
+                                        call_id=call_id,
+                                        parent_id=parent_id,
+                                        time_epoch=time.time(),
+                                    )
                                 raise
                     finally:
                         # Clean up context managers even if an exception occurs
@@ -1194,6 +1479,9 @@ def trace(
                             except Exception:
                                 pass  # Prevent cleanup exceptions from masking the original error
                 except Exception as e:
+                    # In drop mode, function errors are application errors, not tracer failures.
+                    if sampling_state is not None and sampling_state.mode == "drop":
+                        raise
                     # If the wrapped function error was already logged, propagate cleanly.
                     if getattr(e, "_eztrace_logged", False):
                         raise
@@ -1204,16 +1492,25 @@ def trace(
                     raise
                 finally:
                     try:
-                        Setup.decrement_level()
-                        tracing_active.reset(token)
+                        if token is not None:
+                            Setup.decrement_level()
+                            tracing_active.reset(token)
                         if redaction_token is not None:
                             _active_redaction.reset(redaction_token)
-                        if 'tracing_token' in locals():
+                        if tracing_token is not None:
                             _currently_tracing.reset(tracing_token)
-                        if 'stack_token' in locals():
+                        if stack_token is not None:
                             _call_stack_ids.reset(stack_token)
                     except Exception:
                         pass  # Last-resort exception handling
+                    if sampling_state is not None:
+                        _finalize_sampling_scope(
+                            sampling_state,
+                            sampling_token,
+                            sampling_root_scope,
+                            duration=trace_duration,
+                            had_error=trace_had_error,
+                        )
             
             # Mark as wrapped
             setattr(wrapper, _TRACED_ATTRIBUTE, True)
