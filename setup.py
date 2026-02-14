@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="pyeztrace",
-    version="0.1.1",
+    version="0.1.2",
     description="Python tracing and logging library",
     author="Jefferson Nelsson",
     packages=find_packages(),

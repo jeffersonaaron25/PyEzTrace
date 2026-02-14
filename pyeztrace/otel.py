@@ -425,7 +425,7 @@ def _span_to_dict(span) -> Dict[str, Any]:
         "resource": getattr(getattr(span, "resource", None), "attributes", {}) or {},
         "instrumentation": {
             "name": "pyeztrace",
-            "version": "0.1.1",
+            "version": "0.1.2",
         },
     }
 
@@ -460,7 +460,7 @@ def enable_from_env() -> bool:
         resource_attrs: Dict[str, Any] = {
             "service.name": service_name,
             "library.name": "pyeztrace",
-            "library.version": "0.1.1",
+            "library.version": "0.1.2",
         }
 
         if _should_use_gcp_auth(otlp_endpoint, resolved_exporter_name):
