@@ -1,0 +1,14 @@
+# PyEzTrace
+
+> Lightweight Python tracing and logging with hierarchical output and an interactive viewer
+
+Lightweight Python tracing and logging documentation for PyEzTrace.
+
+## Documentation
+
+- [Home](https://jeffersonaaron25.github.io/pyeztrace/index.md): Project overview and quick start.
+- [Getting Started](https://jeffersonaaron25.github.io/pyeztrace/getting-started/index.md): Installation and initialization guide.
+- [Usage](https://jeffersonaaron25.github.io/pyeztrace/usage/index.md): Tracing, logging, and viewer usage.
+- [Configuration](https://jeffersonaaron25.github.io/pyeztrace/configuration/index.md): Configuration reference.
+- [Contributing](https://jeffersonaaron25.github.io/pyeztrace/contributing/index.md): Contribution workflow.
+
