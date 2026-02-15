@@ -134,6 +134,9 @@ Configuration precedence (highest to lowest):
 @trace(
     message="Custom trace message",  # Optional custom message
     stack=True,  # Include stack trace on errors
+    sample_rate=0.5,  # Optional local sampling override for this trace
+    adaptive_sampling=True,  # Optional local adaptive override
+    adaptive_slow_threshold=0.25,  # Optional local slow-threshold override (seconds)
     modules_or_classes=[my_module],  # Trace specific modules
     include=["specific_function_*"],  # Include only specific functions
     exclude=["ignored_function_*"],  # Exclude specific functions
@@ -142,6 +145,28 @@ Configuration precedence (highest to lowest):
 )
 def function():
     # Your code here
+    pass
+```
+
+#### Sampling
+
+Global environment controls:
+
+```bash
+export EZTRACE_SAMPLE_RATE="1.0"         # 0.0 to 1.0
+export EZTRACE_ADAPTIVE_SAMPLING="false" # true => keep slow/error traces at 100%
+export EZTRACE_ADAPTIVE_SLOW_THRESHOLD="1.0" # seconds; slow traces are always kept
+```
+
+Local trace-level override:
+
+```python
+@trace(
+    sample_rate=1.0,
+    adaptive_sampling=True,
+    adaptive_slow_threshold=0.1,
+)
+def critical_path():
     pass
 ```
 
@@ -517,6 +542,9 @@ export EZTRACE_MAX_SIZE="10485760"  # 10MB
 export EZTRACE_BACKUP_COUNT="5"
 export EZTRACE_BUFFER_ENABLED="false"          # Buffer logs (default: false)
 export EZTRACE_BUFFER_FLUSH_INTERVAL="1.0"      # Seconds between flushes when buffering
+export EZTRACE_SAMPLE_RATE="1.0"                # 0.0 to 1.0
+export EZTRACE_ADAPTIVE_SAMPLING="false"        # Keep slow/error traces at 100%
+export EZTRACE_ADAPTIVE_SLOW_THRESHOLD="1.0"    # Seconds for adaptive slow-trace retention
 ```
 
 ```python

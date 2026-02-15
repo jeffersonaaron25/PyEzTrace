@@ -1,5 +1,8 @@
 # Changelog
 
+## v0.1.2
+- Implemented trace sampling options
+
 ## v0.1.1
 - Added Google Cloud OTLP support with ADC-based authentication for App Engine/GCP runtimes.
 - Added `gcp` optional extra (`google-auth`) and updated OTEL documentation/examples for Cloud Trace endpoint usage.

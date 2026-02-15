@@ -254,6 +254,7 @@ class Logging:
         # Merge context with kwargs
         context = LogContext.get_current_context()
         merged_kwargs = {**context, **kwargs}
+        forced_level = merged_kwargs.pop("_eztrace_level_override", None)
         include_data_in_output = Logging._show_data_in_cli
 
         log_format = _log_format if _log_format is not None else Logging._base_format or "color"
@@ -268,7 +269,10 @@ class Logging:
         data_str = f" Data: {merged_kwargs}" if include_data_in_output and merged_kwargs else ""
         timestamp = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime())
         try:
-            level_indent = int(Setup.get_level())
+            if forced_level is not None:
+                level_indent = int(forced_level)
+            else:
+                level_indent = int(Setup.get_level())
         except Exception:
             level_indent = 0
         if level_indent == 0:
@@ -527,7 +531,55 @@ class Logging:
                 logger.debug(msg)
         else:
             raise Exception("Setup is not done. Cannot log debug.")
-        
+
+    @staticmethod
+    def log_critical(
+        message: str,
+        fn_type: Optional[str] = None,
+        function: Optional[str] = None,
+        duration: Optional[float] = None,
+        **kwargs: Any
+    ) -> None:
+        if Setup.is_setup_done():
+            # Get the current context and merge with kwargs
+            context = LogContext.get_current_context()
+            merged_kwargs = {**context, **kwargs}
+
+            # In testing mode, capture logs with minimal overhead (no formatting).
+            if Setup.is_testing_mode():
+                Setup.capture_log({
+                    "level": "CRITICAL",
+                    "message": message,
+                    "fn_type": fn_type,
+                    "function": function,
+                    "duration": duration,
+                    "formatted": None,
+                    "kwargs": merged_kwargs,
+                })
+                return
+            
+            console_format = Logging._console_format or "color"
+            file_format = Logging._file_format or "json"
+
+            def _formats_equal(a: Any, b: Any) -> bool:
+                if isinstance(a, str) and isinstance(b, str):
+                    return a == b
+                return a is b
+
+            split = Logging._file_logging_enabled and not _formats_equal(console_format, file_format)
+
+            msg = Logging._format_message("CRITICAL", message, fn_type, function, duration, _log_format=console_format, **merged_kwargs)
+
+            logger = logging.getLogger("pyeztrace")
+            if split:
+                logger.critical(msg, extra={"eztrace_managed": True, "eztrace_sink": "console"})
+                file_msg = Logging._format_message("CRITICAL", message, fn_type, function, duration, _log_format=file_format, **merged_kwargs)
+                logger.critical(file_msg, extra={"eztrace_managed": True, "eztrace_sink": "file"})
+            else:
+                logger.critical(msg)
+        else:
+            raise Exception("Setup is not done. Cannot log critical.")
+
     @staticmethod
     def raise_exception_to_log(
         exception: Exception,

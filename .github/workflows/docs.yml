@@ -18,8 +18,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install MkDocs and Material
-        run: pip install mkdocs mkdocs-material mkdocs-awesome-pages-plugin mkdocs-git-revision-date-localized-plugin
+      - name: Install MkDocs and plugins
+        run: |
+          pip install mkdocs mkdocs-material mkdocs-awesome-pages-plugin mkdocs-git-revision-date-localized-plugin mkdocs-llmstxt mkdocs-copy-to-llm jsmin csscompressor
 
       - name: Deploy to GitHub Pages
         run: mkdocs gh-deploy --force
