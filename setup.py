@@ -1,11 +1,6 @@
-from setuptools import setup, find_packages
+"""Compatibility shim; canonical package metadata lives in pyproject.toml."""
 
-setup(
-    name="pyeztrace",
-    version="0.1.2",
-    description="Python tracing and logging library",
-    author="Jefferson Nelsson",
-    packages=find_packages(),
-    install_requires=[],
-    python_requires=">=3.7",
-)
+from setuptools import setup
+
+
+setup()

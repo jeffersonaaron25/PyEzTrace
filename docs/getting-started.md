@@ -1,5 +1,7 @@
 # Getting Started
 
+PyEzTrace requires Python 3.9 or newer.
+
 ## Installation
 
 ```bash

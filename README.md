@@ -8,6 +8,8 @@
 
 A dependency-free, lightweight Python tracing and logging library with hierarchical logging, context management, and performance metrics.
 
+Requires Python 3.9 or newer.
+
 ## Features
 
 - **Hierarchical Logging**: Visualize nested operations with tree-style output
@@ -407,6 +409,10 @@ export EZTRACE_OTLP_ENDPOINT="http://localhost:4318/v1/traces"
 # optional: comma-separated headers like "api-key=xyz,x-tenant=abc"
 export EZTRACE_OTLP_HEADERS=""
 
+# Optional: explicitly degrade to console output if the configured remote exporter cannot start.
+# The default is false so production telemetry failures are visible.
+export EZTRACE_OTEL_FALLBACK_TO_CONSOLE=false
+
 # Optional: override service name (defaults to Setup project)
 export EZTRACE_SERVICE_NAME="my-service"
 ```
@@ -467,6 +473,7 @@ Notes:
 - Spans are created for both parent and child wrappers using function `__qualname__` as span names.
 - Exceptions are recorded on the active span when OTEL is enabled.
 - Set `EZTRACE_OTEL_DEBUG=true` to emit one-time OTEL diagnostics to stderr (startup status and no-op reasons).
+- Remote exporter initialization fails closed by default. Set `EZTRACE_OTEL_FALLBACK_TO_CONSOLE=true` only when stdout fallback is intentional.
 - Inspect runtime OTEL state with `from pyeztrace import otel; print(otel.get_otel_status())` (available in newer builds after `0.1.1`).
 
 ## Advanced Usage

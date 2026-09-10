@@ -1,19 +1,17 @@
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyeztrace"
-version = "0.1.2"
+version = "0.1.3"
 description = "A dependency-free, lightweight Python tracing and logging library"
 readme = "README.md"
 authors = [{ name = "Jefferson Nelsson", email = "jefferson.nelsson@gmail.com" }]
-license = { text = "MIT" }
+license = "MIT"
 classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -24,7 +22,13 @@ classifiers = [
 ]
 keywords = ["logging", "tracing", "monitoring", "debugging", "performance"]
 dependencies = []
-requires-python = ">=3.7"
+requires-python = ">=3.9"
+
+[project.urls]
+Homepage = "https://jeffersonaaron25.github.io/PyEzTrace/"
+Documentation = "https://jeffersonaaron25.github.io/PyEzTrace/"
+Source = "https://github.com/jeffersonaaron25/PyEzTrace"
+Issues = "https://github.com/jeffersonaaron25/PyEzTrace/issues"
 
 [project.scripts]
 pyeztrace = "pyeztrace.cli:main"

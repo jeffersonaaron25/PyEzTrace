@@ -26,6 +26,7 @@ def reset_otel_state(monkeypatch):
         "EZTRACE_OTLP_ENDPOINT",
         "EZTRACE_OTLP_HEADERS",
         "EZTRACE_OTLP_GCP_AUTH",
+        "EZTRACE_OTEL_FALLBACK_TO_CONSOLE",
         "EZTRACE_GCP_PROJECT_ID",
         "EZTRACE_GCP_SCOPES",
         "GOOGLE_CLOUD_PROJECT",
@@ -332,6 +333,57 @@ def test_otel_init_failure_surfaces_diagnostic_and_status(monkeypatch):
     assert "unit-exporter-failure" in stderr.getvalue()
 
 
+def test_otel_console_fallback_requires_explicit_opt_in(monkeypatch):
+    Setup.initialize("DEGRADED_OTEL_APP", show_metrics=False)
+    monkeypatch.setenv("EZTRACE_OTEL_ENABLED", "true")
+    monkeypatch.setenv("EZTRACE_OTEL_EXPORTER", "otlp")
+    monkeypatch.setenv("EZTRACE_OTEL_FALLBACK_TO_CONSOLE", "true")
+
+    from opentelemetry.sdk.trace.export import ConsoleSpanExporter
+
+    calls = []
+
+    def fake_build_exporter(name):
+        calls.append(name)
+        if name == "otlp":
+            return None, "collector-unavailable"
+        return ConsoleSpanExporter(), None
+
+    monkeypatch.setattr(otel, "_build_exporter", fake_build_exporter)
+
+    assert otel.enable_from_env() is True
+    assert calls == ["otlp", "console"]
+    status = otel.get_otel_status()
+    assert status["enabled"] is True
+    assert status["error"] == "collector-unavailable"
+
+
+def test_start_span_closes_context_for_base_exceptions(monkeypatch):
+    exit_args = []
+
+    class FakeSpanContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *args):
+            exit_args.append(args)
+
+    class FakeTracer:
+        def start_as_current_span(self, _name, attributes=None):
+            return FakeSpanContext()
+
+    otel._state.enabled = True
+    otel._state.initialized = True
+    otel._state.tracer = FakeTracer()
+
+    with pytest.raises(KeyboardInterrupt):
+        with otel.start_span("cancelled"):
+            raise KeyboardInterrupt()
+
+    assert len(exit_args) == 1
+    assert exit_args[0][0] is KeyboardInterrupt
+
+
 def test_runtime_export_failure_is_surfaced(monkeypatch):
     class FailingExporter:
         def export(self, _spans):
@@ -421,7 +473,13 @@ def test_s3_exporter_writes_span_batch(monkeypatch):
     assert calls, "Expected S3 exporter to upload payload"
     payload = calls[0]["Body"].decode("utf-8").strip().splitlines()
     records = [json.loads(line) for line in payload if line]
-    assert any(record["name"] == "test_s3_span" for record in records)
+    record = next(record for record in records if record["name"] == "test_s3_span")
+    assert len(record["trace_id"]) == 32
+    assert len(record["span_id"]) == 16
+    assert record["kind"] == "INTERNAL"
+    assert record["status"] == "UNSET"
+    assert record["attributes"]["test"] == "value"
+    assert record["instrumentation"]["version"] == "0.1.3"
     assert calls[0]["Bucket"] == "unit-bucket"
     assert calls[0]["ContentType"] == "application/json"
 
@@ -479,5 +537,160 @@ def test_azure_exporter_uploads_span_batch(monkeypatch):
     assert uploads, "Azure exporter should upload payload"
     content = uploads[0]["data"].decode("utf-8").strip().splitlines()
     records = [json.loads(line) for line in content if line]
-    assert any(record["name"] == "test_azure_span" for record in records)
+    record = next(record for record in records if record["name"] == "test_azure_span")
+    assert len(record["trace_id"]) == 32
+    assert len(record["span_id"]) == 16
+    assert record["kind"] == "INTERNAL"
+    assert record["status"] == "UNSET"
+    assert record["attributes"]["test"] == "value"
+    assert record["instrumentation"]["version"] == "0.1.3"
     assert uploads[0]["content_type"] == "application/json"
+
+
+def test_otlp_exporter_google_bearer_fallback_caches_valid_token(monkeypatch):
+    export_headers = []
+    created = {}
+
+    class FakeOTLPSpanExporter:
+        def __init__(self, endpoint=None, headers=None):
+            self._headers = dict(headers or {})
+            self._session = types.SimpleNamespace(headers=dict(headers or {}))
+
+        def export(self, _spans):
+            from opentelemetry.sdk.trace.export import SpanExportResult
+            export_headers.append(self._headers.get("Authorization"))
+            return SpanExportResult.SUCCESS
+
+    class FakeCreds:
+        def __init__(self):
+            self.token = "cached-token"
+            self.refresh_calls = 0
+
+        @property
+        def valid(self):
+            return True
+
+        def refresh(self, _request):
+            self.refresh_calls += 1
+            self.token = f"refreshed-token-{self.refresh_calls}"
+
+    class FakeAuthorizedSession:
+        def __init__(self, credentials):
+            self.credentials = credentials
+
+    class FakeRequest:
+        pass
+
+    trace_exporter_module = types.ModuleType("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+    trace_exporter_module.OTLPSpanExporter = FakeOTLPSpanExporter
+
+    google_module = types.ModuleType("google")
+    google_auth_module = types.ModuleType("google.auth")
+    google_transport_module = types.ModuleType("google.auth.transport")
+    google_requests_module = types.ModuleType("google.auth.transport.requests")
+
+    def fake_default(scopes=None):
+        creds = FakeCreds()
+        created["credentials"] = creds
+        return creds, "unit-project"
+
+    google_auth_module.default = fake_default
+    google_requests_module.AuthorizedSession = FakeAuthorizedSession
+    google_requests_module.Request = FakeRequest
+    google_auth_module.transport = google_transport_module
+    google_transport_module.requests = google_requests_module
+    google_module.auth = google_auth_module
+
+    monkeypatch.setitem(sys.modules, "opentelemetry.exporter.otlp.proto.http.trace_exporter", trace_exporter_module)
+    monkeypatch.setitem(sys.modules, "google", google_module)
+    monkeypatch.setitem(sys.modules, "google.auth", google_auth_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport", google_transport_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport.requests", google_requests_module)
+
+    exporter, err = otel._build_exporter("gcp")
+    assert err is None
+    assert isinstance(exporter, otel._RefreshingGoogleBearerSpanExporter)
+
+    exporter.export([])
+    exporter.export([])
+
+    # Since valid is True, it should use the cached-token and never call refresh()
+    assert export_headers == ["Bearer cached-token", "Bearer cached-token"]
+    assert created["credentials"].refresh_calls == 0
+
+
+def test_otlp_exporter_google_bearer_fallback_refreshes_after_failure(monkeypatch):
+    export_headers = []
+    created = {}
+    export_results = []
+
+    class FakeOTLPSpanExporter:
+        def __init__(self, endpoint=None, headers=None):
+            self._headers = dict(headers or {})
+            self._session = types.SimpleNamespace(headers=dict(headers or {}))
+
+        def export(self, _spans):
+            export_headers.append(self._headers.get("Authorization"))
+            return export_results.pop(0)
+
+    class FakeCreds:
+        def __init__(self):
+            self.token = "initial-token"
+            self.refresh_calls = 0
+
+        @property
+        def valid(self):
+            # Even if locally considered valid, we will check if it refreshes when forced
+            return True
+
+        def refresh(self, _request):
+            self.refresh_calls += 1
+            self.token = f"refreshed-token-{self.refresh_calls}"
+
+    class FakeAuthorizedSession:
+        def __init__(self, credentials):
+            self.credentials = credentials
+
+    class FakeRequest:
+        pass
+
+    trace_exporter_module = types.ModuleType("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+    trace_exporter_module.OTLPSpanExporter = FakeOTLPSpanExporter
+
+    google_module = types.ModuleType("google")
+    google_auth_module = types.ModuleType("google.auth")
+    google_transport_module = types.ModuleType("google.auth.transport")
+    google_requests_module = types.ModuleType("google.auth.transport.requests")
+
+    def fake_default(scopes=None):
+        creds = FakeCreds()
+        created["credentials"] = creds
+        return creds, "unit-project"
+
+    google_auth_module.default = fake_default
+    google_requests_module.AuthorizedSession = FakeAuthorizedSession
+    google_requests_module.Request = FakeRequest
+    google_auth_module.transport = google_transport_module
+    google_transport_module.requests = google_requests_module
+    google_module.auth = google_auth_module
+
+    monkeypatch.setitem(sys.modules, "opentelemetry.exporter.otlp.proto.http.trace_exporter", trace_exporter_module)
+    monkeypatch.setitem(sys.modules, "google", google_module)
+    monkeypatch.setitem(sys.modules, "google.auth", google_auth_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport", google_transport_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport.requests", google_requests_module)
+
+    exporter, err = otel._build_exporter("gcp")
+    assert err is None
+    assert isinstance(exporter, otel._RefreshingGoogleBearerSpanExporter)
+
+    from opentelemetry.sdk.trace.export import SpanExportResult
+    export_results.extend([SpanExportResult.FAILURE, SpanExportResult.SUCCESS])
+
+    # First export (fails)
+    exporter.export([])
+    # Second export (should refresh token because first one failed, even though credentials.valid is True)
+    exporter.export([])
+
+    assert export_headers == ["Bearer initial-token", "Bearer refreshed-token-1"]
+    assert created["credentials"].refresh_calls == 1

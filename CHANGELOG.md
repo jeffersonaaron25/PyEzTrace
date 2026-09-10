@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.3
+- Added native sync and async generator tracing while preserving generator protocol, lazy execution, context cleanup, and disabled-resource-metric behavior.
+- Hardened concurrent child tracing with descriptor preservation, transactional patch rollback, and double-tracing protection.
+- Added periodic and shutdown flushing for buffered logging, plus bounded metrics and viewer caches for long-running processes.
+- Improved the viewer's large-log caching and corrupted-cycle handling.
+- Preserved complete OpenTelemetry span payloads for S3 and Azure JSONL exporters and improved GCP credential refresh behavior.
+- Made OpenTelemetry initialization thread-safe and remote-exporter fallback explicit rather than silently writing spans to stdout.
+- Made structured logging tolerate non-JSON-native values, circular references, and malformed environment configuration.
+- Corrected the supported Python range to 3.9+, expanded CI to Python 3.9–3.13, and enforced branch coverage.
+- Corrected the canonical documentation URL, added package project links, updated the license year, and made `pyproject.toml` the single source of package metadata.
+
 ## v0.1.2
 - Implemented trace sampling options
 
