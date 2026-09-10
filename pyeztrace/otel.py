@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, Optional, Set
 from urllib.parse import urlparse
 
 # Internal EZTrace Setup for project name
+from pyeztrace._version import get_version
 from pyeztrace.setup import Setup
 
 
@@ -480,7 +481,7 @@ def _span_to_dict(span) -> Dict[str, Any]:
         ),
         "instrumentation": {
             "name": "pyeztrace",
-            "version": "0.1.3",
+            "version": get_version(),
         },
     }
 
@@ -515,7 +516,7 @@ def _enable_from_env_unlocked() -> bool:
         resource_attrs: Dict[str, Any] = {
             "service.name": service_name,
             "library.name": "pyeztrace",
-            "library.version": "0.1.3",
+            "library.version": get_version(),
         }
 
         if _should_use_gcp_auth(otlp_endpoint, resolved_exporter_name):

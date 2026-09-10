@@ -58,28 +58,34 @@ pip install "pyeztrace[otel]"
 
 ## Quick Start
 
+Save this as `app.py`:
+
 ```python
-from pyeztrace.tracer import trace
+from pyeztrace import trace
+from pyeztrace.setup import Setup
 from pyeztrace.custom_logging import Logging
 
-# Initialize the logging system
-# Defaults: console=color, file=json (when file logging is enabled)
-log = Logging()  # or Logging(log_format="json"), "plain", "csv", "logfmt"
+Setup.initialize("MyApp", log_dir="logs", log_file="app.log",
+                 file_format="json", disable_file_logging=False)
+log = Logging()
 
-# Use the tracer decorator
+@trace()
+def validate_order(order_id):
+    log.log_info("Validating order", order_id=order_id)
+
 @trace()
 def process_order(order_id):
     with log.with_context(order_id=order_id):
         log.log_info("Processing order")
         validate_order(order_id)
-        process_payment(order_id)
         log.log_info("Order processed successfully")
 
-@trace()
-def validate_order(order_id):
-    log.log_info("Validating order")
-    # Your validation logic here
+if __name__ == "__main__":
+    process_order("123")
 ```
+
+Run `pyeztrace serve logs/app.log --open` in one terminal, then `python app.py`
+in another. The viewer waits for the file and updates as records arrive.
 
 Output example:
 ```
@@ -281,15 +287,20 @@ log = Logging()
 Run your app to generate logs, then start the viewer pointing to your log file:
 
 ```bash
-pyeztrace serve logs/app.log --host 127.0.0.1 --port 8765
-# open http://127.0.0.1:8765
+pyeztrace serve logs/app.log --open
 ```
+
+`--open` launches your browser once the server is listening. You can start the
+viewer before your app: if the log file does not exist yet, the viewer says what
+it is waiting for and starts rendering as soon as records appear.
 
 What you get:
 - Hierarchical tree (parent/child calls)
 - Input previews (args/kwargs), output preview (result)
 - Time (duration), CPU time, memory delta and peak
-- Filter by function or error, auto-refresh every 2.5s
+- Running calls shown with a live elapsed timer; pending metrics are never shown as zero
+- A status bar separating connection health ("last checked") from data freshness ("newest trace")
+- Filter by function or error, auto-refresh every 2.5s (pausing freezes the view, not capture)
 
 ### 5. Async Support
 

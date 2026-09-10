@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.1.4
+- Added optional browser opening, guided startup states, connection status, explicit retry, and separate read/trace timestamps to the live viewer.
+- Added running-call badges and elapsed timers; excluded unfinished calls from outcome rates and displayed unavailable resource metrics explicitly.
+- Made pause preserve the displayed snapshot while monitoring new calls and detecting log replacement.
+- Identified the log by content rather than by viewer process, so restarting the viewer no longer looks like log replacement and discards the selected call.
+- Detected same-size in-place log rewrites, which previously changed neither inode nor size and left reading offset by a partial record.
+- Froze running-call timers on the first failed read instead of after the staleness delay, so elapsed time no longer counts past the last successful read and then jumps backwards.
+- Hardened incremental log reading for partial UTF-8 writes, malformed records, unreadable sources, deep trees, and rotation-safe payload lookup.
+- Applied CLI filters consistently to printing, performance analysis, and error searches.
+- Added actionable stderr errors, reliable exit codes, validated arguments, and configurable terminal colors for scripted CLI use.
+- Corrected runnable startup examples and documented CLI automation conventions and future improvements.
+- Resolved the package version from installed metadata in one shared helper, fixing OpenTelemetry instrumentation and resource attributes that reported a hardcoded `0.1.3`, and making the source-checkout fallback independent of the working directory.
+- Expanded CLI, HTTP, and live-viewer regression and smoke coverage, including a guard against re-hardcoding the version.
+
 ## v0.1.3
 - Added native sync and async generator tracing while preserving generator protocol, lazy execution, context cleanup, and disabled-resource-metric behavior.
 - Hardened concurrent child tracing with descriptor preservation, transactional patch rollback, and double-tracing protection.

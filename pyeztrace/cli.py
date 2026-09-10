@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -10,25 +11,8 @@ import re
 import os
 import sys
 
-def _get_version():
-    """Get the package version dynamically."""
-    try:
-        # Python 3.8+ standard library approach
-        from importlib.metadata import version
-        return version('pyeztrace')
-    except ImportError:
-        # Fallback for Python < 3.8
-        try:
-            import pkg_resources
-            return pkg_resources.get_distribution('pyeztrace').version
-        except Exception:
-            import tomllib
-            try:
-                with open('pyproject.toml', 'rb') as f:
-                    data = tomllib.load(f)
-                    return data['project']['version']
-            except Exception:
-                return 'unknown'
+from pyeztrace._version import get_version
+
 
 class LogAnalyzer:
     def __init__(self, log_file: Path):
@@ -48,7 +32,7 @@ class LogAnalyzer:
                     entry = self._parse_line(line.strip())
                     if self._should_include(entry, filter_level, since, until, context):
                         entries.append(entry)
-                except:
+                except (ValueError, TypeError, KeyError):
                     continue  # Skip invalid lines
                     
         return entries
@@ -73,7 +57,8 @@ class LogAnalyzer:
                         formatted_lines.append(original_line)
                 except:
                     # If parsing fails, include the line anyway (might be a non-standard format)
-                    formatted_lines.append(original_line)
+                    if not any((filter_level, since, until, context)):
+                        formatted_lines.append(original_line)
                     
         return formatted_lines
     
@@ -183,13 +168,13 @@ class LogAnalyzer:
                 hierarchy[call_id] = parent_id
         return hierarchy
     
-    def analyze_performance(self, function_name: Optional[str] = None) -> dict:
+    def analyze_performance(self, function_name: Optional[str] = None, **filters) -> dict:
         """Analyze performance metrics from logs."""
         metrics = {}
-        entries = self.parse_logs()
+        entries = self.parse_logs(**filters)
         
         for entry in entries:
-            if 'duration' not in entry:
+            if not isinstance(entry.get('duration'), (int, float)) or isinstance(entry.get('duration'), bool) or not math.isfinite(entry['duration']):
                 continue
                 
             func = entry.get('function', 'unknown')
@@ -229,7 +214,11 @@ class LogAnalyzer:
 
         try:
             # Try JSON format first
-            return json.loads(line)
+            entry = json.loads(line, parse_constant=lambda _: None,
+                               parse_float=lambda value: float(value) if math.isfinite(float(value)) else None)
+            if not isinstance(entry, dict) or not isinstance(entry.get('data', {}), dict):
+                raise ValueError('Invalid log record')
+            return entry
         except:
             # Fall back to parsing other formats
             return self._parse_plain_format(line)
@@ -267,10 +256,10 @@ class LogAnalyzer:
         if filter_level and entry.get('level') != filter_level:
             return False
             
-        timestamp = datetime.fromisoformat(entry['timestamp'])
-        if since and timestamp < since:
+        timestamp = datetime.fromisoformat(entry['timestamp'].replace('Z', '+00:00'))
+        if since and timestamp.astimezone() < since.astimezone():
             return False
-        if until and timestamp > until:
+        if until and timestamp.astimezone() > until.astimezone():
             return False
             
         if context:
@@ -279,55 +268,63 @@ class LogAnalyzer:
             
         return True
 
+def _port(value):
+    try:
+        port = int(value)
+        if 0 <= port <= 65535:
+            return port
+    except (TypeError, ValueError):
+        pass
+    raise argparse.ArgumentTypeError("port must be between 0 and 65535")
+
+
 def main():
     """Main entry point for the pyeztrace CLI command."""
     parser = argparse.ArgumentParser(
         description="PyEzTrace Log Analyzer and Viewer",
-        prog="pyeztrace"
+        prog="pyeztrace", allow_abbrev=False
     )
     
     # Add version argument (must be before subparsers)
     parser.add_argument(
         '--version',
         action='version',
-        version=f'%(prog)s {_get_version()}'
+        version=f'%(prog)s {get_version()}'
     )
     
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
     # Analyze / print subcommand (default)
-    parser_print = subparsers.add_parser('print', help='Print or analyze logs')
+    parser_print = subparsers.add_parser('print', help='Print or analyze logs', allow_abbrev=False)
     parser_print.add_argument('log_file', type=Path, help="Path to log file")
     parser_print.add_argument('--level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                       help="Filter by log level")
     parser_print.add_argument('--since', type=str, help="Show logs since (YYYY-MM-DD[THH:MM:SS])")
     parser_print.add_argument('--until', type=str, help="Show logs until (YYYY-MM-DD[THH:MM:SS])")
     parser_print.add_argument('--context', type=str, help="Filter by context (key=value[,key=value])")
-    parser_print.add_argument('--analyze', action='store_true', help="Show performance metrics")
+    output_mode = parser_print.add_mutually_exclusive_group()
+    output_mode.add_argument('--analyze', action='store_true', help="Show performance metrics")
     parser_print.add_argument('--function', type=str, help="Analyze specific function")
-    parser_print.add_argument('--errors', action='store_true', help="Show only errors")
+    output_mode.add_argument('--errors', action='store_true', help="Show only errors")
     parser_print.add_argument('--format', choices=['text', 'json'], default='text',
                       help="Output format")
+    parser_print.add_argument('--color', choices=['auto', 'always', 'never'], default='auto',
+                              help='ANSI color policy (auto honors NO_COLOR and redirected output)')
     parser_print.set_defaults(func=_cmd_print)
 
     # Serve subcommand
-    parser_serve = subparsers.add_parser('serve', help='Run interactive viewer server')
+    parser_serve = subparsers.add_parser(
+        'serve', help='Run interactive viewer server', allow_abbrev=False,
+        description='Watch JSON file logs; a missing file is picked up when it appears.',
+        epilog='Enable file output in the traced app with EZTRACE_DISABLE_FILE_LOGGING=0 '
+               'and EZTRACE_FILE_LOG_FORMAT=json. Set EZTRACE_LOG_FILE to the watched path.')
     parser_serve.add_argument('log_file', type=Path, help='Path to JSON-formatted log file')
     parser_serve.add_argument('--host', type=str, default=os.environ.get('EZTRACE_VIEW_HOST', '127.0.0.1'))
-    parser_serve.add_argument('--port', type=int, default=int(os.environ.get('EZTRACE_VIEW_PORT', '8765')))
+    parser_serve.add_argument('--port', type=_port, default=os.environ.get('EZTRACE_VIEW_PORT', '8765'))
+    parser_serve.add_argument('--open', dest='open_browser', action='store_true',
+                              help='Open the viewer in your default browser once the server is up')
     parser_serve.set_defaults(func=_cmd_serve)
 
-    # Backward compatible arguments (no subcommand -> treat as print)
-    parser.add_argument('--level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help=argparse.SUPPRESS)
-    parser.add_argument('--since', type=str, help=argparse.SUPPRESS)
-    parser.add_argument('--until', type=str, help=argparse.SUPPRESS)
-    parser.add_argument('--context', type=str, help=argparse.SUPPRESS)
-    parser.add_argument('--analyze', action='store_true', help=argparse.SUPPRESS)
-    parser.add_argument('--function', type=str, help=argparse.SUPPRESS)
-    parser.add_argument('--errors', action='store_true', help=argparse.SUPPRESS)
-    parser.add_argument('--format', choices=['text', 'json'], default='text', help=argparse.SUPPRESS)
-    # Note: log_file argument removed from main parser to avoid conflicts with subparsers
-    
     args = parser.parse_args()
 
     # If no command provided, show help (backward compatibility removed due to subparser conflicts)
@@ -337,32 +334,50 @@ def main():
 
     # Use the function-based approach for subcommands
     if hasattr(args, 'func'):
-        return args.func(args)
+        try:
+            return args.func(args)
+        except BrokenPipeError:
+            return 0
+        except OSError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except ValueError as exc:
+            parser.error(str(exc))
     else:
         parser.print_help()
 
 
 def _cmd_print(args):
     # Parse datetime arguments
-    since = datetime.fromisoformat(args.since) if getattr(args, 'since', None) else None
-    until = datetime.fromisoformat(args.until) if getattr(args, 'until', None) else None
+    since = datetime.fromisoformat(args.since.replace('Z', '+00:00')) if getattr(args, 'since', None) else None
+    until = datetime.fromisoformat(args.until.replace('Z', '+00:00')) if getattr(args, 'until', None) else None
 
     # Parse context filters
     context = {}
     if getattr(args, 'context', None):
         for pair in args.context.split(','):
-            key, value = pair.split('=')
+            if '=' not in pair or not pair.split('=', 1)[0].strip():
+                raise ValueError('--context requires key=value[,key=value]')
+            key, value = pair.split('=', 1)
             context[key.strip()] = value.strip()
 
     log_file = getattr(args, 'log_file', None)
     if log_file is None:
-        print("Error: No log file specified")
+        print("Error: No log file specified", file=sys.stderr)
         return 1
         
-    analyzer = LogAnalyzer(log_file)
+    if since and until and since.astimezone() > until.astimezone():
+        raise ValueError('--since must not be later than --until')
+    if getattr(args, 'function', None) and not getattr(args, 'analyze', False):
+        raise ValueError('--function requires --analyze')
+    analyzer = LogAnalyzer(log_file.expanduser())
+    log_file = analyzer.log_file
+    filters = dict(filter_level=getattr(args, 'level', None), since=since, until=until, context=context)
+    color = getattr(args, 'color', 'auto')
+    use_color = color == 'always' or (color == 'auto' and sys.stdout.isatty() and 'NO_COLOR' not in os.environ)
 
     if getattr(args, 'analyze', False):
-        metrics = analyzer.analyze_performance(getattr(args, 'function', None))
+        metrics = analyzer.analyze_performance(getattr(args, 'function', None), **filters)
         if getattr(args, 'format', 'text') == 'json':
             print(json.dumps(metrics, indent=2))
         else:
@@ -376,7 +391,7 @@ def _cmd_print(args):
         return
 
     if getattr(args, 'errors', False):
-        errors = analyzer.find_errors(since)
+        errors = [entry for entry in analyzer.parse_logs(**filters) if entry.get('level') == 'ERROR']
         if getattr(args, 'format', 'text') == 'json':
             print(json.dumps(errors, indent=2))
         else:
@@ -410,29 +425,29 @@ def _cmd_print(args):
         call_hierarchy = analyzer.build_call_hierarchy(entries)
         for entry in entries:
             formatted = analyzer.format_json_entry(entry, call_hierarchy)
-            print(formatted)
+            print(formatted if use_color else analyzer._strip_ansi_codes(formatted))
     else:
         # For color/plain format logs, preserve original formatting
         formatted_lines = analyzer.read_formatted_lines(
             getattr(args, 'level', None), since, until, context
         )
         for line in formatted_lines:
-            print(line)
+            print(line if use_color else analyzer._strip_ansi_codes(line))
 
 
 def _cmd_serve(args):
-    # Ensure JSON file logging is used
-    print("Note: The viewer expects the log file in JSON format. Set EZTRACE_FILE_LOG_FORMAT=json (or EZTRACE_LOG_FORMAT=json) before running your app.")
-    
     # Get log_file from args
     log_file = getattr(args, 'log_file', None)
     if log_file is None:
-        print("Error: No log file specified")
+        print("Error: No log file specified", file=sys.stderr)
         return 1
-        
+
     from pyeztrace.viewer import TraceViewerServer
     server = TraceViewerServer(log_file, host=args.host, port=args.port)
-    server.serve_forever()
+    # The viewer tolerates a missing or not-yet-written log file: it reports what
+    # it is waiting for, here and in the browser, and starts rendering as soon as
+    # trace records appear.
+    server.serve_forever(open_browser=getattr(args, 'open_browser', False))
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
