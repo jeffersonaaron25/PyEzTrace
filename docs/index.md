@@ -40,7 +40,7 @@ from pyeztrace.setup import Setup
 from pyeztrace import trace
 from pyeztrace.custom_logging import Logging
 
-Setup.initialize("MyApp", show_metrics=True, log_format="json", log_dir="logs", log_file="app.log")
+Setup.initialize("MyApp", show_metrics=True, log_format="json", log_dir="logs", log_file="app.log", disable_file_logging=False)
 log = Logging()
 
 @trace()
@@ -48,13 +48,14 @@ def process_order(order_id):
     with log.with_context(order_id=order_id):
         log.log_info("Processing order")
         # ... your code ...
+
+process_order("123")
 ```
 
 Run your app, then open the trace viewer:
 
 ```bash
-pyeztrace serve logs/app.log --host 127.0.0.1 --port 8765
-# open http://127.0.0.1:8765
+pyeztrace serve logs/app.log --open
 ```
 
 ## Next steps

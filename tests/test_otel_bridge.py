@@ -13,6 +13,7 @@ pytest.importorskip("opentelemetry", reason="OpenTelemetry bridge tests require 
 from opentelemetry import trace as ot_trace
 
 from pyeztrace import otel
+from pyeztrace._version import get_version
 from pyeztrace.setup import Setup
 
 
@@ -479,7 +480,9 @@ def test_s3_exporter_writes_span_batch(monkeypatch):
     assert record["kind"] == "INTERNAL"
     assert record["status"] == "UNSET"
     assert record["attributes"]["test"] == "value"
-    assert record["instrumentation"]["version"] == "0.1.3"
+    instrumentation_version = record["instrumentation"]["version"]
+    assert instrumentation_version == get_version()
+    assert instrumentation_version != "unknown", "version did not resolve from package metadata"
     assert calls[0]["Bucket"] == "unit-bucket"
     assert calls[0]["ContentType"] == "application/json"
 
@@ -543,7 +546,9 @@ def test_azure_exporter_uploads_span_batch(monkeypatch):
     assert record["kind"] == "INTERNAL"
     assert record["status"] == "UNSET"
     assert record["attributes"]["test"] == "value"
-    assert record["instrumentation"]["version"] == "0.1.3"
+    instrumentation_version = record["instrumentation"]["version"]
+    assert instrumentation_version == get_version()
+    assert instrumentation_version != "unknown", "version did not resolve from package metadata"
     assert uploads[0]["content_type"] == "application/json"
 
 

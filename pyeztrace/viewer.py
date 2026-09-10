@@ -1,10 +1,37 @@
+import hashlib
 import json
+import math
+import os
+import shlex
+import stat
+import sys
 import threading
+from collections import Counter
+from datetime import datetime
+from functools import wraps
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 import time
+
+
+def _synchronized(method):
+    """Keep a response and its source metadata on the same file snapshot."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._entries_lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
+def _finite_number(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return float(value) if math.isfinite(value) else None
+        except (OverflowError, ValueError):
+            pass
+    return None
 
 
 class _TraceTreeBuilder:
@@ -15,13 +42,27 @@ class _TraceTreeBuilder:
             self.log_file = log_file.expanduser().resolve(strict=False)
         except Exception:
             self.log_file = Path(str(log_file)).expanduser()
-        self._entries_lock = threading.Lock()
+        self._entries_lock = threading.RLock()
         self._cached_entries: List[Dict[str, Any]] = []
         self._cached_offset = 0
         self._cached_inode: Optional[tuple[int, int]] = None
-        self._cached_remainder = ""
+        self._cached_remainder = b""
         self._pruned_count = 0
         self._version = 0
+        # Source-state tracking. These let the UI distinguish "no file yet",
+        # "file exists but is empty", "file has lines but none are trace records"
+        # and "records exist but filters hide them" instead of showing zeroes.
+        self._unparsed_lines = 0
+        self._newest_event_at: Optional[float] = None
+        self._generation = "empty"
+        self._generation_head = None
+        self._calls_started = 0
+        self._node_references = Counter()
+        self._read_error = None
+        self._file_exists = False
+        self._file_size = 0
+        self._file_mtime = None
+        self._count_is_estimate = False
         self._tree_cache = None
         self._tree_cache_version = -1
         self._tree_cache_metrics_mtime = None
@@ -49,94 +90,169 @@ class _TraceTreeBuilder:
         except Exception:
             return (0.0, 0)
 
+    def _reset_source(self):
+        self._cached_entries = []
+        self._cached_offset = 0
+        self._cached_inode = None
+        self._cached_remainder = b""
+        self._pruned_count = 0
+        self._unparsed_lines = 0
+        self._newest_event_at = None
+        # New content: recompute the identity on the next read.
+        self._generation = "empty"
+        self._generation_head = None
+        self._calls_started = 0
+        self._node_references.clear()
+        self._count_is_estimate = False
+        self._version += 1
+
+    _HEAD_SCAN_BYTES = 65536
+
+    def _read_head_key(self, handle) -> Optional[str]:
+        """Hash the log's first COMPLETE line, or None if there isn't one yet.
+
+        This is the log's content fingerprint. It is read on every poll, not
+        cached once, because a same-size in-place rewrite changes neither the
+        inode nor the file size and would otherwise go undetected - leaving the
+        viewer reading new content from a stale offset.
+
+        Only the first line is hashed: a fixed byte window would keep changing
+        while a small file is still being appended to, and a partially written
+        first line would hash differently once completed.
+        """
+        position = handle.tell()
+        try:
+            handle.seek(0)
+            head = handle.read(self._HEAD_SCAN_BYTES)
+        except OSError:
+            return None
+        finally:
+            try:
+                handle.seek(position)
+            except OSError:
+                pass
+        newline = head.find(b"\n")
+        if newline >= 0:
+            head = head[:newline + 1]
+        elif len(head) < self._HEAD_SCAN_BYTES:
+            # Nothing written yet, or the first line is still incomplete.
+            return None
+        return hashlib.sha1(head).hexdigest()[:16]
+
+    @_synchronized
     def _read_entries_cached(self) -> List[Dict[str, Any]]:
-        with self._entries_lock:
-            if not self.log_file.exists():
-                if self._cached_entries:
-                    self._cached_entries = []
-                    self._cached_offset = 0
-                    self._cached_inode = None
-                    self._cached_remainder = ""
-                    self._pruned_count = 0
-                    self._version += 1
-                return []
-
-            inode = self._stat_inode()
-            try:
-                st = self.log_file.stat()
-                size_now = int(st.st_size)
-            except Exception:
-                size_now = 0
-
-            rotated_or_truncated = (
-                self._cached_inode is not None
-                and inode is not None
-                and self._cached_inode != inode
-            ) or size_now < self._cached_offset
-
-            if rotated_or_truncated:
-                self._cached_entries = []
-                self._cached_offset = 0
-                self._cached_remainder = ""
-                self._pruned_count = 0
-                self._version += 1
-
-            self._cached_inode = inode
-
-            try:
-                with self.log_file.open("r", encoding="utf-8", errors="ignore") as f:
-                    if self._cached_offset == 0 and size_now > 50 * 1024 * 1024:
-                        # Large file initial load optimization: seek to the last 50MB
-                        f.seek(size_now - 50 * 1024 * 1024)
-                        # Discard first partial line
-                        f.readline()
-                        # Estimate self._pruned_count using average line size of 500 bytes
-                        self._pruned_count = (size_now - 50 * 1024 * 1024) // 500
-                    elif self._cached_offset > 0:
-                        f.seek(self._cached_offset)
-                    chunk = f.read()
-                    self._cached_offset = f.tell()
-            except Exception:
-                return list(self._cached_entries)
-
-            if not chunk:
-                return list(self._cached_entries)
-
-            text = self._cached_remainder + chunk
-            lines = text.splitlines(keepends=True)
-            if text and not text.endswith("\n"):
-                self._cached_remainder = lines.pop() if lines else text
-            else:
-                self._cached_remainder = ""
-
-            parsed = self._parse_json_lines(lines)
-            if parsed:
-                self._cached_entries.extend(parsed)
-                self._version += 1
-                # Keep cache bounded in size to prevent memory exhaustion in production
-                max_cache_size = 100000
-                if len(self._cached_entries) > max_cache_size:
-                    prune_amount = len(self._cached_entries) - max_cache_size
-                    self._pruned_count += prune_amount
-                    self._cached_entries = self._cached_entries[prune_amount:]
-
+        self._read_error = None
+        try:
+            with self.log_file.open("rb") as f:
+                st = os.fstat(f.fileno())
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError("Trace source must be a regular file")
+                inode = (st.st_dev, st.st_ino)
+                self._file_exists = True
+                self._file_size = st.st_size
+                self._file_mtime = st.st_mtime
+                head_key = self._read_head_key(f)
+                # Three ways the stream we were following can be gone: a new
+                # file, a shrunken file, or the same-sized file rewritten in
+                # place (which changes neither inode nor size).
+                if (
+                    (self._cached_inode is not None and inode != self._cached_inode)
+                    or st.st_size < self._cached_offset
+                    or (
+                        self._generation_head is not None
+                        and head_key is not None
+                        and head_key != self._generation_head
+                    )
+                ):
+                    self._reset_source()
+                self._cached_inode = inode
+                # Identify the log *stream*, not this process. Restarting the
+                # viewer against an unchanged file must keep the same generation,
+                # or the browser mistakes a restart for the log being replaced
+                # and discards the user's selection.
+                self._generation_head = head_key
+                self._generation = "empty" if head_key is None else f"{inode[0]}-{inode[1]}-{head_key}"
+                if self._cached_offset == 0 and st.st_size > 50 * 1024 * 1024:
+                    f.seek(st.st_size - 50 * 1024 * 1024)
+                    f.readline()
+                    self._pruned_count = f.tell() // 500
+                    self._count_is_estimate = True
+                else:
+                    f.seek(self._cached_offset)
+                chunk = f.read()
+                self._cached_offset = f.tell()
+        except FileNotFoundError:
+            if self._cached_inode is not None:
+                self._reset_source()
+            self._file_exists = False
+            self._file_size = 0
+            self._file_mtime = None
+            return []
+        except OSError as exc:
+            self._read_error = str(exc)
             return list(self._cached_entries)
+        if not chunk:
+            return list(self._cached_entries)
+        lines = (self._cached_remainder + chunk).split(b"\n")
+        self._cached_remainder = lines.pop()
+        parsed, skipped = self._parse_json_lines(lines)
+        self._unparsed_lines += skipped
+        for entry in parsed:
+            data = entry.get("data") or {}
+            if data.get("event") == "start" and data.get("call_id"):
+                self._calls_started += 1
+            for key in ("call_id", "parent_id"):
+                if data.get(key):
+                    self._node_references[data[key]] += 1
+            epoch = self._event_epoch(entry)
+            if epoch is not None and (self._newest_event_at is None or epoch > self._newest_event_at):
+                self._newest_event_at = epoch
+        if parsed:
+            self._cached_entries.extend(parsed)
+            self._version += 1
+            prune_amount = max(0, len(self._cached_entries) - 100000)
+            for entry in self._cached_entries[:prune_amount]:
+                for key in ("call_id", "parent_id"):
+                    value = (entry.get("data") or {}).get(key)
+                    if value:
+                        self._node_references[value] -= 1
+                        if not self._node_references[value]:
+                            del self._node_references[value]
+            self._pruned_count += prune_amount
+            self._cached_entries = self._cached_entries[prune_amount:]
+        return list(self._cached_entries)
 
-    def _parse_json_lines(self, lines: List[str]) -> List[Dict[str, Any]]:
+    def _parse_json_lines(self, lines: List[str]) -> tuple[List[Dict[str, Any]], int]:
+        """Parse JSONL trace records.
+
+        Returns the parsed entries plus the number of non-empty lines that were
+        skipped. The skipped count is what lets the viewer say "this file is not
+        JSON trace output" instead of silently rendering an empty dashboard.
+        """
         entries = []
+        skipped = 0
         for line in lines:
             s = line.strip()
             if not s:
                 continue
             try:
-                obj = json.loads(s)
+                obj = json.loads(s, parse_constant=lambda _: None,
+                                 parse_float=lambda value: _finite_number(float(value)))
                 # Minimal validation
-                if isinstance(obj, dict) and 'timestamp' in obj and 'level' in obj:
+                if (isinstance(obj, dict) and isinstance(obj.get('timestamp'), str)
+                        and isinstance(obj.get('level'), str)
+                        and all(isinstance(obj.get(k), (str, type(None)))
+                                for k in ('function', 'project', 'message', 'fn_type'))
+                        and (obj.get('data') is None or isinstance(obj.get('data'), dict))
+                        and all(isinstance((obj.get('data') or {}).get(k), (str, type(None)))
+                                for k in ('call_id', 'parent_id', 'event', 'status'))):
                     entries.append(obj)
+                else:
+                    skipped += 1
             except Exception:
-                # Ignore non-JSON lines
-                continue
-        return entries
+                # Ignore non-JSON lines, but remember that we saw them.
+                skipped += 1
+        return entries, skipped
 
     def _read_metrics_sidecar(self) -> List[Dict[str, Any]]:
         metrics_file = self._metrics_file()
@@ -153,21 +269,60 @@ class _TraceTreeBuilder:
             if not s:
                 continue
             try:
-                obj = json.loads(s)
-                if isinstance(obj, dict) and obj.get("event") == "metrics_summary":
+                obj = json.loads(s, parse_constant=lambda _: None,
+                                 parse_float=lambda value: _finite_number(float(value)))
+                if (isinstance(obj, dict) and obj.get("event") == "metrics_summary"
+                        and isinstance(obj.get("metrics", []), list)
+                        and all(isinstance(item, dict) for item in obj.get("metrics", []))):
                     metrics_entries.append(obj)
             except Exception:
                 continue
         return metrics_entries
 
-    def _to_epoch(self, timestamp_str: str) -> float:
+    def _event_epoch(self, entry: Dict[str, Any]) -> Optional[float]:
+        """Best-effort event time for an entry, or None if it cannot be determined.
+
+        Unlike _to_epoch this never falls back to "now": a record with an
+        unreadable timestamp must not make the newest trace look current.
+        """
+        data = entry.get("data")
+        if isinstance(data, dict):
+            epoch = _finite_number(data.get("time_epoch"))
+            if epoch is not None:
+                return epoch
+        return self._to_epoch(entry.get("timestamp", ""))
+
+    @_synchronized
+    def source_state(self, refresh=True) -> Dict[str, Any]:
+        if refresh:
+            self._read_entries_cached()
+        count = len(self._cached_entries) + self._pruned_count
+        status = "ok"
+        if self._read_error:
+            status = "read_error"
+        elif not self._file_exists:
+            status = "missing_file"
+        elif not self._file_size:
+            status = "empty_file"
+        elif not count:
+            status = "unparsable" if self._unparsed_lines else "no_records"
+        return {
+            "status": status, "log_file": str(self.log_file),
+            "file_exists": self._file_exists, "file_size": self._file_size,
+            "file_mtime": self._file_mtime, "record_count": count,
+            "unparsed_lines": self._unparsed_lines,
+            "newest_event_at": self._newest_event_at,
+            "read_error": self._read_error, "generation": self._generation,
+            "calls_started": self._calls_started,
+            "count_is_estimate": self._count_is_estimate,
+            "total_nodes": len(self._node_references),
+        }
+
+    def _to_epoch(self, timestamp_str: str) -> Optional[float]:
         try:
-            # Format: YYYY-MM-DDTHH:MM:SS
-            # Parse conservatively to avoid extra deps
-            struct_time = time.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%S")
-            return time.mktime(struct_time)
-        except Exception:
-            return time.time()
+            return _finite_number(datetime.fromisoformat(timestamp_str.replace("Z", "+00:00")).timestamp())
+        except (TypeError, ValueError, OverflowError, AttributeError, OSError):
+            return None
 
     def _safe_json_dumps(self, value: Any) -> str:
         try:
@@ -199,9 +354,7 @@ class _TraceTreeBuilder:
         if payload_truncated:
             payload_preview += "…"
 
-        ts_epoch = data.get("time_epoch")
-        if ts_epoch is None:
-            ts_epoch = self._to_epoch(entry.get("timestamp", ""))
+        ts_epoch = self._event_epoch(entry)
 
         record = {
             "id": entry_idx,
@@ -230,6 +383,7 @@ class _TraceTreeBuilder:
 
         return record
 
+    @_synchronized
     def build_logs(self, limit: int = 2000, payload_preview_chars: int = 1200) -> Dict[str, Any]:
         entries = self._read_entries_cached()
         with self._entries_lock:
@@ -258,6 +412,7 @@ class _TraceTreeBuilder:
             "generated_at": time.time(),
             "log_file": str(self.log_file),
             "total_entries": total_entries,
+            "generation": self._generation,
             "logs": records,
         }
 
@@ -267,10 +422,13 @@ class _TraceTreeBuilder:
             self._logs_cache_limit = limit
             self._logs_cache_preview = payload_preview_chars
 
-        return res_to_cache
+        return res_to_cache.copy()
 
-    def get_log_payload(self, entry_idx: int) -> Optional[Dict[str, Any]]:
+    @_synchronized
+    def get_log_payload(self, entry_idx: int, generation: Optional[str] = None) -> Optional[Dict[str, Any]]:
         entries = self._read_entries_cached()
+        if generation is not None and generation != self._generation:
+            return None
         local_idx = entry_idx - self._pruned_count
         if local_idx < 0 or local_idx >= len(entries):
             return None
@@ -286,6 +444,7 @@ class _TraceTreeBuilder:
             "payload_size": len(self._safe_json_dumps(data)),
         }
 
+    @_synchronized
     def build_tree(self) -> Dict[str, Any]:
         entries = self._read_entries_cached()
         mtime, size = self._metrics_stat()
@@ -343,7 +502,8 @@ class _TraceTreeBuilder:
                 metrics_entries_from_log.append({
                     'timestamp': e.get('timestamp'),
                     'status': status or e.get('level'),
-                    'metrics': data.get('metrics', []),
+                    'metrics': [item for item in data.get('metrics', []) if isinstance(item, dict)]
+                               if isinstance(data.get('metrics', []), list) else [],
                     'total_functions': data.get('total_functions'),
                     'total_calls': data.get('total_calls'),
                     'generated_at': data.get('generated_at') or self._to_epoch(e.get('timestamp', ''))
@@ -370,17 +530,17 @@ class _TraceTreeBuilder:
 
             # Timestamps and metrics
             if event == 'start':
-                node['start_time'] = data.get('time_epoch') or self._to_epoch(e.get('timestamp', ''))
+                node['start_time'] = self._event_epoch(e)
                 node['args_preview'] = data.get('args_preview')
                 node['kwargs_preview'] = data.get('kwargs_preview')
                 node['status'] = status or 'running'
             elif event == 'end':
-                node['end_time'] = data.get('time_epoch') or self._to_epoch(e.get('timestamp', ''))
-                node['duration'] = e.get('duration')
-                node['cpu_time'] = data.get('cpu_time')
-                node['mem_rss_kb'] = data.get('mem_rss_kb') or data.get('mem_peak_kb')
-                node['mem_peak_kb'] = data.get('mem_peak_kb')
-                node['mem_delta_kb'] = data.get('mem_delta_kb')
+                node['end_time'] = self._event_epoch(e)
+                node['duration'] = _finite_number(e.get('duration'))
+                node['cpu_time'] = _finite_number(data.get('cpu_time'))
+                node['mem_rss_kb'] = _finite_number(data.get('mem_rss_kb', data.get('mem_peak_kb')))
+                node['mem_peak_kb'] = _finite_number(data.get('mem_peak_kb'))
+                node['mem_delta_kb'] = _finite_number(data.get('mem_delta_kb'))
                 node['mem_mode'] = data.get('mem_mode') or node.get('mem_mode')
                 node['result_preview'] = data.get('result_preview')
                 node['status'] = status or 'success'
@@ -388,7 +548,7 @@ class _TraceTreeBuilder:
                 # Mark node with error info
                 node['error'] = e.get('message')
                 node['status'] = status or 'error'
-                node['end_time'] = data.get('time_epoch') or self._to_epoch(e.get('timestamp', ''))
+                node['end_time'] = self._event_epoch(e)
 
         # Determine roots
         seen_as_child = set()
@@ -400,14 +560,19 @@ class _TraceTreeBuilder:
         # Convert to nested structure with cycle detection to prevent RecursionError on corrupted logs
         visited = set()
         materialized_cids = set()
+        depth_limited = False
         def materialize(cid: str) -> Dict[str, Any]:
+            nonlocal depth_limited
+            if len(visited) >= 150:
+                depth_limited = True
             materialized_cids.add(cid)
-            if cid in visited:
+            if cid in visited or len(visited) >= 150:
                 n = nodes[cid]
                 return {
                     **{k: v for k, v in n.items() if k != 'children'},
                     'children': [],
-                    'error': 'Circular reference detected'
+                    'error': 'Circular reference detected' if cid in visited else None,
+                    'display_warning': 'Maximum display depth reached' if cid not in visited else None
                 }
             visited.add(cid)
             try:
@@ -439,6 +604,7 @@ class _TraceTreeBuilder:
             'log_file': str(self.log_file),
             'roots': tree,
             'total_nodes': len(nodes),
+            'display_depth_limited': depth_limited,
             'metrics': metrics_entries
         }
 
@@ -448,7 +614,7 @@ class _TraceTreeBuilder:
             self._tree_cache_metrics_mtime = mtime
             self._tree_cache_metrics_size = size
 
-        return res_to_cache
+        return res_to_cache.copy()
 
 
 class TraceViewerServer:
@@ -480,8 +646,23 @@ class TraceViewerServer:
                     self._send(200, outer._html_page().encode('utf-8'), 'text/html; charset=utf-8')
                 elif parsed.path == '/app.js':
                     self._send(200, outer._js_bundle().encode('utf-8'), 'application/javascript')
+                elif parsed.path == '/api/status':
+                    # Cheap liveness + freshness probe. Used while the view is
+                    # paused so connection state stays truthful and we can count
+                    # what arrived without re-rendering the tree.
+                    source = outer._builder.source_state()
+                    data = {
+                        'generated_at': time.time(),
+                        'total_nodes': source['total_nodes'],
+                        'source': source,
+                    }
+                    self._send(200, json.dumps(data).encode('utf-8'), 'application/json')
                 elif parsed.path == '/api/tree':
-                    data = outer._builder.build_tree()
+                    with outer._builder._entries_lock:
+                        data = outer._builder.build_tree()
+                        data['source'] = outer._builder.source_state(refresh=False)
+                    # `generated_at` is poll time; `source.newest_event_at` is data age.
+                    # They are reported separately so the UI never presents one as the other.
                     self._send(200, json.dumps(data).encode('utf-8'), 'application/json')
                 elif parsed.path == '/api/logs':
                     try:
@@ -501,7 +682,7 @@ class TraceViewerServer:
                         entry_id = int((query.get('id') or ['-1'])[0])
                     except Exception:
                         entry_id = -1
-                    payload = outer._builder.get_log_payload(entry_id)
+                    payload = outer._builder.get_log_payload(entry_id, (query.get('generation') or [None])[0])
                     if payload is None:
                         self._send(404, b'Not Found', 'text/plain')
                     else:
@@ -722,6 +903,35 @@ class TraceViewerServer:
     .payload-tree-value.boolean { color: #67e8f9; }
     .payload-tree-value.null { color: #c4b5fd; }
     .payload-tree-empty { color: var(--muted); padding: 2px 0; }
+    .status-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--muted); padding-top: 8px; margin-top: 6px; border-top: 1px solid var(--border); }
+    .status-item { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+    .status-item strong { color: var(--text); font-weight: 600; }
+    .status-sep { width: 1px; height: 14px; background: var(--border); }
+    .conn-state { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; letter-spacing: 0.02em; white-space: nowrap; }
+    .conn-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--muted); flex: none; }
+    .conn-state.ok { color: #86efac; }
+    .conn-state.ok .conn-dot { background: #22c55e; box-shadow: 0 0 0 3px rgba(34,197,94,0.18); }
+    .conn-state.warn { color: #fcd34d; }
+    .conn-state.warn .conn-dot { background: #f59e0b; box-shadow: 0 0 0 3px rgba(245,158,11,0.18); animation: conn-pulse 1.1s ease-in-out infinite; }
+    .conn-state.bad { color: #fca5a5; }
+    .conn-state.bad .conn-dot { background: #ef4444; box-shadow: 0 0 0 3px rgba(239,68,68,0.18); }
+    @keyframes conn-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+    @media (prefers-reduced-motion: reduce) { .conn-state.warn .conn-dot { animation: none; } .running-dot { animation: none; } }
+    .stale-note { color: #fcd34d; }
+    .empty-state { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 22px; margin-bottom: 14px; }
+    .empty-state h2 { margin: 0 0 6px; font-size: 16px; color: var(--text); }
+    .empty-state p { margin: 0 0 10px; color: var(--muted); font-size: 13px; line-height: 1.5; max-width: 70ch; }
+    .empty-state code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; background: rgba(2,6,23,0.6); border: 1px solid var(--border); border-radius: 6px; padding: 1px 5px; overflow-wrap: anywhere; }
+    .empty-state pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; background: rgba(2,6,23,0.6); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; color: var(--text); margin: 0 0 10px; }
+    .empty-state .empty-kicker { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--accent); font-weight: 700; margin-bottom: 8px; }
+    .empty-state ol { margin: 0; padding-left: 20px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+    .running-dot { width: 7px; height: 7px; border-radius: 999px; background: #38bdf8; display: inline-block; flex: none; animation: conn-pulse 1.2s ease-in-out infinite; }
+    .pill.running { background: rgba(56,189,248,0.15); color: #7dd3fc; border-color: rgba(56,189,248,0.4); display: inline-flex; align-items: center; gap: 5px; }
+    .elapsed { color: #7dd3fc; font-variant-numeric: tabular-nums; }
+    /* A frozen timer is not counting. Dim it and mark it so a static number is
+       not mistaken for a live one. */
+    .elapsed.frozen { color: var(--muted); }
+    .elapsed.frozen::after { content: ' \\23F8'; font-size: 0.85em; opacity: 0.8; }
     @media (max-width: 1080px) {
       header .meta { justify-content: flex-start; text-align: left; }
       .split-layout { grid-template-columns: 1fr; }
@@ -747,8 +957,20 @@ class TraceViewerServer:
         <button class="btn primary" id="refresh">Refresh</button>
       </div>
     </div>
+    <div class="status-bar" id="status-bar">
+      <span class="conn-state" id="conn-state" role="status" aria-live="polite">
+        <span class="conn-dot" aria-hidden="true"></span><span id="conn-label">Connecting</span>
+      </span>
+      <span class="status-sep" aria-hidden="true"></span>
+      <span class="status-item">Last checked <strong id="last-checked" title="When the viewer last reached the server">never</strong></span>
+      <span class="status-item">Newest trace <strong id="newest-trace" title="Time of the most recent trace record in the log file">none yet</strong></span>
+      <label class="toggle"><input type="checkbox" id="auto-refresh" checked /> Auto refresh</label>
+      <span class="status-item hidden-panel" id="paused-counter"></span>
+      <button class="btn small hidden-panel" id="retry-now">Retry now</button>
+    </div>
   </header>
   <main>
+    <div class="empty-state hidden-panel" id="empty-state"></div>
     <div class="grid hidden-panel" id="overview"></div>
     <div id="trace-settings" class="insight-panel trace-settings">
       <div class="panel-title">Trace filters</div>
@@ -796,7 +1018,6 @@ class TraceViewerServer:
         <div class="section-title"><span>Trace hierarchy</span></div>
         <div id="selection-strip" class="selection-strip"></div>
         <div id="trace-controls" class="trace-controls">
-          <label class="toggle"><input type="checkbox" id="auto-refresh" checked /> Auto refresh</label>
           <label class="filter-label">Focus</label>
           <select id="focus-mode" class="select">
             <option value="all">All</option>
@@ -854,6 +1075,32 @@ class TraceViewerServer:
   const expandDepthEl = document.getElementById('expand-depth');
   const collapseAllEl = document.getElementById('collapse-all');
   const copyFilteredEl = document.getElementById('copy-filtered');
+  const emptyStateEl = document.getElementById('empty-state');
+  const connStateEl = document.getElementById('conn-state');
+  const connLabelEl = document.getElementById('conn-label');
+  const lastCheckedEl = document.getElementById('last-checked');
+  const newestTraceEl = document.getElementById('newest-trace');
+  const pausedCounterEl = document.getElementById('paused-counter');
+  const retryNowEl = document.getElementById('retry-now');
+
+  // Connection + freshness state. `lastSuccessAt` is when we last reached the
+  // server; `sourceState.newest_event_at` is how old the newest trace is.
+  // These are deliberately never collapsed into one "last updated" value.
+  let connState = 'connecting';
+  let lastSuccessAt = null;
+  let consecutiveFailures = 0;
+  let lastFetchError = null;
+  let sourceState = null;
+  let pausedBaselineNodes = null;
+  let pausedGeneration = null;
+  let snapshotGeneration = null;
+  let snapshotCalls = 0;
+  let snapshotAt = null;
+  let viewRevision = 0;
+  let statusInFlight = false;
+  let logsGeneration = null;
+  let liveNodeCount = 0;
+  let statusTicker = null;
 
   let tree = [];
   let logs = [];
@@ -986,6 +1233,254 @@ class TraceViewerServer:
   }
   function escapeHtml(value){
     return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  function fmtClock(epoch){
+    if(!epoch) return null;
+    return new Date(epoch*1000).toLocaleTimeString();
+  }
+  function fmtAgo(epoch){
+    if(!epoch) return null;
+    const secs = Math.max(0, (Date.now()/1000) - epoch);
+    if(secs < 5) return 'just now';
+    if(secs < 60) return `${Math.floor(secs)}s ago`;
+    if(secs < 3600) return `${Math.floor(secs/60)}m ago`;
+    if(secs < 86400) return `${Math.floor(secs/3600)}h ${Math.floor((secs%3600)/60)}m ago`;
+    return `${Math.floor(secs/86400)}d ago`;
+  }
+  function fmtElapsed(secs){
+    if(secs == null || !isFinite(secs) || secs < 0) return '-';
+    if(secs < 60) return `${secs.toFixed(1)}s`;
+    if(secs < 3600) return `${Math.floor(secs/60)}m ${String(Math.floor(secs%60)).padStart(2,'0')}s`;
+    return `${Math.floor(secs/3600)}h ${String(Math.floor((secs%3600)/60)).padStart(2,'0')}m`;
+  }
+  function isRunning(node){
+    return node && node.status === 'running' && node.duration == null;
+  }
+  // A running-call timer may only advance while we are actually reading the
+  // log. It freezes on the FIRST failed poll rather than after the staleness
+  // grace period: counting past the last successful read and then snapping back
+  // to it made the timer visibly run backwards.
+  function elapsedIsLive(){
+    return autoRefreshEnabled
+      && consecutiveFailures === 0
+      && effectiveConnState() === 'ok'
+      && !(sourceState && sourceState.read_error);
+  }
+  function elapsedReferenceTime(){
+    return elapsedIsLive() ? Date.now()/1000 : (snapshotAt || Date.now()/1000);
+  }
+  function applyElapsed(el, start){
+    const live = elapsedIsLive();
+    el.textContent = fmtElapsed(elapsedReferenceTime() - start);
+    el.classList.toggle('frozen', !live);
+    el.title = live
+      ? 'Elapsed time for a call that is still running'
+      : 'Frozen: elapsed time as of the last successful read';
+  }
+  function elapsedHtml(node){
+    if(!isRunning(node) || !node.start_time) return '';
+    const live = elapsedIsLive();
+    const secs = elapsedReferenceTime() - node.start_time;
+    return `<span class="elapsed${live ? '' : ' frozen'}" data-start="${node.start_time}" title="${
+      live ? 'Elapsed time for a call that is still running' : 'Frozen: elapsed time as of the last successful read'
+    }">${escapeHtml(fmtElapsed(secs))}</span>`;
+  }
+  function runningPill(){
+    return '<span class="pill running"><span class="running-dot" aria-hidden="true"></span>running</span>';
+  }
+
+  function setConnState(state, err){
+    connState = state;
+    lastFetchError = err || null;
+    renderStatusBar();
+  }
+
+  // Polling is suspended while the tab is in the background (and browsers
+  // throttle timers there anyway). Reporting "Connected" during that window
+  // would be the same lie as showing stale data with a fresh timestamp, so the
+  // displayed state is derived from when we actually last succeeded.
+  const STALE_AFTER_SEC = 10;
+  function effectiveConnState(){
+    if(connState !== 'ok') return connState;
+    const age = lastSuccessAt ? ((Date.now()/1000) - lastSuccessAt) : Infinity;
+    if(document.hidden && age > STALE_AFTER_SEC) return 'background';
+    if(age > STALE_AFTER_SEC) return 'stale';
+    return 'ok';
+  }
+
+  function renderStatusBar(){
+    if(!connStateEl) return;
+    const labels = {
+      connecting: 'Connecting',
+      ok: 'Connected',
+      background: 'Paused - tab in background',
+      stale: 'Not checking',
+      retrying: 'Reconnecting',
+      down: 'Disconnected'
+    };
+    const effective = effectiveConnState();
+    const tone = { connecting: 'warn', ok: 'ok', background: 'warn', stale: 'warn', retrying: 'warn', down: 'bad' }[effective] || 'warn';
+    connStateEl.classList.remove('ok', 'warn', 'bad');
+    connStateEl.classList.add(tone);
+    let label = labels[effective] || 'Unknown';
+    if(effective === 'retrying' && consecutiveFailures > 1){
+      label += ` (${consecutiveFailures} failed checks)`;
+    }
+    // This is an aria-live region and renderStatusBar runs every second. Only
+    // write when the text actually changes, so screen readers announce state
+    // transitions rather than re-announcing the same state repeatedly.
+    if(connLabelEl.textContent !== label) connLabelEl.textContent = label;
+    connStateEl.title = lastFetchError
+      ? `Last error: ${lastFetchError}`
+      : (effective === 'background' ? 'Polling resumes as soon as this tab is visible again.' : '');
+
+    // Last checked = reachability. Never shown as data freshness.
+    if(lastSuccessAt){
+      const ago = fmtAgo(lastSuccessAt);
+      lastCheckedEl.textContent = effective === 'ok' ? ago : `${ago} (stale)`;
+      lastCheckedEl.title = `Last successful read at ${fmtClock(lastSuccessAt)}`;
+      lastCheckedEl.classList.toggle('stale-note', effective !== 'ok');
+    } else {
+      lastCheckedEl.textContent = 'never';
+      lastCheckedEl.classList.toggle('stale-note', effective === 'down');
+    }
+
+    // Newest trace = data age, straight from the log records themselves.
+    const newest = sourceState && sourceState.newest_event_at;
+    if(newest){
+      newestTraceEl.textContent = fmtAgo(newest);
+      newestTraceEl.title = `Most recent trace record at ${fmtClock(newest)}`;
+    } else {
+      newestTraceEl.textContent = 'none yet';
+      newestTraceEl.title = 'No trace records have been read from the log file yet';
+    }
+
+    if(sourceState && sourceState.read_error){
+      connLabelEl.textContent = 'Source unreadable - snapshot stale';
+      connStateEl.classList.remove('ok'); connStateEl.classList.add('warn');
+      connStateEl.title = sourceState.read_error;
+    }
+    if(retryNowEl){
+      retryNowEl.classList.toggle('hidden-panel', effective === 'ok' || effective === 'connecting' || effective === 'background');
+    }
+    renderPausedCounter();
+  }
+
+  function renderPausedCounter(){
+    if(!pausedCounterEl) return;
+    if(autoRefreshEnabled || pausedBaselineNodes == null){
+      pausedCounterEl.classList.add('hidden-panel');
+      pausedCounterEl.textContent = '';
+      return;
+    }
+    if(sourceState && pausedGeneration && sourceState.generation !== pausedGeneration){
+      pausedCounterEl.classList.remove('hidden-panel');
+      pausedCounterEl.textContent = 'Paused - log source replaced or truncated; resume to load it';
+      return;
+    }
+    const delta = Math.max(0, liveNodeCount - pausedBaselineNodes);
+    pausedCounterEl.classList.remove('hidden-panel');
+    pausedCounterEl.innerHTML = delta > 0
+      ? `<strong>Paused</strong> - ${delta} new call${delta === 1 ? '' : 's'} not shown`
+      : '<strong>Paused</strong> - capture continues';
+  }
+
+  // Updates relative times and running-call timers without re-rendering the
+  // tree, so selection, scroll position and focus survive.
+  function tickLiveUi(){
+    renderStatusBar();
+    document.querySelectorAll('.elapsed[data-start]').forEach(el=>{
+      const start = parseFloat(el.dataset.start);
+      if(isFinite(start)) applyElapsed(el, start);
+    });
+  }
+
+  function emptyStateHtml(){
+    const st = sourceState;
+    if(!st) return null;
+    const file = escapeHtml(st.log_file || '');
+    const quotedFile = "'" + (st.log_file || 'logs/app.log').replaceAll("'", "'\\''") + "'";
+    const cmd = 'export EZTRACE_DISABLE_FILE_LOGGING=0 EZTRACE_FILE_LOG_FORMAT=json EZTRACE_LOG_FILE=' + quotedFile;
+    if(connState === 'down' && !st.record_count){
+      return `
+        <div class="empty-kicker">Viewer disconnected</div>
+        <h2>Cannot reach the viewer server</h2>
+        <p>The page is still open but the server at this address is not responding${lastFetchError ? ` (${escapeHtml(lastFetchError)})` : ''}. Any results below were read before the connection dropped.</p>
+        <p>Restart it with:</p>
+        <pre>pyeztrace serve ${escapeHtml(quotedFile)} --open</pre>`;
+    }
+    if(st.status === 'read_error'){
+      return `<h2>Cannot read the trace file</h2><p>${escapeHtml(st.read_error || 'Read failed')}. Last available data is preserved.</p>`;
+    }
+    if(st.status === 'missing_file'){
+      return `
+        <div class="empty-kicker">Waiting for the log file</div>
+        <h2>No log file yet</h2>
+        <p>The viewer is watching <code>${file}</code>. It does not exist yet, which is normal if the traced application has not started. The dashboard appears automatically once records arrive - no need to restart the viewer.</p>
+        <ol>
+          <li>Enable JSON file logging for the app at this path:<pre>${escapeHtml(cmd)}</pre></li>
+          <li>Run the traced application as usual.</li>
+        </ol>`;
+    }
+    if(st.status === 'empty_file' || st.status === 'no_records'){
+      return `
+        <div class="empty-kicker">Waiting for traces</div>
+        <h2>Log file found, no trace records yet</h2>
+        <p><code>${file}</code> exists but has no trace records so far. The viewer is polling and will render as soon as the first traced call starts.</p>
+        <p>If the app is definitely running, confirm it is writing JSON to this exact path and that at least one function is decorated for tracing.</p>`;
+    }
+    if(st.status === 'unparsable'){
+      return `
+        <div class="empty-kicker">Wrong log format</div>
+        <h2>This file is not JSON trace output</h2>
+        <p>Read <strong>${st.unparsed_lines}</strong> line${st.unparsed_lines === 1 ? '' : 's'} from <code>${file}</code>, but none are JSON trace records. This usually means the application is writing the human-readable log format.</p>
+        <p>Set the format before starting the traced application, then restart it:</p>
+        <pre>export EZTRACE_FILE_LOG_FORMAT=json</pre>
+        <p>The viewer picks up the change on its own once valid records are written.</p>`;
+    }
+    return null;
+  }
+
+  function filtersHideEverythingHtml(visibleCount){
+    if(visibleCount > 0) return null;
+    const count = insightTab === 'logs' ? logs.length : total;
+    if(!sourceState || sourceState.status !== 'ok' || !count) return null;
+    return `
+      <div class="empty-kicker">Nothing matches</div>
+      <h2>${count} ${insightTab === 'logs' ? 'log records' : 'calls'} captured, but filters hide them all</h2>
+      <p>Trace data is arriving normally. ${insightTab === 'logs' ? 'The current log search, level or link filters exclude every record.' : 'The current search, status, duration or type filters exclude every call.'}</p>
+      <p><button class="btn small" id="clear-all-filters">Clear all filters</button></p>`;
+  }
+
+  function renderEmptyState(visibleCount){
+    if(!emptyStateEl) return false;
+    const html = emptyStateHtml() || filtersHideEverythingHtml(visibleCount);
+    if(!html){
+      emptyStateEl.classList.add('hidden-panel');
+      emptyStateEl.innerHTML = '';
+      return false;
+    }
+    emptyStateEl.innerHTML = html;
+    emptyStateEl.classList.remove('hidden-panel');
+    const clearBtn = document.getElementById('clear-all-filters');
+    if(clearBtn) clearBtn.addEventListener('click', clearAllFilters);
+    return true;
+  }
+
+  function clearAllFilters(){
+    searchEl.value = '';
+    statusFilter = 'all';
+    minDurationMs = 0;
+    fnTypeFilter = 'all';
+    focusMode = 'all';
+    runQuery = ''; runSearchEl.value = '';
+    logQuery = ''; logLevelFilter = 'all'; logLinkFilter = 'all';
+    depthLimit = 99; depthLimitEl.value = 99;
+    if(minDurationEl) minDurationEl.value = '';
+    if(fnTypeEl) fnTypeEl.value = 'all';
+    if(focusModeEl) focusModeEl.value = 'all';
+    saveState();
+    render();
   }
   function escapeAttr(value){
     return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -1785,15 +2280,26 @@ class TraceViewerServer:
     const totalRuns = tree.length;
     const errorNodes = allNodes.filter(n=>n.error || n.status === 'error');
     const successNodes = allNodes.filter(n=>n.status === 'success');
-    const errorRate = totalCalls ? ((errorNodes.length / totalCalls) * 100) : 0;
+    const runningNodes = allNodes.filter(isRunning);
+    // Rates are computed over *finished* calls only. A call still in flight has
+    // not succeeded or failed, and counting it as either understates both.
+    const settledCalls = successNodes.length + errorNodes.length;
+    const errorRate = settledCalls ? ((errorNodes.length / settledCalls) * 100) : 0;
+    const successRate = settledCalls ? ((successNodes.length / settledCalls) * 100) : 0;
+    const oldestRunningStart = runningNodes.reduce((acc, n)=> (n.start_time && (acc == null || n.start_time < acc)) ? n.start_time : acc, null);
     const p50 = percentile(durationsMs, 50);
     const p95 = percentile(durationsMs, 95);
     const p99 = percentile(durationsMs, 99);
     const latestMetrics = metrics.length ? metrics[metrics.length - 1] : null;
-    const missingEnd = allNodes.filter(n=>n.start_time && !n.end_time).length;
+    // A long-open call is an observation, not proof of interruption.
+    const STALLED_AFTER_SEC = 300;
+    const nowSec = Date.now()/1000;
+    const missingEnd = allNodes.filter(n=>n.start_time && !n.end_time && (nowSec - n.start_time) > STALLED_AFTER_SEC).length;
 
     const fnMap = new Map();
     const functionTraceTarget = new Map();
+    let cpuSamples = 0;
+    let memSamples = 0;
     let cpuTotal = 0;
     let memDeltaNet = 0;
     let memDeltaPositive = 0;
@@ -1803,20 +2309,24 @@ class TraceViewerServer:
     allNodes.forEach(n=>{
       const key = cleanFnName(n.function || n.call_id || 'unknown');
       if(!fnMap.has(key)){
-        fnMap.set(key, { fn: key, calls: 0, totalMs: 0, errors: 0, maxMs: 0, cpuS: 0, memDeltaKb: 0 });
+        fnMap.set(key, { fn: key, calls: 0, completed: 0, running: 0, totalMs: 0, errors: 0, maxMs: 0, cpuS: 0, memDeltaKb: 0, cpuSamples: 0, memSamples: 0 });
       }
       const row = fnMap.get(key);
       row.calls += 1;
+      if(isRunning(n)) row.running += 1;
+      if(n.duration != null) row.completed += 1;
       if(n.duration != null){
         const ms = n.duration * 1000;
         row.totalMs += ms;
         row.maxMs = Math.max(row.maxMs, ms);
       }
       if(n.cpu_time != null){
+        cpuSamples += 1; row.cpuSamples += 1;
         row.cpuS += Number(n.cpu_time) || 0;
         cpuTotal += Number(n.cpu_time) || 0;
       }
       if(n.mem_delta_kb != null){
+        memSamples += 1; row.memSamples += 1;
         const md = Number(n.mem_delta_kb) || 0;
         row.memDeltaKb += md;
         memDeltaNet += md;
@@ -1842,8 +2352,8 @@ class TraceViewerServer:
     const hotspots = [...fnMap.values()]
       .sort((a,b)=> b.totalMs - a.totalMs)
       .slice(0, 12);
-    const cpuHotspots = [...fnMap.values()].sort((a,b)=> b.cpuS - a.cpuS).slice(0, 10);
-    const memHotspots = [...fnMap.values()].sort((a,b)=> b.memDeltaKb - a.memDeltaKb).slice(0, 10);
+    const cpuHotspots = [...fnMap.values()].filter(r=>r.cpuSamples).sort((a,b)=> b.cpuS - a.cpuS).slice(0, 10);
+    const memHotspots = [...fnMap.values()].filter(r=>r.memSamples).sort((a,b)=> b.memDeltaKb - a.memDeltaKb).slice(0, 10);
 
     const errMap = new Map();
     errorNodes.forEach(n=>{
@@ -1855,7 +2365,20 @@ class TraceViewerServer:
     });
     const errorSigs = [...errMap.values()].sort((a,b)=> b.count - a.count).slice(0, 12);
 
-    const generated = generatedAt ? new Date(generatedAt*1000).toLocaleString() : '-';
+    const newestEventAt = sourceState && sourceState.newest_event_at;
+    const newestTraceLabel = newestEventAt ? fmtAgo(newestEventAt) : 'none yet';
+    const newestTraceSub = newestEventAt ? `At ${fmtClock(newestEventAt)}` : 'No trace records read yet';
+    const lastCheckedLabel = lastSuccessAt ? fmtAgo(lastSuccessAt) : 'never';
+    const effectiveConn = effectiveConnState();
+    const lastCheckedSub = !lastSuccessAt
+      ? 'Not connected yet'
+      : ({
+          ok: `Server reachable at ${fmtClock(lastSuccessAt)}`,
+          background: 'Paused while this tab is in the background',
+          stale: 'Not currently polling',
+          retrying: 'Retrying the connection',
+          down: 'Disconnected - this view is frozen'
+        }[effectiveConn] || 'Unknown');
     const metricsGenerated = latestMetrics && latestMetrics.generated_at ? new Date(latestMetrics.generated_at*1000).toLocaleTimeString() : '-';
     const prevMetrics = metrics.length > 1 ? metrics[metrics.length - 2] : null;
     const memModeLabel = memModes.has('peak_rusage') ? 'Peak RSS fallback' : (memModes.has('current_rss') ? 'Current RSS' : 'Unknown');
@@ -1880,7 +2403,7 @@ class TraceViewerServer:
       return {
         calls: nodes.length,
         errors: errs,
-        errorRate: nodes.length ? (errs / nodes.length * 100) : 0,
+        errorRate: nodes.filter(n=>n.status === 'success' || n.status === 'error' || n.error).length ? (errs / nodes.filter(n=>n.status === 'success' || n.status === 'error' || n.error).length * 100) : 0,
         avgMs: d.length ? d.reduce((a,b)=>a+b,0) / d.length : 0,
         p95: percentile(d, 95) || 0,
         cpu
@@ -1907,16 +2430,18 @@ class TraceViewerServer:
       <div class="insight-panel">
         <div class="panel-title">Overview dashboard</div>
         <div class="overview-grid">
-          <div class="overview-card"><div class="overview-label">Last updated ${infoTip('Timestamp of the latest parsed trace data. Use this to confirm the dashboard reflects current logs.')}</div><div class="overview-value">${generated}</div><div class="overview-sub">Live trace snapshot</div></div>
+          <div class="overview-card"><div class="overview-label">Newest trace ${infoTip('Age of the most recent trace record in the log file. This is data freshness: if it stops advancing, the traced application has stopped emitting traces.')}</div><div class="overview-value">${escapeHtml(newestTraceLabel)}</div><div class="overview-sub">${escapeHtml(newestTraceSub)}</div></div>
+          <div class="overview-card"><div class="overview-label">Last checked ${infoTip('When the viewer last reached the server. This is connection health, not data freshness - it advances on every successful poll even when no new traces have arrived.')}</div><div class="overview-value">${escapeHtml(lastCheckedLabel)}</div><div class="overview-sub">${escapeHtml(lastCheckedSub)}</div></div>
           <div class="overview-card"><div class="overview-label">Trace runs ${infoTip('Number of top-level trace roots. Useful for estimating how many independent workflows were captured.')}</div><div class="overview-value">${totalRuns}</div><div class="overview-sub">Top-level root traces</div></div>
           <div class="overview-card"><div class="overview-label">Total calls ${infoTip('Count of all parsed trace nodes (root + nested). Higher values indicate deeper or busier execution paths.')}</div><div class="overview-value">${totalCalls}</div><div class="overview-sub">All nodes parsed</div></div>
-          <div class="overview-card"><div class="overview-label">Success rate ${infoTip('Share of calls with successful completion status. Track this over time for service stability.')}</div><div class="overview-value">${totalCalls ? ((successNodes.length/totalCalls)*100).toFixed(1) : '0.0'}%</div><div class="overview-sub">${successNodes.length} successful calls</div></div>
-          <div class="overview-card"><div class="overview-label">Error rate ${infoTip('Share of calls marked as errors. Rising error rate can indicate regressions or environmental failures.')}</div><div class="overview-value" style="color:#fca5a5;">${errorRate.toFixed(1)}%</div><div class="overview-sub">${errorNodes.length} error calls</div></div>
+          <div class="overview-card"><div class="overview-label">Running now ${infoTip('Calls that have started and not yet reported an end. These are in flight, not failures - their duration and resource metrics are recorded on completion.')}</div><div class="overview-value">${runningNodes.length ? `${runningNodes.length} <span class="running-dot" aria-hidden="true"></span>` : '0'}</div><div class="overview-sub">${oldestRunningStart ? `Oldest running for <span class="elapsed" data-start="${oldestRunningStart}">${escapeHtml(fmtElapsed((Date.now()/1000) - oldestRunningStart))}</span>` : 'No calls in flight'}</div></div>
+          <div class="overview-card"><div class="overview-label">Success rate ${infoTip('Share of FINISHED calls that completed successfully. Calls still running are excluded so in-flight work is never counted as a failure.')}</div><div class="overview-value">${settledCalls ? successRate.toFixed(1) + '%' : '-'}</div><div class="overview-sub">${successNodes.length} of ${settledCalls} finished call${settledCalls === 1 ? '' : 's'}</div></div>
+          <div class="overview-card"><div class="overview-label">Error rate ${infoTip('Share of FINISHED calls that ended in an error. Calls still running are excluded from the denominator.')}</div><div class="overview-value" style="color:#fca5a5;">${settledCalls ? errorRate.toFixed(1) + '%' : '-'}</div><div class="overview-sub">${errorNodes.length} of ${settledCalls} finished call${settledCalls === 1 ? '' : 's'}</div></div>
           <div class="overview-card"><div class="overview-label">Latency p95 / p99 ${infoTip('Tail latency percentiles. p95 and p99 are strong indicators of user-facing slowdowns and outliers.')}</div><div class="overview-value">${p95==null?'-':p95.toFixed(1)} / ${p99==null?'-':p99.toFixed(1)} ms</div><div class="overview-sub">p50 ${p50==null?'-':p50.toFixed(1)} ms</div></div>
-          <div class="overview-card"><div class="overview-label">Trace health ${infoTip('Calls that started but have no end timestamp. Persistent growth may indicate interrupted execution or incomplete logging.')}</div><div class="overview-value">${missingEnd}</div><div class="overview-sub">Calls missing end timestamp</div></div>
+          <div class="overview-card"><div class="overview-label">Trace health ${infoTip('Calls open for more than 5 minutes with no end record; they may still be running. All open calls are counted under "Running now" instead, so live traffic is not reported as a problem.')}</div><div class="overview-value">${missingEnd}</div><div class="overview-sub">${missingEnd ? 'Open over 5 min - may still be running' : 'No calls open over 5 min'}</div></div>
           <div class="overview-card"><div class="overview-label">Calls / min ${infoTip('Throughput estimate over the observed trace span. Useful for capacity monitoring and traffic comparisons.')}</div><div class="overview-value">${callsPerMin ? callsPerMin.toFixed(1) : '-'}</div><div class="overview-sub">Across ${(spanSec/60).toFixed(1)} min window</div></div>
-          <div class="overview-card"><div class="overview-label">CPU total ${infoTip('Sum of recorded CPU time across calls. Helpful for spotting compute-intensive workloads.')}</div><div class="overview-value">${cpuTotal.toFixed(3)}s</div><div class="overview-sub">Tracked across all calls</div></div>
-          <div class="overview-card"><div class="overview-label">Mem delta SUM+ / SUM- / NET ${infoTip(memTipText)}</div><div class="overview-value">${memDeltaPositive.toFixed(0)} / ${Math.abs(memDeltaNegative).toFixed(0)} / ${memDeltaNet.toFixed(0)} KB</div><div class="overview-sub">MAX +${memDeltaMax.toFixed(0)} KB • ${memModeLabel}</div></div>
+          <div class="overview-card"><div class="overview-label">CPU total ${infoTip('Sum of recorded CPU time across calls. Helpful for spotting compute-intensive workloads.')}</div><div class="overview-value">${cpuSamples ? cpuTotal.toFixed(3) + 's' : '-'}</div><div class="overview-sub">Recorded for ${cpuSamples} call${cpuSamples === 1 ? '' : 's'}</div></div>
+          <div class="overview-card"><div class="overview-label">Mem delta SUM+ / SUM- / NET ${infoTip(memTipText)}</div><div class="overview-value">${memSamples ? `${memDeltaPositive.toFixed(0)} / ${Math.abs(memDeltaNegative).toFixed(0)} / ${memDeltaNet.toFixed(0)} KB` : '-'}</div><div class="overview-sub">${memSamples ? `MAX +${memDeltaMax.toFixed(0)} KB • ${memModeLabel}` : 'No recorded memory samples'}</div></div>
           <div class="overview-card"><div class="overview-label">Metrics snapshots ${infoTip('Number of metrics snapshots available. More snapshots improve trend confidence and historical visibility.')}</div><div class="overview-value">${metrics.length}</div><div class="overview-sub">Latest at ${metricsGenerated}</div></div>
           <div class="overview-card">
             <div class="overview-label">Recent 5m calls ${infoTip('Calls started in the most recent 5-minute window relative to the latest trace timestamp in this file. Compare with previous window to gauge momentum.')}</div>
@@ -1953,10 +2478,10 @@ class TraceViewerServer:
                       : `<span class="function-name">${escapeHtml(r.fn)}</span>`;
                     return `
                     <tr>
-                      <td>${fnText}</td>
+                      <td>${fnText}${r.running ? ` <span class="pill running"><span class="running-dot" aria-hidden="true"></span>${r.running}</span>` : ''}</td>
                       <td class="number">${r.calls}</td>
-                      <td class="number">${r.totalMs.toFixed(1)}ms</td>
-                      <td class="number">${r.maxMs.toFixed(1)}ms</td>
+                      <td class="number">${r.completed ? r.totalMs.toFixed(1) + 'ms' : '-'}</td>
+                      <td class="number">${r.completed ? r.maxMs.toFixed(1) + 'ms' : '-'}</td>
                       <td class="number">${r.errors}</td>
                     </tr>
                   `;
@@ -2151,17 +2676,19 @@ class TraceViewerServer:
       const isActive = run.id === selectedRunId;
       const time = run.start_time ? new Date(run.start_time*1000).toLocaleTimeString() : '-';
       const errorBadge = run.error || run.status === 'error' ? '<span class="pill error">error</span>' : '';
+      const runIsRunning = isRunning(run);
       return `
         <div class="run-item ${isActive ? 'active' : ''} ${runCompact ? 'compact' : 'comfy'}" data-action="select-run" data-run-id="${escapeAttr(run.id)}" style="height:${rowH-6}px;">
           ${errorBadge}
+          ${runIsRunning ? runningPill() : ''}
           <div class="grow">
             <div>${escapeHtml(cleanFnName(run.function))}</div>
             ${runCompact ? '' : `<div class="muted">${escapeHtml(run.id)}</div>`}
           </div>
-          <div class="muted">${time}</div>
+          <div class="muted">${runIsRunning ? (elapsedHtml(run) || time) : time}</div>
         </div>
       `;
-    }).join('');
+    }).join('') || (rawRuns.length ? '<div class="muted">No runs match the run search. Clear the run search to see all runs.</div>' : '');
     if(!selectedRunId && rawRuns.length) selectedRunId = rawRuns[0].id;
   }
 
@@ -2222,7 +2749,10 @@ class TraceViewerServer:
       const depthPad = 10 + (depth * 14);
       const isSelected = n.call_id === selectedCallId;
       const hasError = n.error || n.status === 'error';
-      const duration = n.duration != null ? fmtDuration(n.duration) : '-';
+      const running = isRunning(n);
+      // A running call has no duration yet - show live elapsed time instead of a
+      // dash, and never imply the call took 0ms.
+      const duration = running ? (elapsedHtml(n) || 'running') : (n.duration != null ? fmtDuration(n.duration) : '-');
       const shortId = (n.call_id || '-').slice(0, 8);
       const start = n.start_time ? new Date(n.start_time*1000).toLocaleTimeString() : '-';
       return `
@@ -2235,6 +2765,7 @@ class TraceViewerServer:
           <span class="trace-meta">${duration}</span>
           <span class="trace-meta">${start}</span>
           ${hasError ? '<span class="pill error">error</span>' : ''}
+          ${running ? runningPill() : ''}
         </div>
       `;
     }).join('') || '<div class="muted">No trace nodes found for current filters.</div>';
@@ -2252,6 +2783,7 @@ class TraceViewerServer:
     const kwargs = node.kwargs_preview!=null ? JSON.stringify(node.kwargs_preview, null, 2) : '-';
     const result = node.result_preview!=null ? JSON.stringify(node.result_preview, null, 2) : '-';
     const hasError = !!(node.error || node.status === 'error');
+    const running = isRunning(node);
     const relatedLogs = logs.filter(l=>l.call_id && l.call_id === node.call_id).slice(0, 12);
     const error = node.error ? `
       <div class="detail-error">
@@ -2263,11 +2795,14 @@ class TraceViewerServer:
       <div class="detail-block">
         <div class="detail-title ${hasError ? 'error' : ''}">Overview</div>
         <div class="kv"><strong>Function:</strong> ${escapeHtml(cleanFnName(node.function || '-'))}</div>
-        <div class="kv ${hasError ? 'error-kv' : ''}"><strong>Status:</strong> ${escapeHtml(node.status || '-')}</div>
+        <div class="kv ${hasError ? 'error-kv' : ''}"><strong>Status:</strong> ${escapeHtml(node.status || '-')} ${running ? runningPill() : ''}</div>
         <div class="kv"><strong>Call ID:</strong> ${escapeHtml(node.call_id || '-')}</div>
         <div class="kv"><strong>Parent ID:</strong> ${escapeHtml(node.parent_id || '-')}</div>
-        <div class="kv"><strong>Start:</strong> ${fmtTime(node.start_time)} • <strong>End:</strong> ${fmtTime(node.end_time)}</div>
-        <div class="kv"><strong>Duration:</strong> ${fmtDuration(node.duration)} • <strong>CPU:</strong> ${fmt(node.cpu_time)}s • <strong>MemΔ:</strong> ${node.mem_delta_kb ?? '-'} • <strong>Mem mode:</strong> ${escapeHtml(node.mem_mode || '-')}</div>
+        <div class="kv"><strong>Start:</strong> ${fmtTime(node.start_time)} • <strong>End:</strong> ${running ? 'in progress' : fmtTime(node.end_time)}</div>
+        ${running
+          ? `<div class="kv"><strong>Elapsed:</strong> ${elapsedHtml(node) || '-'} • <strong>CPU:</strong> pending • <strong>Mem&#916;:</strong> pending • <strong>Mem mode:</strong> ${escapeHtml(node.mem_mode || 'pending')}</div>
+             <div class="kv muted">Resource metrics are recorded when the call completes. Blank values here are not zero.</div>`
+          : `<div class="kv"><strong>Duration:</strong> ${fmtDuration(node.duration)} • <strong>CPU:</strong> ${node.cpu_time == null ? '-' : fmt(node.cpu_time) + 's'} • <strong>Mem&#916;:</strong> ${node.mem_delta_kb ?? '-'} • <strong>Mem mode:</strong> ${escapeHtml(node.mem_mode || '-')}</div>`}
         ${error}
       </div>
       <div class="detail-block"><div class="detail-title">Args</div><div class="kv">${escapeHtml(args)}</div></div>
@@ -2327,6 +2862,20 @@ class TraceViewerServer:
     const activeTree = currentTree();
     overviewEl.innerHTML = '';
 
+    // A dashboard of zeroes explains nothing. When there is no data to show,
+    // say what the viewer is waiting for and suppress the empty panels.
+    const visibleCount = insightTab === 'logs' ? filteredLogs().length : flattenNodes(tree).filter(n=>matchesNode(n, q)).length;
+    const showingEmptyState = renderEmptyState(visibleCount);
+    const noDataAtAll = !total;
+    if(rootEl) rootEl.classList.toggle('hidden-panel', showingEmptyState && noDataAtAll);
+    if(traceSettingsEl) traceSettingsEl.classList.toggle('hidden-panel', showingEmptyState && noDataAtAll);
+    if(splitLayoutEl && showingEmptyState && noDataAtAll) splitLayoutEl.classList.add('hidden-panel');
+    if(showingEmptyState && noDataAtAll){
+      renderStatusBar();
+      saveState();
+      return;
+    }
+
     const overviewPanel = insightTab === 'overview' ? buildOverviewPanel() : '';
     const metricsPanel = insightTab === 'metrics' ? buildMetricsPanel() : '';
     const flamePanel = insightTab === 'flame' ? buildFlameGraph(activeTree, q) : '';
@@ -2380,10 +2929,12 @@ class TraceViewerServer:
       renderLogsRows();
     }
     restoreUiScrollState();
+    renderStatusBar();
     saveState();
   }
 
   function renderLogsOnly(){
+    renderEmptyState(filteredLogs().length);
     const shell = document.getElementById('logs-panel-shell');
     if(!shell) return;
     snapshotPayloadTreeState();
@@ -2407,31 +2958,63 @@ class TraceViewerServer:
     saveState();
   }
 
-  async function fetchTree(){
+  async function fetchJson(url){
+    const controller = new AbortController();
+    const timeout = setTimeout(()=>controller.abort(), 8000);
+    try {
+      const res = await fetch(url, { cache: 'no-store', signal: controller.signal });
+      if(!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } finally { clearTimeout(timeout); }
+  }
+
+  async function fetchTree(forceLogs=false){
     if(fetchTreeInFlight) return;
     fetchTreeInFlight = true;
+    const revision = viewRevision;
     try {
-    const shouldFetchLogs = (insightTab === 'logs') || logs.length === 0 || (logsFetchCounter % 3 === 0);
+    const shouldFetchLogs = forceLogs || (insightTab === 'logs') || logs.length === 0 || (logsFetchCounter % 3 === 0);
     logsFetchCounter += 1;
-    const [treeRes, logsRes] = await Promise.all([
-      fetch('/api/tree'),
-      shouldFetchLogs ? fetch('/api/logs?limit=2500&preview=1800') : Promise.resolve(null)
+    const [data, logsData] = await Promise.all([
+      fetchJson('/api/tree'),
+      shouldFetchLogs ? fetchJson('/api/logs?limit=2500&preview=1800') : Promise.resolve(null)
     ]);
-    const data = await treeRes.json();
-    const logsData = logsRes ? await logsRes.json() : null;
+    if(revision !== viewRevision) return;
+    consecutiveFailures = 0;
+    lastSuccessAt = Date.now()/1000;
+    sourceState = data.source || sourceState;
+    setConnState('ok', null);
+    if(sourceState.read_error) { renderEmptyState(1); return; }
+    if(snapshotGeneration && snapshotGeneration !== sourceState.generation){
+      logs = []; fullPayloadCache.clear(); selectedLogId = null;
+      selectedCallId = null; selectedRunId = null;
+    }
+    snapshotGeneration = sourceState.generation;
+    snapshotCalls = sourceState.calls_started || 0;
+    snapshotAt = Date.now()/1000;
     tree = data.roots || [];
-    if(logsData){
+    if(logsData && logsData.generation === snapshotGeneration){
+      logsGeneration = logsData.generation;
       logs = logsData.logs || [];
       fullPayloadCache.clear();
       logsGeneratedAt = logsData.generated_at || null;
       logsVersion += 1;
     }
     total = data.total_nodes || 0;
+    liveNodeCount = snapshotCalls;
+    // Restored a paused session: anchor the "new calls" count to what is shown.
+    if(!autoRefreshEnabled){
+      pausedBaselineNodes = snapshotCalls;
+      pausedGeneration = snapshotGeneration;
+    }
     metrics = data.metrics || [];
     generatedAt = data.generated_at || null;
     rebuildCallToRunMap();
     renderFnTypeOptions();
-    metaEl.textContent = `${generatedAt ? new Date(generatedAt*1000).toLocaleString() : ''} • ${data.log_file} • ${total} nodes • ${logs.length} logs`;
+    // Times live in the status bar, where "last checked" and "newest trace" are
+    // reported separately. Keep this line to identifying facts only.
+    metaEl.textContent = `${data.log_file} • ${total} nodes • ${logs.length} logs${data.display_depth_limited ? ' • deep hierarchy split into sections at 150 levels' : ''}${sourceState.count_is_estimate ? ' • earlier record count is estimated' : ''}`;
+    metaEl.title = data.log_file || '';
     if(!selectedRunId && tree.length) selectedRunId = tree[0].call_id || null;
     const runStillExists = selectedRunId ? !!getRunNode(selectedRunId) : false;
     if(!runStillExists && tree.length){
@@ -2440,11 +3023,20 @@ class TraceViewerServer:
     }
     if(insightTab === 'logs' && document.getElementById('logs-panel-shell')){
       renderLogsOnly();
+      renderEmptyState(filteredLogs().length);
     } else {
       render();
     }
+    } catch (err) {
+      // Never leave a stale view silently claiming to be current. Keep the last
+      // good snapshot on screen, but say plainly that it is no longer live.
+      consecutiveFailures += 1;
+      const message = (err && err.message) ? err.message : String(err);
+      setConnState(consecutiveFailures >= 3 ? 'down' : 'retrying', message);
+      if(consecutiveFailures >= 3) renderEmptyState(1);
     } finally {
       fetchTreeInFlight = false;
+      if(revision !== viewRevision && autoRefreshEnabled) fetchTree();
     }
   }
 
@@ -2476,9 +3068,14 @@ class TraceViewerServer:
   async function loadLogPayload(logId){
     const key = String(logId);
     if(fullPayloadCache.has(key)) return;
-    const res = await fetch(`/api/logs/payload?id=${encodeURIComponent(key)}`);
-    if(!res.ok) return;
-    const data = await res.json();
+    const generation = logsGeneration;
+    let data;
+    try { data = await fetchJson(`/api/logs/payload?id=${encodeURIComponent(key)}&generation=${encodeURIComponent(generation)}`); } catch (err) {
+      const detail = document.getElementById('logs-panel-title');
+      if(detail) detail.textContent = 'Payload unavailable; refresh after log rotation or reconnect.';
+      return;
+    }
+    if(generation !== logsGeneration) return;
     fullPayloadCache.set(key, data);
     render();
   }
@@ -2639,7 +3236,7 @@ class TraceViewerServer:
   });
 
   searchEl.addEventListener('input', render);
-  refreshBtn.addEventListener('click', fetchTree);
+  refreshBtn.addEventListener('click', ()=>fetchTree(true));
   minDurationEl.addEventListener('input', (e)=>{ minDurationMs = Number(e.target.value || 0); render(); });
   fnTypeEl.addEventListener('change', (e)=>{ fnTypeFilter = e.target.value || 'all'; render(); });
   sortModeEl.addEventListener('change', (e)=>{ sortMode = e.target.value || 'start'; render(); });
@@ -2648,10 +3245,31 @@ class TraceViewerServer:
   runGroupEl.addEventListener('change', (e)=>{ runGroupBy = e.target.value || 'none'; renderRuns(); saveState(); });
   runCompactEl.addEventListener('change', (e)=>{ runCompact = !!e.target.checked; renderRuns(); saveState(); });
   autoRefreshEl.addEventListener('change', (e)=>{
+    viewRevision += 1;
     autoRefreshEnabled = !!e.target.checked;
-    if(autoRefreshEnabled) scheduleRefresh(true); else if(refreshTimer) clearInterval(refreshTimer);
+    if(autoRefreshEnabled){
+      // Resuming: drop the baseline and catch up immediately.
+      pausedBaselineNodes = null;
+      scheduleRefresh(true);
+    } else {
+      // Pausing freezes the view only. The server keeps reading the log and the
+      // traced application keeps writing to it; we remember where we paused so
+      // we can report how much arrived in the meantime.
+      pausedBaselineNodes = snapshotCalls;
+      pausedGeneration = snapshotGeneration;
+      snapshotAt = Date.now()/1000;
+      liveNodeCount = snapshotCalls;
+    }
+    renderStatusBar();
     saveState();
   });
+  if(retryNowEl){
+    retryNowEl.addEventListener('click', ()=>{
+      consecutiveFailures = 0;
+      setConnState('retrying', lastFetchError);
+      if(autoRefreshEnabled) fetchTree(); else pollStatusOnly();
+    });
+  }
   focusModeEl.addEventListener('change', (e)=>{ focusMode = e.target.value || 'all'; render(); });
   depthLimitEl.addEventListener('input', (e)=>{ depthLimit = Math.max(0, Number(e.target.value || 0)); render(); });
   expandDepthEl.addEventListener('click', ()=>{ depthLimit = Math.min(999, depthLimit + 1); depthLimitEl.value = depthLimit; render(); });
@@ -2681,11 +3299,35 @@ class TraceViewerServer:
     }
   });
 
+  // Polled while the view is paused: keeps connection state honest and counts
+  // calls arriving in the background, without disturbing the frozen view.
+  async function pollStatusOnly(){
+    if(statusInFlight) return;
+    statusInFlight = true;
+    const revision = viewRevision;
+    try {
+      const data = await fetchJson('/api/status');
+      if(revision !== viewRevision) return;
+      consecutiveFailures = 0;
+      lastSuccessAt = Date.now()/1000;
+      sourceState = data.source || sourceState;
+      liveNodeCount = sourceState.calls_started || 0;
+      setConnState('ok', null);
+    } catch (err) {
+      consecutiveFailures += 1;
+      const message = (err && err.message) ? err.message : String(err);
+      setConnState(consecutiveFailures >= 3 ? 'down' : 'retrying', message);
+    } finally { statusInFlight = false; }
+  }
+
   function scheduleRefresh(immediate=false){
     if(refreshTimer) clearInterval(refreshTimer);
-    if(!autoRefreshEnabled) return;
-    refreshTimer = setInterval(()=>{ if(autoRefreshEnabled && !document.hidden) fetchTree(); }, 2500);
-    if(immediate) fetchTree();
+    refreshTimer = setInterval(()=>{
+      if(document.hidden) return;
+      // Paused stops rendering, not monitoring.
+      if(autoRefreshEnabled) fetchTree(); else pollStatusOnly();
+    }, 2500);
+    if(immediate) fetchTree(true);
   }
 
   window.addEventListener('resize', ()=>{
@@ -2695,20 +3337,83 @@ class TraceViewerServer:
     }
   });
 
+  // Re-poll as soon as the tab is visible again so a backgrounded viewer does
+  // not sit on stale data while claiming to be connected.
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.hidden) return;
+    if(autoRefreshEnabled) fetchTree(); else pollStatusOnly();
+  });
+
   loadState();
   syncControlState();
+  renderStatusBar();
   fetchTree();
   scheduleRefresh();
+  // Relative times and running-call elapsed counters advance every second
+  // independently of network polling.
+  statusTicker = setInterval(tickLiveUi, 1000);
 })();
             """
         ).strip()
 
-    def serve_forever(self) -> None:
-        self._httpd = ThreadingHTTPServer((self.host, self.port), self._handler_factory())
-        print(f"PyEzTrace Viewer serving on http://{self.host}:{self.port} (reading {self.log_file})")
+    @property
+    def url(self) -> str:
+        # 0.0.0.0 is a bind address, not something a browser can open.
+        host = '127.0.0.1' if self.host in ('0.0.0.0', '::', '') else self.host
+        if ':' in host and not host.startswith('['):
+            host = f'[{host}]'
+        return f'http://{host}:{self.port}'
+
+    def _open_browser(self) -> None:
+        """Open the viewer in a browser once the server is accepting connections."""
+        import webbrowser
+        try:
+            webbrowser.open_new_tab(self.url)
+        except Exception as exc:  # pragma: no cover - platform dependent
+            print(f"Could not open a browser automatically ({exc}). Open {self.url} manually.", file=sys.stderr)
+
+    def serve_forever(self, open_browser: bool = False) -> None:
+        try:
+            self._httpd = ThreadingHTTPServer((self.host, self.port), self._handler_factory())
+            self.port = self._httpd.server_address[1]
+        except OSError as exc:
+            import errno
+            if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+                if exc.errno == errno.EADDRINUSE:
+                    print(
+                        f"Error: port {self.port} on {self.host} is already in use.\n"
+                        f"       Another viewer may already be running at {self.url}.\n"
+                        f"       Use a different port:  pyeztrace serve {shlex.quote(str(self.log_file))} --port {self.port + 1 if self.port < 65535 else 8765}",
+                        file=sys.stderr
+                    )
+                else:
+                    print(
+                        f"Error: not allowed to bind {self.host}:{self.port}.\n"
+                        f"       Ports below 1024 usually require elevated privileges; "
+                        f"try --port 8765.", file=sys.stderr
+                    )
+                raise SystemExit(1)
+            raise
+
+        source = self._builder.source_state()
+        print(f"PyEzTrace Viewer serving on {self.url} (reading {self.log_file})", flush=True)
+        if source['status'] == 'missing_file':
+            print(f"  Waiting for {self.log_file} to appear - the viewer will pick it up automatically.")
+        elif source['status'] in ('empty_file', 'no_records'):
+            print("  Log file is empty so far. Waiting for the first trace record.")
+        elif source['status'] == 'unparsable':
+            print(
+                f"  Warning: {source['unparsed_lines']} line(s) read, none are JSON trace records.\n"
+                f"           Set EZTRACE_FILE_LOG_FORMAT=json in the traced app and restart it."
+            )
+        print("  Press Ctrl+C to stop.", flush=True)
+
+        if open_browser:
+            threading.Timer(0.3, self._open_browser).start()
+
         try:
             self._httpd.serve_forever()
         except KeyboardInterrupt:
-            pass
+            print("\nViewer stopped.")
         finally:
             self._httpd.server_close()

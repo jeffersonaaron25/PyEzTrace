@@ -100,19 +100,81 @@ Per-sink: set `console_format` and `file_format` via `Setup.initialize(..., cons
 
 ## Interactive viewer
 
-1. Enable JSON file logging (e.g. `Setup.initialize(..., file_format="json", disable_file_logging=False)`).
-2. Run your app to produce logs.
-3. Start the viewer:
+1. Enable JSON file logging for your instrumented application:
 
 ```bash
-pyeztrace serve logs/app.log --host 127.0.0.1 --port 8765
+export EZTRACE_DISABLE_FILE_LOGGING=0
+export EZTRACE_FILE_LOG_FORMAT=json
+export EZTRACE_LOG_FILE="$PWD/logs/app.log"
 ```
 
-Open `http://127.0.0.1:8765`. You get:
+Or initialize explicitly with `Setup.initialize("MyApp", log_dir="logs", log_file="app.log", file_format="json", disable_file_logging=False)`.
+
+2. Start the viewer — you can do this *before* the app runs:
+
+```bash
+pyeztrace serve logs/app.log --open
+```
+
+`--open` launches your default browser once the server is listening. The log
+file does not need to exist yet: the viewer explains what it is waiting for and
+starts rendering automatically as soon as trace records appear, so the usual
+workflow is to leave it running in one terminal and start and restart your app
+in another.
+
+3. Run your app to produce logs.
+
+You get:
 
 - Hierarchical tree (parent/child calls)
 - Input/output previews, duration, CPU, memory
 - Filters (function, error, min duration), auto-refresh
+
+### Reading the live status bar
+
+The header always shows two independent facts. They are deliberately not merged
+into a single "last updated" value, because they answer different questions:
+
+| Indicator | Meaning |
+|-----------|---------|
+| **Connection state** | `Connected`, `Reconnecting`, `Disconnected`, or `Paused - tab in background`. If the viewer cannot reach the server, the last snapshot stays on screen and is labelled stale rather than silently presented as current. |
+| **Last checked** | When the viewer last reached the server. This is connection health; it advances on every successful poll even when no new traces arrive. |
+| **Newest trace** | Age of the most recent record in the log file. This is data freshness. If it stops advancing, your application has stopped emitting traces. |
+
+An inactive log does not prove the application stopped — it only means no new
+records have been written. The viewer reports what it can actually observe.
+
+### Calls that are still running
+
+A call that has started but not finished is shown with a **running** badge and a
+live elapsed timer instead of a duration. Its CPU and memory values read
+`pending`, never `0`, because those are only recorded on completion. Running
+calls are excluded from success and error rates so in-flight work is never
+counted as a failure; they appear under **Running now** instead.
+
+### Pausing
+
+The **Auto refresh** toggle pauses the *view* only. Your application keeps
+running and the viewer keeps reading the log; while paused the status bar
+reports how many new calls arrived but are not being shown. Selection, scroll
+position and filters are preserved when you resume — including across a restart
+of the viewer itself, since the log is identified by its contents rather than by
+the server process. Elapsed timers freeze while paused or disconnected, dimmed
+and marked with a pause glyph; a frozen timer shows the elapsed time as of the
+last successful read and never counts past it. Retry checks the connection
+without resuming a paused view; the Refresh button explicitly loads a new
+snapshot. Log replacement or truncation prompts you to resume rather than
+reporting a misleading call count.
+A start record without an end record cannot prove a process is alive: calls open
+for over five minutes are labeled as possibly still running.
+
+### When the dashboard is empty
+
+Instead of a grid of zeroes, the viewer names the reason and what to do next. It
+distinguishes four cases: the log file does not exist yet, it exists but has no
+records yet, it has content that is not JSON trace output (usually
+`EZTRACE_FILE_LOG_FORMAT` was set to a text format), and records exist but the current filters
+hide all of them.
 
 > **Note:** The trace viewer UI (`pyeztrace serve`) is designed for **local development and analysis**—it is **not** intended to be used as a hosted or production solution.
 
@@ -245,10 +307,19 @@ Same options as per-decorator `redact_keys`, `redact_pattern`, `redact_value_pat
 **Viewer:**
 
 ```bash
-pyeztrace serve logs/app.log --host 127.0.0.1 --port 8765
+pyeztrace serve logs/app.log --host 127.0.0.1 --port 8765 --open
 ```
 
+| Flag | Description |
+|------|-------------|
+| `--host` | Bind address (default `127.0.0.1`) |
+| `--port` | Port (default `8765`); a clash reports the conflict and suggests another port |
+| `--open` | Open the viewer in your default browser once the server is listening |
+
 Optional env: `EZTRACE_VIEW_HOST`, `EZTRACE_VIEW_PORT`.
+
+The log file may be missing when the viewer starts; it will wait for it and say
+so both in the terminal and in the browser.
 
 **Print / analyze logs:**
 
@@ -314,3 +385,47 @@ print(otel.get_otel_status())
 ```
 
 `otel.get_otel_status()` is available in newer builds after `0.1.1`.
+
+## Scripted and agent-driven CLI use
+
+Commands are non-interactive; `serve` only opens a browser with `--open`.
+Use explicit subcommands and `--format json` to consume one JSON value on stdout:
+
+```bash
+pyeztrace print logs/app.log --format json > records.json
+pyeztrace print logs/app.log --analyze --since 2026-09-01 --format json > metrics.json
+pyeztrace print logs/app.log --errors --until 2026-10-01 --context order_id=123 --format json
+pyeztrace print logs/app.log --analyze --function process_order --format json
+```
+
+Date, level, and context filters apply to all three modes. Context values match
+strings exactly; values may contain `=`. Dates without time zones use local time.
+`--analyze` and `--errors` are mutually exclusive; `--function` requires `--analyze`.
+Empty matches are successful results (`[]` or `{}`), including an error search
+with no matching errors. Error records in the input do not change the exit code.
+
+| Exit code | Meaning |
+|-----------|---------|
+| 0 | Command succeeded, including no matches |
+| 1 | File access or server startup failed |
+| 2 | Invalid arguments or configuration |
+
+Diagnostics go to stderr; successful JSON output goes to stdout. Text uses
+`--color auto` by default (no ANSI when redirected or when `NO_COLOR` is set).
+Use `--color always` or `--color never` to override. JSON is always uncolored.
+A missing source is allowed for `serve`, which waits for it, but fails for `print`.
+Invalid log lines are skipped; the viewer reports their count. JSON output shapes
+remain the existing record list or function-to-metrics mapping.
+
+### Future CLI improvements
+
+Later work should add versioned output schemas and structured error envelopes,
+explicit tree/call/payload inspection commands, bounded output with cursor-based
+pagination, stdin and JSONL streaming, a doctor command, and optional CI failure
+predicates. A combined application/viewer launcher needs deliberate process and
+signal handling. These are proposals, not flags in this release.
+
+The current conventions follow the [Command Line Interface Guidelines](https://clig.dev/)
+for machine-readable output, stderr diagnostics, terminal-aware color, and
+non-interactive use, and [Python argparse](https://docs.python.org/3/library/argparse.html)
+for usage errors and argument validation.
