@@ -1,6 +1,7 @@
 import contextvars
 import fnmatch
 import inspect
+import math
 import os
 import random
 import re
@@ -19,6 +20,7 @@ except Exception:
 from pyeztrace.setup import Setup
 from pyeztrace.custom_logging import Logging
 from pyeztrace.otel import start_span, record_exception, is_enabled
+from pyeztrace.config import config
 
 # Marker attribute for wrapped functions
 _TRACED_ATTRIBUTE = '_pyeztrace_wrapped'
@@ -133,11 +135,23 @@ def _build_redaction_settings(
     return None
 
 
+_sentinel = object()
+_cached_env_redaction = None
+_cached_env_version = _sentinel
+
 def _redaction_from_env() -> Optional[RedactionSettings]:
-    keys_env = os.environ.get("EZTRACE_REDACT_KEYS")
-    pattern_env = os.environ.get("EZTRACE_REDACT_PATTERN")
-    value_patterns_env = os.environ.get("EZTRACE_REDACT_VALUE_PATTERNS")
-    presets_env = os.environ.get("EZTRACE_REDACT_PRESETS")
+    global _cached_env_redaction, _cached_env_version
+    env_keys = (
+        os.environ.get("EZTRACE_REDACT_KEYS"),
+        os.environ.get("EZTRACE_REDACT_PATTERN"),
+        os.environ.get("EZTRACE_REDACT_VALUE_PATTERNS"),
+        os.environ.get("EZTRACE_REDACT_PRESETS")
+    )
+    if _cached_env_version == env_keys:
+        return _cached_env_redaction
+
+    _cached_env_version = env_keys
+    keys_env, pattern_env, value_patterns_env, presets_env = env_keys
 
     keys = None
     if keys_env:
@@ -151,7 +165,8 @@ def _redaction_from_env() -> Optional[RedactionSettings]:
     if presets_env:
         presets = [p.strip() for p in presets_env.split(",") if p.strip()]
 
-    return _build_redaction_settings(keys, pattern_env, value_patterns, presets)
+    _cached_env_redaction = _build_redaction_settings(keys, pattern_env, value_patterns, presets)
+    return _cached_env_redaction
 
 
 _global_redaction_override: Optional[RedactionSettings] = None
@@ -197,6 +212,18 @@ def _resolve_redaction(
     return _redaction_from_env()
 
 
+def _get_start_cpu() -> Optional[float]:
+    if getattr(config, "disable_resource_metrics", False):
+        return None
+    return time.process_time()
+
+
+def _get_cpu_time(start_cpu: Optional[float]) -> Optional[float]:
+    if start_cpu is None or getattr(config, "disable_resource_metrics", False):
+        return None
+    return time.process_time() - start_cpu
+
+
 def _get_current_rss_snapshot() -> tuple[Optional[int], str]:
     """Best-effort RSS snapshot with measurement mode metadata.
 
@@ -204,6 +231,8 @@ def _get_current_rss_snapshot() -> tuple[Optional[int], str]:
     ``resource.getrusage`` (which reports the historical peak) if reading from
     /proc is not possible.
     """
+    if getattr(config, "disable_resource_metrics", False):
+        return None, "disabled"
 
     try:
         # On Windows, os.sysconf is not available and raises AttributeError.
@@ -308,11 +337,11 @@ def _safe_to_wrap(obj):
     # Check if already wrapped
     if hasattr(obj, _TRACED_ATTRIBUTE):
         return False
-    
+
     # Early return for None value
     if obj is None:
         return False
-        
+
     # Only wrap python-level functions / coroutines / builtins / methods, skip everything else
     return (
         inspect.isfunction(obj)
@@ -450,7 +479,7 @@ def _parse_sample_rate(value: Any, source: str, default: float = 1.0) -> float:
     except (TypeError, ValueError):
         warnings.warn(f"Ignoring invalid {source}={value!r}; expected float in [0.0, 1.0].")
         return default
-    if parsed < 0.0 or parsed > 1.0:
+    if not math.isfinite(parsed) or parsed < 0.0 or parsed > 1.0:
         warnings.warn(f"Ignoring invalid {source}={value!r}; expected float in [0.0, 1.0].")
         return default
     return parsed
@@ -463,7 +492,7 @@ def _parse_sample_rate_override(sample_rate: Optional[float]) -> Optional[float]
         parsed = float(sample_rate)
     except (TypeError, ValueError) as exc:
         raise ValueError("trace(sample_rate=...) must be a float in [0.0, 1.0].") from exc
-    if parsed < 0.0 or parsed > 1.0:
+    if not math.isfinite(parsed) or parsed < 0.0 or parsed > 1.0:
         raise ValueError("trace(sample_rate=...) must be a float in [0.0, 1.0].")
     return parsed
 
@@ -483,7 +512,7 @@ def _parse_non_negative_float_override(name: str, value: Optional[float]) -> Opt
         parsed = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"trace({name}=...) must be a float >= 0.0.") from exc
-    if parsed < 0.0:
+    if not math.isfinite(parsed) or parsed < 0.0:
         raise ValueError(f"trace({name}=...) must be a float >= 0.0.")
     return parsed
 
@@ -495,37 +524,61 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+_cached_sample_rate = 1.0
+_cached_sample_rate_env = _sentinel
+
 def _resolve_sample_rate(local_sample_rate: Optional[float]) -> float:
     if local_sample_rate is not None:
         return local_sample_rate
-    return _parse_sample_rate(os.environ.get(_SAMPLE_RATE_ENV), _SAMPLE_RATE_ENV, default=1.0)
+    global _cached_sample_rate, _cached_sample_rate_env
+    env_val = os.environ.get(_SAMPLE_RATE_ENV)
+    if env_val != _cached_sample_rate_env:
+        _cached_sample_rate_env = env_val
+        _cached_sample_rate = _parse_sample_rate(env_val, _SAMPLE_RATE_ENV, default=1.0)
+    return _cached_sample_rate
 
+
+_cached_adaptive_sampling = False
+_cached_adaptive_sampling_env = _sentinel
 
 def _resolve_adaptive_sampling(local_adaptive_sampling: Optional[bool]) -> bool:
     if local_adaptive_sampling is not None:
         return local_adaptive_sampling
-    return _env_bool(_ADAPTIVE_SAMPLING_ENV, default=False)
+    global _cached_adaptive_sampling, _cached_adaptive_sampling_env
+    env_val = os.environ.get(_ADAPTIVE_SAMPLING_ENV)
+    if env_val != _cached_adaptive_sampling_env:
+        _cached_adaptive_sampling_env = env_val
+        _cached_adaptive_sampling = _env_bool(_ADAPTIVE_SAMPLING_ENV, default=False)
+    return _cached_adaptive_sampling
 
+
+_cached_slow_threshold = _DEFAULT_ADAPTIVE_SLOW_THRESHOLD_SECONDS
+_cached_slow_threshold_env = _sentinel
 
 def _resolve_adaptive_slow_threshold(local_threshold: Optional[float]) -> float:
     if local_threshold is not None:
         return local_threshold
-    value = os.environ.get(_ADAPTIVE_SLOW_THRESHOLD_ENV)
-    if value is None:
-        return _DEFAULT_ADAPTIVE_SLOW_THRESHOLD_SECONDS
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        warnings.warn(
-            f"Ignoring invalid {_ADAPTIVE_SLOW_THRESHOLD_ENV}={value!r}; expected float >= 0.0."
-        )
-        return _DEFAULT_ADAPTIVE_SLOW_THRESHOLD_SECONDS
-    if parsed < 0.0:
-        warnings.warn(
-            f"Ignoring invalid {_ADAPTIVE_SLOW_THRESHOLD_ENV}={value!r}; expected float >= 0.0."
-        )
-        return _DEFAULT_ADAPTIVE_SLOW_THRESHOLD_SECONDS
-    return parsed
+    global _cached_slow_threshold, _cached_slow_threshold_env
+    env_val = os.environ.get(_ADAPTIVE_SLOW_THRESHOLD_ENV)
+    if env_val != _cached_slow_threshold_env:
+        _cached_slow_threshold_env = env_val
+        if env_val is None:
+            _cached_slow_threshold = _DEFAULT_ADAPTIVE_SLOW_THRESHOLD_SECONDS
+        else:
+            try:
+                parsed = float(env_val)
+            except (TypeError, ValueError):
+                warnings.warn(
+                    f"Ignoring invalid {_ADAPTIVE_SLOW_THRESHOLD_ENV}={env_val!r}; expected float >= 0.0."
+                )
+                parsed = _DEFAULT_ADAPTIVE_SLOW_THRESHOLD_SECONDS
+            if not math.isfinite(parsed) or parsed < 0.0:
+                warnings.warn(
+                    f"Ignoring invalid {_ADAPTIVE_SLOW_THRESHOLD_ENV}={env_val!r}; expected float >= 0.0."
+                )
+                parsed = _DEFAULT_ADAPTIVE_SLOW_THRESHOLD_SECONDS
+            _cached_slow_threshold = parsed
+    return _cached_slow_threshold
 
 
 def _decide_sampling_mode(sample_rate: float, adaptive: bool) -> str:
@@ -630,76 +683,106 @@ def _finalize_sampling_scope(
 class trace_children_in_module:
     """
     Context manager to monkey-patch all functions in a module (or class) with a child-tracing decorator.
-    Robust for concurrent tracing: uses per-thread and per-coroutine reference counting and locking.
+    Robust for concurrent tracing: uses a global reference counter and registry to coordinate patching.
     Only active when tracing_active is True.
     """
-    _thread_local = threading.local()
-    _coroutine_local = contextvars.ContextVar("trace_patch_ref", default=None)
+    _global_patches: Dict[int, Dict[str, Any]] = {}
+    _global_lock = threading.Lock()
 
     def __init__(self, module_or_class: Any, child_decorator: Callable[[Callable[..., Any]], Callable[..., Any]]) -> None:
         self.module_or_class = module_or_class
         self.child_decorator = child_decorator
         self.originals: Dict[str, Callable[..., Any]] = {}
-        self._is_thread = threading.current_thread() is not None
-
-    def _get_ref_counter(self) -> dict:
-        # Prefer coroutine-local if inside a coroutine, else thread-local
-        try:
-            # If running in an event loop, use contextvar
-            import asyncio
-            if asyncio.get_event_loop().is_running():
-                ref = trace_children_in_module._coroutine_local.get()
-                if ref is None:
-                    ref = {}
-                    trace_children_in_module._coroutine_local.set(ref)
-                return ref
-        except Exception:
-            pass
-        # Fallback to thread-local
-        if not hasattr(trace_children_in_module._thread_local, "ref"):
-            trace_children_in_module._thread_local.ref = {}
-        return trace_children_in_module._thread_local.ref
 
     def __enter__(self) -> None:
-        ref_counter = self._get_ref_counter()
         key = id(self.module_or_class)
-        if key not in ref_counter:
-            # First entry for this context: patch
-            ref_counter[key] = 1
-            
-            # Different handling for modules vs classes
-            if isinstance(self.module_or_class, types.ModuleType):
-                # For modules, use __dict__ directly
-                items = self.module_or_class.__dict__.items()
+        with trace_children_in_module._global_lock:
+            if key not in trace_children_in_module._global_patches:
+                # First entry globally: patch and record originals
+                originals = {}
+
+                # Different handling for modules vs classes
+                is_module = isinstance(self.module_or_class, types.ModuleType)
+                if is_module:
+                    # For modules, use __dict__ directly
+                    items = list(self.module_or_class.__dict__.items())
+                else:
+                    # For classes, we need to get all attributes including methods
+                    items = []
+                    # Add regular attributes
+                    for name, obj in self.module_or_class.__dict__.items():
+                        items.append((name, obj))
+
+                    # Get all special methods we want to trace
+                    special_methods = ["__call__", "__init__", "__str__", "__repr__",
+                                      "__eq__", "__lt__", "__gt__", "__le__", "__ge__"]
+
+                    # Add any missing special methods
+                    for name in special_methods:
+                        if hasattr(self.module_or_class, name) and name not in self.module_or_class.__dict__:
+                            items.append((name, getattr(self.module_or_class, name)))
+
+                # Now patch all applicable items
+                try:
+                    for name, obj in items:
+                        # Skip special methods that shouldn't be traced for classes
+                        if not is_module:
+                            if name.startswith('__') and name not in ['__init__', '__call__']:
+                                continue
+
+                        descriptor_type = None
+                        original_callable = None
+                        extra_descriptor_attrs = {}
+
+                        if isinstance(obj, staticmethod):
+                            original_callable = obj.__func__
+                            descriptor_type = staticmethod
+                            if hasattr(obj, "__isabstractmethod__"):
+                                extra_descriptor_attrs["__isabstractmethod__"] = obj.__isabstractmethod__
+                        elif isinstance(obj, classmethod):
+                            original_callable = obj.__func__
+                            descriptor_type = classmethod
+                            if hasattr(obj, "__isabstractmethod__"):
+                                extra_descriptor_attrs["__isabstractmethod__"] = obj.__isabstractmethod__
+                        elif _safe_to_wrap(obj):
+                            original_callable = obj
+                        else:
+                            continue
+
+                        if original_callable is None or not _safe_to_wrap(original_callable) or hasattr(original_callable, _TRACED_ATTRIBUTE):
+                            continue
+
+                        if callable(original_callable):
+                            wrapped = self.child_decorator(original_callable)
+
+                            if descriptor_type is not None:
+                                wrapped_descriptor = descriptor_type(wrapped)
+                                for attr_name, attr_value in extra_descriptor_attrs.items():
+                                    try:
+                                        setattr(wrapped_descriptor, attr_name, attr_value)
+                                    except (AttributeError, TypeError):
+                                        setattr(wrapped, attr_name, attr_value)
+                                originals[name] = obj
+                                setattr(self.module_or_class, name, wrapped_descriptor)
+                            else:
+                                originals[name] = obj
+                                setattr(self.module_or_class, name, wrapped)
+                except Exception:
+                    # Rollback successfully patched items
+                    for name, orig in originals.items():
+                        try:
+                            setattr(self.module_or_class, name, orig)
+                        except Exception:
+                            pass
+                    raise
+
+                trace_children_in_module._global_patches[key] = {
+                    "ref_count": 1,
+                    "originals": originals
+                }
             else:
-                # For classes, we need to get all attributes including methods
-                items = []
-                # Add regular attributes
-                for name, obj in self.module_or_class.__dict__.items():
-                    items.append((name, obj))
-                
-                # Get all special methods we want to trace
-                special_methods = ["__call__", "__init__", "__str__", "__repr__", 
-                                  "__eq__", "__lt__", "__gt__", "__le__", "__ge__"]
-                
-                # Add any missing special methods
-                for name in special_methods:
-                    if hasattr(self.module_or_class, name) and name not in self.module_or_class.__dict__:
-                        items.append((name, getattr(self.module_or_class, name)))
-            
-            # Now patch all applicable items
-            for name, obj in items:
-                if not _safe_to_wrap(obj):
-                    continue
-                
-                if callable(obj):
-                    # For regular methods, just patch
-                    if not name.startswith("__") or name in ["__call__", "__init__", "__str__", "__eq__", "__lt__", "__gt__"]:
-                        self.originals[name] = obj
-                        setattr(self.module_or_class, name, self.child_decorator(obj))
-        else:
-            # Nested/concurrent: just increment
-            ref_counter[key] += 1
+                # Increment global ref count
+                trace_children_in_module._global_patches[key]["ref_count"] += 1
 
     async def __aenter__(self) -> 'trace_children_in_module':
         self.__enter__()
@@ -709,15 +792,17 @@ class trace_children_in_module:
         self.__exit__(None, None, None)
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        ref_counter = self._get_ref_counter()
         key = id(self.module_or_class)
-        if key in ref_counter:
-            ref_counter[key] -= 1
-            if ref_counter[key] == 0:
-                # Last exit for this context: restore
-                for name, obj in self.originals.items():
-                    setattr(self.module_or_class, name, obj)
-                del ref_counter[key]
+        with trace_children_in_module._global_lock:
+            if key in trace_children_in_module._global_patches:
+                entry = trace_children_in_module._global_patches[key]
+                entry["ref_count"] -= 1
+                if entry["ref_count"] == 0:
+                    # Last exit: restore originals
+                    for name, obj in entry["originals"].items():
+                        setattr(self.module_or_class, name, obj)
+                    del trace_children_in_module._global_patches[key]
+
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -726,29 +811,29 @@ def child_trace_decorator(func: F) -> F:
     Decorator for child functions: only logs if tracing_active is True.
     """
     import functools
-    
+
     # Skip decoration entirely if we know we're not in a tracing context
     # This avoids the additional function call overhead
     if not tracing_active.get():
         return func
-        
+
     if inspect.iscoroutinefunction(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             if not tracing_active.get():
                 return await func(*args, **kwargs)
-                
+
             # Get the function ID
             func_id = id(func)
-            
+
             # Get the current set of functions being traced in this execution path
             currently_tracing = _currently_tracing.get()
-            
+
             # Check if already tracing this function in this execution path
             if func_id in currently_tracing:
                 # Already being traced - avoid double tracing
                 return await func(*args, **kwargs)
-                
+
             # Add to currently tracing set
             new_tracing = currently_tracing.copy()
             new_tracing.add(func_id)
@@ -759,14 +844,14 @@ def child_trace_decorator(func: F) -> F:
             call_id = new_stack[-1]
             parent_id = stack_before[-1] if stack_before else None
             stack_token = _call_stack_ids.set(new_stack)
-            
+
             # Normal tracing logic
             Setup.increment_level()
             redaction = _resolve_redaction(None)
             previews = _preview_args_kwargs(args, kwargs, redaction=redaction)
             start_ts = time.time()
             # Resource snapshots
-            start_cpu = time.process_time()
+            start_cpu = _get_start_cpu()
             mem_before, mem_mode_before = _get_current_rss_snapshot()
             _sampled_log_info(
                 f"called...",
@@ -787,7 +872,7 @@ def child_trace_decorator(func: F) -> F:
                     end = time.time()
                     duration = end - start
                     # Metrics capture
-                    cpu_time = time.process_time() - start_cpu
+                    cpu_time = _get_cpu_time(start_cpu)
                     mem_after, mem_mode_after = _get_current_rss_snapshot()
                     mem_delta = None
                     if mem_after is not None and mem_before is not None:
@@ -833,27 +918,225 @@ def child_trace_decorator(func: F) -> F:
                         _call_stack_ids.reset(stack_token)
                     except Exception:
                         pass
-        
+
         # Mark as wrapped
         setattr(wrapper, _TRACED_ATTRIBUTE, True)
         return wrapper
+
+    elif inspect.isasyncgenfunction(func):
+        @functools.wraps(func)
+        async def async_generator_wrapper(*args, **kwargs):
+            if not tracing_active.get():
+                async for item in func(*args, **kwargs):
+                    yield item
+                return
+
+            func_id = id(func)
+            currently_tracing = _currently_tracing.get()
+            if func_id in currently_tracing:
+                async for item in func(*args, **kwargs):
+                    yield item
+                return
+
+            new_tracing = currently_tracing.copy()
+            new_tracing.add(func_id)
+            tracing_token = _currently_tracing.set(new_tracing)
+            stack_before = _call_stack_ids.get()
+            new_stack = tuple(list(stack_before) + [uuid.uuid4().hex])
+            call_id = new_stack[-1]
+            parent_id = stack_before[-1] if stack_before else None
+            stack_token = _call_stack_ids.set(new_stack)
+
+            Setup.increment_level()
+            redaction = _resolve_redaction(None)
+            previews = _preview_args_kwargs(args, kwargs, redaction=redaction)
+            start_ts = time.time()
+            start_cpu = _get_start_cpu()
+            mem_before, mem_mode_before = _get_current_rss_snapshot()
+            _sampled_log_info(
+                "called async generator...",
+                fn_type="child",
+                function=func.__qualname__,
+                event="start",
+                status="running",
+                call_id=call_id,
+                parent_id=parent_id,
+                time_epoch=start_ts,
+                **previews,
+            )
+
+            start = time.time()
+            completed = False
+            try:
+                with start_span(func.__qualname__, {"fn.type": "child"}) as span:
+                    try:
+                        with logging.with_context(call_id=call_id, parent_id=parent_id):
+                            async for item in func(*args, **kwargs):
+                                yield item
+                        completed = True
+                    except Exception as exc:
+                        _sampled_log_error(
+                            f"Error: {str(exc)}",
+                            fn_type="child",
+                            function=func.__qualname__,
+                            event="error",
+                            status="error",
+                            call_id=call_id,
+                            parent_id=parent_id,
+                            time_epoch=time.time(),
+                        )
+                        record_exception(span, exc)
+                        setattr(exc, "_eztrace_logged", True)
+                        raise
+
+                if completed:
+                    end_ts = time.time()
+                    duration = end_ts - start
+                    cpu_time = _get_cpu_time(start_cpu)
+                    mem_after, mem_mode_after = _get_current_rss_snapshot()
+                    mem_delta = None
+                    if mem_after is not None and mem_before is not None:
+                        mem_delta = mem_after - mem_before
+                    mem_mode = mem_mode_after if mem_mode_after != "unavailable" else mem_mode_before
+                    _sampled_log_info(
+                        "Ok.",
+                        fn_type="child",
+                        function=func.__qualname__,
+                        duration=duration,
+                        event="end",
+                        status="success",
+                        call_id=call_id,
+                        parent_id=parent_id,
+                        time_epoch=end_ts,
+                        cpu_time=cpu_time,
+                        mem_peak_kb=mem_after,
+                        mem_rss_kb=mem_after,
+                        mem_delta_kb=mem_delta,
+                        mem_mode=mem_mode,
+                    )
+                    _sampled_record_metric(func.__qualname__, duration)
+            finally:
+                Setup.decrement_level()
+                _currently_tracing.reset(tracing_token)
+                _call_stack_ids.reset(stack_token)
+
+        setattr(async_generator_wrapper, _TRACED_ATTRIBUTE, True)
+        return async_generator_wrapper
+
+    elif inspect.isgeneratorfunction(func):
+        @functools.wraps(func)
+        def generator_wrapper(*args, **kwargs):
+            if not tracing_active.get():
+                return (yield from func(*args, **kwargs))
+
+            func_id = id(func)
+            currently_tracing = _currently_tracing.get()
+            if func_id in currently_tracing:
+                return (yield from func(*args, **kwargs))
+
+            new_tracing = currently_tracing.copy()
+            new_tracing.add(func_id)
+            tracing_token = _currently_tracing.set(new_tracing)
+            stack_before = _call_stack_ids.get()
+            new_stack = tuple(list(stack_before) + [uuid.uuid4().hex])
+            call_id = new_stack[-1]
+            parent_id = stack_before[-1] if stack_before else None
+            stack_token = _call_stack_ids.set(new_stack)
+
+            Setup.increment_level()
+            redaction = _resolve_redaction(None)
+            previews = _preview_args_kwargs(args, kwargs, redaction=redaction)
+            start_ts = time.time()
+            start_cpu = _get_start_cpu()
+            mem_before, mem_mode_before = _get_current_rss_snapshot()
+            _sampled_log_info(
+                "called generator...",
+                fn_type="child",
+                function=func.__qualname__,
+                event="start",
+                status="running",
+                call_id=call_id,
+                parent_id=parent_id,
+                time_epoch=start_ts,
+                **previews,
+            )
+
+            start = time.time()
+            completed = False
+            generator_result = None
+            try:
+                with start_span(func.__qualname__, {"fn.type": "child"}) as span:
+                    try:
+                        with logging.with_context(call_id=call_id, parent_id=parent_id):
+                            generator_result = yield from func(*args, **kwargs)
+                        completed = True
+                    except Exception as exc:
+                        _sampled_log_error(
+                            f"Error: {str(exc)}",
+                            fn_type="child",
+                            function=func.__qualname__,
+                            event="error",
+                            status="error",
+                            call_id=call_id,
+                            parent_id=parent_id,
+                            time_epoch=time.time(),
+                        )
+                        record_exception(span, exc)
+                        setattr(exc, "_eztrace_logged", True)
+                        raise
+
+                if completed:
+                    end_ts = time.time()
+                    duration = end_ts - start
+                    cpu_time = _get_cpu_time(start_cpu)
+                    mem_after, mem_mode_after = _get_current_rss_snapshot()
+                    mem_delta = None
+                    if mem_after is not None and mem_before is not None:
+                        mem_delta = mem_after - mem_before
+                    mem_mode = mem_mode_after if mem_mode_after != "unavailable" else mem_mode_before
+                    _sampled_log_info(
+                        "Ok.",
+                        fn_type="child",
+                        function=func.__qualname__,
+                        duration=duration,
+                        event="end",
+                        status="success",
+                        call_id=call_id,
+                        parent_id=parent_id,
+                        time_epoch=end_ts,
+                        cpu_time=cpu_time,
+                        mem_peak_kb=mem_after,
+                        mem_rss_kb=mem_after,
+                        mem_delta_kb=mem_delta,
+                        mem_mode=mem_mode,
+                    )
+                    _sampled_record_metric(func.__qualname__, duration)
+                    return generator_result
+            finally:
+                Setup.decrement_level()
+                _currently_tracing.reset(tracing_token)
+                _call_stack_ids.reset(stack_token)
+
+        setattr(generator_wrapper, _TRACED_ATTRIBUTE, True)
+        return generator_wrapper
+
     else:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             if not tracing_active.get():
                 return func(*args, **kwargs)
-                
+
             # Get the function ID
             func_id = id(func)
-            
+
             # Get the current set of functions being traced in this execution path
             currently_tracing = _currently_tracing.get()
-            
+
             # Check if already tracing this function in this execution path
             if func_id in currently_tracing:
                 # Already being traced - avoid double tracing
                 return func(*args, **kwargs)
-                
+
             # Add to currently tracing set
             new_tracing = currently_tracing.copy()
             new_tracing.add(func_id)
@@ -864,14 +1147,14 @@ def child_trace_decorator(func: F) -> F:
             call_id = new_stack[-1]
             parent_id = stack_before[-1] if stack_before else None
             stack_token = _call_stack_ids.set(new_stack)
-            
+
             # Normal tracing logic
             Setup.increment_level()
             redaction = _resolve_redaction(None)
             previews = _preview_args_kwargs(args, kwargs, redaction=redaction)
             start_ts = time.time()
             # Resource snapshots
-            start_cpu = time.process_time()
+            start_cpu = _get_start_cpu()
             mem_before, mem_mode_before = _get_current_rss_snapshot()
             _sampled_log_info(
                 f"called...",
@@ -892,7 +1175,7 @@ def child_trace_decorator(func: F) -> F:
                     end = time.time()
                     duration = end - start
                     # Metrics capture
-                    cpu_time = time.process_time() - start_cpu
+                    cpu_time = _get_cpu_time(start_cpu)
                     mem_after, mem_mode_after = _get_current_rss_snapshot()
                     mem_delta = None
                     if mem_after is not None and mem_before is not None:
@@ -938,7 +1221,7 @@ def child_trace_decorator(func: F) -> F:
                         _call_stack_ids.reset(stack_token)
                     except Exception:
                         pass
-        
+
         # Mark as wrapped
         setattr(wrapper, _TRACED_ATTRIBUTE, True)
         return wrapper
@@ -963,12 +1246,12 @@ def trace(
 ) -> Callable[[T], T]:
     """
     Decorator for parent function. Enables tracing for all child functions in the given modules or classes.
-    
+
     If modules_or_classes is None, it will automatically patch the module where the parent function is defined.
     Accepts a single module/class or a list of modules/classes for cross-module tracing.
     Handles both sync and async parent functions.
     Supports selective tracing via include/exclude patterns (function names).
-    
+
     Parameters:
         message: Optional message to include in error logs
         stack: Whether to show stack trace for errors
@@ -1009,18 +1292,18 @@ def trace(
                 return orig_decorator(func)
             return func
         return selective_decorator
-        
+
     def _get_recursive_modules(module, depth, pattern=None, visited=None):
         """Recursively collect modules based on depth and pattern."""
         if visited is None:
             visited = set()
-            
+
         if depth <= 0 or id(module) in visited:
             return []
-            
+
         # Track visited modules to prevent circular references
         visited.add(id(module))
-            
+
         imported_modules = []
         try:
             # Look for imported modules
@@ -1028,25 +1311,25 @@ def trace(
                 # Only process modules
                 if not isinstance(obj, types.ModuleType):
                     continue
-                    
+
                 # Skip standard library and critical system modules
                 if obj.__name__.startswith(('_', 'builtins', 'sys', 'os', 'logging', 'asyncio', 'threading')):
                     continue
-                    
+
                 # Skip the tracer module itself to prevent circular tracing
                 if obj.__name__ == 'pyeztrace.tracer':
                     continue
-                    
+
                 # Apply pattern filter if provided
                 if pattern and not fnmatch.fnmatch(obj.__name__, pattern):
                     continue
-                    
+
                 # Skip if already visited
                 if id(obj) in visited:
                     continue
-                    
+
                 imported_modules.append(obj)
-                
+
                 # Recurse with reduced depth
                 if depth > 1:
                     sub_modules = _get_recursive_modules(obj, depth-1, pattern, visited)
@@ -1054,7 +1337,7 @@ def trace(
         except (AttributeError, ImportError) as e:
             # Skip modules we can't process
             logging.log_debug(f"Error processing module {getattr(module, '__name__', 'unknown')}: {str(e)}")
-            
+
         return imported_modules
 
     def decorator(func: T) -> T:
@@ -1063,7 +1346,7 @@ def trace(
             # Start with directly specified modules
             targets = []
             base_modules = []
-            
+
             # Handle directly specified modules
             if modules_or_classes is None:
                 # Default to the module containing the decorated function
@@ -1074,18 +1357,18 @@ def trace(
                 base_modules.extend(modules_or_classes)
             else:
                 base_modules.append(modules_or_classes)
-                
+
             # Always include directly specified modules
             targets.extend(base_modules)
-            
+
             # If recursive_depth > 0, add imports from the base modules
             if recursive_depth > 0:
                 visited = set()  # Track modules we've seen to avoid duplicates
                 for base_module in base_modules:
                     if isinstance(base_module, types.ModuleType):
                         recursive_mods = _get_recursive_modules(
-                            base_module, 
-                            recursive_depth, 
+                            base_module,
+                            recursive_depth,
                             module_pattern,
                             visited
                         )
@@ -1188,13 +1471,13 @@ def trace(
                     redaction_token = _active_redaction.set(redaction_to_use)
                     token = tracing_active.set(True)
                     Setup.increment_level()
-                    
+
                     # Get the function ID
                     func_id = id(func)
-                    
+
                     # Get the current set of functions being traced
                     currently_tracing = _currently_tracing.get()
-                    
+
                     # Add to currently tracing set
                     new_tracing = currently_tracing.copy()
                     new_tracing.add(func_id)
@@ -1205,11 +1488,11 @@ def trace(
                     call_id = new_stack[-1]
                     parent_id = stack_before[-1] if stack_before else None
                     stack_token = _call_stack_ids.set(new_stack)
-                    
+
                     previews = _preview_args_kwargs(args, kwargs, redaction=redaction_to_use)
                     start_ts = time.time()
                     # Resource snapshots
-                    start_cpu = time.process_time()
+                    start_cpu = _get_start_cpu()
                     mem_before, mem_mode_before = _get_current_rss_snapshot()
                     _sampled_log_info(
                         f"called...",
@@ -1223,7 +1506,7 @@ def trace(
                         **previews
                     )
                     start = time.time()
-                    
+
                     targets = _get_targets()
                     managers = []
                     try:
@@ -1239,7 +1522,7 @@ def trace(
                                 duration = end - start
                                 trace_duration = duration
                                 # Metrics capture
-                                cpu_time = time.process_time() - start_cpu
+                                cpu_time = _get_cpu_time(start_cpu)
                                 mem_after, mem_mode_after = _get_current_rss_snapshot()
                                 mem_delta = None
                                 if mem_after is not None and mem_before is not None:
@@ -1335,10 +1618,343 @@ def trace(
                             duration=trace_duration,
                             had_error=trace_had_error,
                         )
-            
-            # Mark as wrapped            
+
+            # Mark as wrapped
             setattr(async_wrapper, _TRACED_ATTRIBUTE, True)
             return async_wrapper
+
+        elif inspect.isasyncgenfunction(func):
+            @functools.wraps(func)
+            async def async_generator_wrapper(*args, **kwargs):
+                redaction_token = None
+                token = None
+                tracing_token = None
+                stack_token = None
+                sampling_state = None
+                sampling_token = None
+                sampling_root_scope = False
+                trace_duration: Optional[float] = None
+                trace_had_error = False
+                targets = _get_targets()
+                managers = []
+                try:
+                    ensure_initialized()
+                    _ensure_otel_initialized_early()
+                    sampling_state, sampling_token, sampling_root_scope = _start_sampling_scope(
+                        local_sample_rate, local_adaptive_sampling, local_adaptive_slow_threshold
+                    )
+                    if sampling_state.mode == "drop":
+                        async for item in func(*args, **kwargs):
+                            yield item
+                        return
+
+                    redaction_to_use = _resolve_redaction(configured_redaction)
+                    redaction_token = _active_redaction.set(redaction_to_use)
+                    token = tracing_active.set(True)
+                    Setup.increment_level()
+
+                    func_id = id(func)
+                    currently_tracing = _currently_tracing.get()
+                    new_tracing = currently_tracing.copy()
+                    new_tracing.add(func_id)
+                    tracing_token = _currently_tracing.set(new_tracing)
+
+                    stack_before = _call_stack_ids.get()
+                    new_stack = tuple(list(stack_before) + [uuid.uuid4().hex])
+                    call_id = new_stack[-1]
+                    parent_id = stack_before[-1] if stack_before else None
+                    stack_token = _call_stack_ids.set(new_stack)
+
+                    previews = _preview_args_kwargs(args, kwargs, redaction=redaction_to_use)
+                    start_ts = time.time()
+                    start_cpu = _get_start_cpu()
+                    mem_before, mem_mode_before = _get_current_rss_snapshot()
+                    _sampled_log_info(
+                        f"called async generator...",
+                        fn_type="parent",
+                        function=func.__qualname__,
+                        event="start",
+                        call_id=call_id,
+                        parent_id=parent_id,
+                        time_epoch=start_ts,
+                        **previews
+                    )
+                    start = time.time()
+
+                    if targets:
+                        managers = [trace_children_in_module(t, make_child_decorator(child_trace_decorator)) for t in targets]
+                        for m in managers:
+                            await m.__aenter__()
+
+                    span_cm = start_span(func.__qualname__, {"fn.type": "parent"})
+                    _span = span_cm.__enter__()
+                    try:
+                        with logging.with_context(call_id=call_id, parent_id=parent_id):
+                            gen = func(*args, **kwargs)
+                            async for item in gen:
+                                yield item
+                        end = time.time()
+                        trace_duration = end - start
+                        cpu_time = _get_cpu_time(start_cpu)
+                        mem_after, mem_mode_after = _get_current_rss_snapshot()
+                        mem_delta = None
+                        if mem_after is not None and mem_before is not None:
+                            mem_delta = mem_after - mem_before
+                        mem_mode = mem_mode_after if mem_mode_after != "unavailable" else mem_mode_before
+                        _sampled_log_info(
+                            f"Ok.",
+                            fn_type="parent",
+                            function=func.__qualname__,
+                            duration=trace_duration,
+                            event="end",
+                            call_id=call_id,
+                            parent_id=parent_id,
+                            time_epoch=time.time(),
+                            cpu_time=cpu_time,
+                            mem_peak_kb=mem_after,
+                            mem_rss_kb=mem_after,
+                            mem_delta_kb=mem_delta,
+                            mem_mode=mem_mode,
+                        )
+                        _sampled_record_metric(func.__qualname__, trace_duration)
+                    except Exception as e:
+                        end = time.time()
+                        trace_duration = end - start
+                        trace_had_error = True
+                        error_message = f"{message} -> {str(e)}" if message else str(e)
+                        _sampled_log_error(
+                            f"Error: {error_message}",
+                            fn_type="parent",
+                            function=func.__qualname__,
+                            duration=trace_duration,
+                            event="error",
+                            status="error",
+                            call_id=call_id,
+                            parent_id=parent_id,
+                            time_epoch=end
+                        )
+                        record_exception(_span, e)
+                        setattr(e, "_eztrace_logged", True)
+                        if stack:
+                            import traceback
+                            _sampled_log_error(
+                                traceback.format_exc(),
+                                fn_type="parent",
+                                function=func.__qualname__,
+                                event="stack",
+                                status="error",
+                                call_id=call_id,
+                                parent_id=parent_id,
+                                time_epoch=time.time(),
+                            )
+                        raise
+                    finally:
+                        span_cm.__exit__(None, None, None)
+                except Exception as e:
+                    if sampling_state is not None and sampling_state.mode == "drop":
+                        raise
+                    if getattr(e, "_eztrace_logged", False):
+                        raise
+                    print(f"TRACE ERROR: {func.__qualname__} - {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+                finally:
+                    # Clean up context managers even if an exception occurs
+                    for m in reversed(managers):
+                        try:
+                            await m.__aexit__(None, None, None)
+                        except Exception:
+                            pass
+                    try:
+                        if token is not None:
+                            Setup.decrement_level()
+                            tracing_active.reset(token)
+                        if redaction_token is not None:
+                            _active_redaction.reset(redaction_token)
+                        if tracing_token is not None:
+                            _currently_tracing.reset(tracing_token)
+                        if stack_token is not None:
+                            _call_stack_ids.reset(stack_token)
+                    except Exception:
+                        pass
+                    if sampling_state is not None:
+                        _finalize_sampling_scope(
+                            sampling_state,
+                            sampling_token,
+                            sampling_root_scope,
+                            duration=trace_duration,
+                            had_error=trace_had_error,
+                        )
+
+            setattr(async_generator_wrapper, _TRACED_ATTRIBUTE, True)
+            return async_generator_wrapper
+
+        elif inspect.isgeneratorfunction(func):
+            @functools.wraps(func)
+            def generator_wrapper(*args, **kwargs):
+                redaction_token = None
+                token = None
+                tracing_token = None
+                stack_token = None
+                sampling_state = None
+                sampling_token = None
+                sampling_root_scope = False
+                trace_duration: Optional[float] = None
+                trace_had_error = False
+                targets = _get_targets()
+                managers = []
+                try:
+                    ensure_initialized()
+                    _ensure_otel_initialized_early()
+                    sampling_state, sampling_token, sampling_root_scope = _start_sampling_scope(
+                        local_sample_rate, local_adaptive_sampling, local_adaptive_slow_threshold
+                    )
+                    if sampling_state.mode == "drop":
+                        return (yield from func(*args, **kwargs))
+
+                    redaction_to_use = _resolve_redaction(configured_redaction)
+                    redaction_token = _active_redaction.set(redaction_to_use)
+                    token = tracing_active.set(True)
+                    Setup.increment_level()
+
+                    func_id = id(func)
+                    currently_tracing = _currently_tracing.get()
+                    new_tracing = currently_tracing.copy()
+                    new_tracing.add(func_id)
+                    tracing_token = _currently_tracing.set(new_tracing)
+
+                    stack_before = _call_stack_ids.get()
+                    new_stack = tuple(list(stack_before) + [uuid.uuid4().hex])
+                    call_id = new_stack[-1]
+                    parent_id = stack_before[-1] if stack_before else None
+                    stack_token = _call_stack_ids.set(new_stack)
+
+                    previews = _preview_args_kwargs(args, kwargs, redaction=redaction_to_use)
+                    start_ts = time.time()
+                    start_cpu = _get_start_cpu()
+                    mem_before, mem_mode_before = _get_current_rss_snapshot()
+                    _sampled_log_info(
+                        f"called generator...",
+                        fn_type="parent",
+                        function=func.__qualname__,
+                        event="start",
+                        call_id=call_id,
+                        parent_id=parent_id,
+                        time_epoch=start_ts,
+                        **previews
+                    )
+                    start = time.time()
+
+                    if targets:
+                        managers = [trace_children_in_module(t, make_child_decorator(child_trace_decorator)) for t in targets]
+                        for m in managers:
+                            m.__enter__()
+
+                    span_cm = start_span(func.__qualname__, {"fn.type": "parent"})
+                    _span = span_cm.__enter__()
+                    try:
+                        with logging.with_context(call_id=call_id, parent_id=parent_id):
+                            gen = func(*args, **kwargs)
+                            generator_result = yield from gen
+                        end = time.time()
+                        trace_duration = end - start
+                        cpu_time = _get_cpu_time(start_cpu)
+                        mem_after, mem_mode_after = _get_current_rss_snapshot()
+                        mem_delta = None
+                        if mem_after is not None and mem_before is not None:
+                            mem_delta = mem_after - mem_before
+                        mem_mode = mem_mode_after if mem_mode_after != "unavailable" else mem_mode_before
+                        _sampled_log_info(
+                            f"Ok.",
+                            fn_type="parent",
+                            function=func.__qualname__,
+                            duration=trace_duration,
+                            event="end",
+                            call_id=call_id,
+                            parent_id=parent_id,
+                            time_epoch=time.time(),
+                            cpu_time=cpu_time,
+                            mem_peak_kb=mem_after,
+                            mem_rss_kb=mem_after,
+                            mem_delta_kb=mem_delta,
+                            mem_mode=mem_mode,
+                        )
+                        _sampled_record_metric(func.__qualname__, trace_duration)
+                        return generator_result
+                    except Exception as e:
+                        end = time.time()
+                        trace_duration = end - start
+                        trace_had_error = True
+                        error_message = f"{message} -> {str(e)}" if message else str(e)
+                        _sampled_log_error(
+                            f"Error: {error_message}",
+                            fn_type="parent",
+                            function=func.__qualname__,
+                            duration=trace_duration,
+                            event="error",
+                            status="error",
+                            call_id=call_id,
+                            parent_id=parent_id,
+                            time_epoch=end
+                        )
+                        record_exception(_span, e)
+                        setattr(e, "_eztrace_logged", True)
+                        if stack:
+                            import traceback
+                            _sampled_log_error(
+                                traceback.format_exc(),
+                                fn_type="parent",
+                                function=func.__qualname__,
+                                event="stack",
+                                status="error",
+                                call_id=call_id,
+                                parent_id=parent_id,
+                                time_epoch=time.time(),
+                            )
+                        raise
+                    finally:
+                        span_cm.__exit__(None, None, None)
+                except Exception as e:
+                    if sampling_state is not None and sampling_state.mode == "drop":
+                        raise
+                    if getattr(e, "_eztrace_logged", False):
+                        raise
+                    print(f"TRACE ERROR: {func.__qualname__} - {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+                finally:
+                    # Clean up context managers even if an exception occurs
+                    for m in reversed(managers):
+                        try:
+                            m.__exit__(None, None, None)
+                        except Exception:
+                            pass
+                    try:
+                        if token is not None:
+                            Setup.decrement_level()
+                            tracing_active.reset(token)
+                        if redaction_token is not None:
+                            _active_redaction.reset(redaction_token)
+                        if tracing_token is not None:
+                            _currently_tracing.reset(tracing_token)
+                        if stack_token is not None:
+                            _call_stack_ids.reset(stack_token)
+                    except Exception:
+                        pass
+                    if sampling_state is not None:
+                        _finalize_sampling_scope(
+                            sampling_state,
+                            sampling_token,
+                            sampling_root_scope,
+                            duration=trace_duration,
+                            had_error=trace_had_error,
+                        )
+
+            setattr(generator_wrapper, _TRACED_ATTRIBUTE, True)
+            return generator_wrapper
+
         else:
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
@@ -1365,13 +1981,13 @@ def trace(
                     redaction_token = _active_redaction.set(redaction_to_use)
                     token = tracing_active.set(True)
                     Setup.increment_level()
-                    
+
                     # Get the function ID
                     func_id = id(func)
-                    
+
                     # Get the current set of functions being traced
                     currently_tracing = _currently_tracing.get()
-                    
+
                     # Add to currently tracing set
                     new_tracing = currently_tracing.copy()
                     new_tracing.add(func_id)
@@ -1382,11 +1998,11 @@ def trace(
                     call_id = new_stack[-1]
                     parent_id = stack_before[-1] if stack_before else None
                     stack_token = _call_stack_ids.set(new_stack)
-                    
+
                     previews = _preview_args_kwargs(args, kwargs, redaction=redaction_to_use)
                     start_ts = time.time()
                     # Resource snapshots
-                    start_cpu = time.process_time()
+                    start_cpu = _get_start_cpu()
                     mem_before, mem_mode_before = _get_current_rss_snapshot()
                     _sampled_log_info(
                         f"called...",
@@ -1399,7 +2015,7 @@ def trace(
                         **previews
                     )
                     start = time.time()
-                    
+
                     targets = _get_targets()
                     managers = []
                     try:
@@ -1415,7 +2031,7 @@ def trace(
                                 duration = end - start
                                 trace_duration = duration
                                 # Metrics capture
-                                cpu_time = time.process_time() - start_cpu
+                                cpu_time = _get_cpu_time(start_cpu)
                                 mem_after, mem_mode_after = _get_current_rss_snapshot()
                                 mem_delta = None
                                 if mem_after is not None and mem_before is not None:
@@ -1511,7 +2127,7 @@ def trace(
                             duration=trace_duration,
                             had_error=trace_had_error,
                         )
-            
+
             # Mark as wrapped
             setattr(wrapper, _TRACED_ATTRIBUTE, True)
             return wrapper

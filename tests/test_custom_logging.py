@@ -3,12 +3,13 @@ import logging
 import random
 import time
 import io
+import math
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from pyeztrace.config import config
+from pyeztrace.config import LogConfig, config
 from pyeztrace.custom_logging import Logging, BufferedHandler
 from pyeztrace.setup import Setup
 from pyeztrace.tracer import trace
@@ -188,6 +189,75 @@ def test_log_format_json(monkeypatch):
     data = json.loads(msg)
     assert data["function"] == "f"
     assert data["duration"] == 1.23
+
+
+def test_json_logging_converts_non_native_and_circular_values(reset_logging_state):
+    class BrokenString:
+        def __str__(self):
+            raise RuntimeError("cannot stringify")
+
+    circular = {}
+    circular["self"] = circular
+    broken_key = BrokenString()
+
+    Setup.initialize("JSON_SAFE", show_metrics=False, disable_file_logging=True)
+    log = Logging(log_format="json")
+    message = log._format_message(
+        "INFO",
+        "payload",
+        function="json_safe",
+        obj=object(),
+        broken=BrokenString(),
+        broken_key={broken_key: "value"},
+        circular=circular,
+        non_finite=float("nan"),
+    )
+
+    payload = json.loads(message)
+    assert payload["data"]["obj"].startswith("<object object at")
+    assert payload["data"]["broken"] == "<BrokenString>"
+    assert payload["data"]["broken_key"] == {"<BrokenString>": "value"}
+    assert payload["data"]["circular"]["self"] == "<circular_reference>"
+    assert payload["data"]["non_finite"] == "nan"
+
+    # The public logging call must not propagate serialization failures.
+    log.log_info("payload", obj=object(), circular=circular)
+
+
+def test_invalid_environment_configuration_uses_safe_defaults(monkeypatch):
+    monkeypatch.setenv("EZTRACE_MAX_SIZE", "not-an-int")
+    monkeypatch.setenv("EZTRACE_BACKUP_COUNT", "-4")
+    monkeypatch.setenv("EZTRACE_BUFFER_FLUSH_INTERVAL", "nan")
+    monkeypatch.setenv("EZTRACE_LOG_LEVEL", "verbose")
+    monkeypatch.setenv("EZTRACE_FILE_LOG_FORMAT", "xml")
+
+    with pytest.warns(RuntimeWarning):
+        fresh = LogConfig()
+
+    assert fresh.max_size == 10 * 1024 * 1024
+    assert fresh.backup_count == 5
+    assert fresh.buffer_flush_interval == 1.0
+    assert fresh.log_level == "DEBUG"
+    assert fresh.file_format == "json"
+
+
+def test_thread_metric_batches_are_bounded_and_preserve_totals(monkeypatch):
+    Setup.initialize("BOUNDED_METRICS", show_metrics=False, disable_file_logging=True)
+    Setup.set_show_metrics(True)
+    Logging._metrics = {}
+    Logging._thread_metrics = {}
+
+    thread_ids = iter(range(Logging._thread_metrics_max_threads + 25))
+    monkeypatch.setattr("pyeztrace.custom_logging.threading.get_ident", lambda: next(thread_ids))
+
+    for _ in range(Logging._thread_metrics_max_threads + 25):
+        Logging.record_metric("bounded", 0.25)
+
+    assert len(Logging._thread_metrics) < Logging._thread_metrics_max_threads
+    snapshot = Logging._build_metrics_summary_snapshot()
+    assert snapshot is not None
+    assert snapshot["total_calls"] == Logging._thread_metrics_max_threads + 25
+    assert math.isclose(snapshot["metrics"][0]["total_seconds"], 38.25)
 
 def simulate_complex_operation(log, depth=0, max_depth=3):
     """Simulate a complex operation with nested calls and random delays"""

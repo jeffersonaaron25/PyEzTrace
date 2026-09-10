@@ -12,10 +12,74 @@ import threading
 import contextvars
 import queue
 import hashlib
+import math
+import warnings
 from pyeztrace.setup import Setup
 from pyeztrace.config import config
 
 from typing import Any, Callable, Optional, Union, Dict
+
+
+def _json_safe(value: Any, *, _seen: Optional[set] = None, _depth: int = 0) -> Any:
+    """Return a bounded, JSON-safe representation without raising into application code."""
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if _depth >= 12:
+        return "<max_depth>"
+
+    seen = _seen if _seen is not None else set()
+    value_id = id(value)
+    if value_id in seen:
+        return "<circular_reference>"
+
+    if isinstance(value, dict):
+        seen.add(value_id)
+        try:
+            converted = {}
+            for key, item in value.items():
+                try:
+                    safe_key = str(key)
+                except Exception:
+                    safe_key = f"<{type(key).__name__}>"
+                converted[safe_key] = _json_safe(item, _seen=seen, _depth=_depth + 1)
+            return converted
+        finally:
+            seen.remove(value_id)
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        seen.add(value_id)
+        try:
+            return [_json_safe(item, _seen=seen, _depth=_depth + 1) for item in value]
+        finally:
+            seen.remove(value_id)
+
+    try:
+        return str(value)
+    except Exception:
+        return f"<{type(value).__name__}>"
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        parsed = -1.0
+    if not math.isfinite(parsed) or parsed <= 0:
+        warnings.warn(
+            f"Ignoring invalid {name}={raw!r}; using {default!r}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return default
+    return parsed
+
 
 class LogContext:
     """Async-safe context management for logging."""
@@ -45,7 +109,7 @@ class LogContext:
 
 
 class BufferedHandler(logging.Handler):
-    """Buffered logging handler for improved performance."""
+    """Buffered logging handler for improved performance with background flushing."""
     def __init__(self, target_handler, buffer_size=1000, flush_interval=1.0):
         super().__init__()
         self.target_handler = target_handler
@@ -54,30 +118,81 @@ class BufferedHandler(logging.Handler):
         self.flush_interval = flush_interval
         self.last_flush = time.time()
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._flusher_thread = threading.Thread(target=self._flusher_loop, daemon=True)
+        self._flusher_thread.start()
+
+    def _flusher_loop(self):
+        while not self._stop_event.wait(self.flush_interval):
+            try:
+                if not self.buffer.empty():
+                    self.flush()
+            except Exception:
+                pass
 
     def shouldFlush(self):
-        return (self.buffer.qsize() >= self.buffer_size or
-                time.time() - self.last_flush >= self.flush_interval)
+        try:
+            return (self.buffer.qsize() >= self.buffer_size or
+                    time.time() - self.last_flush >= self.flush_interval)
+        except Exception:
+            return False
 
     def emit(self, record):
         try:
-            self.buffer.put_nowait(record)
-        except queue.Full:
-            self.flush()
-            self.buffer.put_nowait(record)
-        
-        if self.shouldFlush():
-            self.flush()
+            try:
+                self.buffer.put_nowait(record)
+            except queue.Full:
+                self.flush()
+                try:
+                    self.buffer.put_nowait(record)
+                except queue.Full:
+                    self.handleError(record)
+                    return
+
+            if self.shouldFlush():
+                self.flush()
+        except Exception:
+            self.handleError(record)
 
     def flush(self):
         with self._lock:
-            while not self.buffer.empty():
-                try:
-                    record = self.buffer.get_nowait()
-                    self.target_handler.emit(record)
-                except queue.Empty:
-                    break
+            self.target_handler.acquire()
+            try:
+                while not self.buffer.empty():
+                    try:
+                        record = self.buffer.get_nowait()
+                        try:
+                            self.target_handler.emit(record)
+                        except Exception:
+                            self.handleError(record)
+                    except queue.Empty:
+                        break
+            finally:
+                self.target_handler.release()
             self.last_flush = time.time()
+
+    def close(self):
+        self._stop_event.set()
+        try:
+            self._flusher_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            self.flush()
+        except Exception:
+            pass
+        finally:
+            try:
+                if hasattr(self.target_handler, 'close'):
+                    self.target_handler.close()
+            except Exception:
+                pass
+            try:
+                super().close()
+            except Exception:
+                pass
+
+
 
 class Logging:
     """
@@ -91,16 +206,22 @@ class Logging:
     _file_logging_enabled = False
     _metrics_lock = threading.Lock()
     _metrics: Dict[str, Dict[str, Any]] = {}
+    _thread_metrics_lock = threading.Lock()
+    _thread_metrics: Dict[int, Dict[str, Dict[str, Any]]] = {}
     _metrics_thread = None
     _metrics_stop_event = threading.Event()
     _metrics_scheduler_started = False
-    _metrics_flush_interval = float(os.environ.get("EZTRACE_METRICS_INTERVAL", "5.0"))
+    _metrics_scheduler_lock = threading.Lock()
+    _metrics_atexit_registered = False
+    _thread_metrics_max_batch = 10
+    _thread_metrics_max_threads = 128
+    _metrics_flush_interval = _positive_float_env("EZTRACE_METRICS_INTERVAL", 5.0)
     _metrics_sidecar_lock = threading.Lock()
     _last_metrics_sidecar_fingerprint: Optional[str] = None
     _buffer_enabled = False  # Disable buffering by default (configurable via env)
     _buffer_flush_interval = 1.0
     _show_data_in_cli = os.environ.get("EZTRACE_SHOW_DATA_IN_CLI", "0").lower() in {"1", "true", "yes", "on"}
-    
+
     COLOR_CODES = {
         'DEBUG': '\033[36m',  # Cyan
         'INFO': '\033[32m',   # Green
@@ -125,10 +246,10 @@ class Logging:
             Logging._buffer_enabled = config.buffer_enabled
 
         if env_flush_interval is not None:
-            try:
-                Logging._buffer_flush_interval = float(env_flush_interval)
-            except ValueError:
-                Logging._buffer_flush_interval = config.buffer_flush_interval
+            Logging._buffer_flush_interval = _positive_float_env(
+                "EZTRACE_BUFFER_FLUSH_INTERVAL",
+                config.buffer_flush_interval,
+            )
         else:
             Logging._buffer_flush_interval = config.buffer_flush_interval
 
@@ -235,7 +356,7 @@ class Logging:
     def with_context(**kwargs):
         """Context manager for adding context to log messages."""
         return LogContext(**kwargs)
-        
+
     @classmethod
     def _get_context(cls) -> Dict:
         """Get the current logging context."""
@@ -255,18 +376,19 @@ class Logging:
         context = LogContext.get_current_context()
         merged_kwargs = {**context, **kwargs}
         forced_level = merged_kwargs.pop("_eztrace_level_override", None)
+        safe_merged_kwargs = _json_safe(merged_kwargs)
         include_data_in_output = Logging._show_data_in_cli
 
         log_format = _log_format if _log_format is not None else Logging._base_format or "color"
 
         if log_format == "json":
             include_data_in_output = True  # JSON logs must include data for structured consumers
-        
+
         project = Setup.get_project() if Setup.is_setup_done() else "?"
         level_str = level.upper()
         log_type = fn_type or ""
         func = function or context.get('function', '')
-        data_str = f" Data: {merged_kwargs}" if include_data_in_output and merged_kwargs else ""
+        data_str = f" Data: {safe_merged_kwargs}" if include_data_in_output and safe_merged_kwargs else ""
         timestamp = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime())
         try:
             if forced_level is not None:
@@ -280,7 +402,7 @@ class Logging:
         elif level_indent == 1:
             tree = "├──"
         else:
-            tree = "│    " * (level_indent - 1) + "├───"  
+            tree = "│    " * (level_indent - 1) + "├───"
         color = Logging.COLOR_CODES.get(level_str, '')
         reset = Logging.COLOR_CODES['RESET']
         if log_format == "color":
@@ -306,18 +428,18 @@ class Logging:
                 "fn_type": log_type,
                 "function": func,
                 "message": message,
-                "data": merged_kwargs,
+                "data": safe_merged_kwargs,
             }
             if duration is not None:
-                payload["duration"] = duration
-            return json.dumps(payload)
+                payload["duration"] = _json_safe(duration)
+            return json.dumps(payload, ensure_ascii=False, allow_nan=False)
         # CSV
         elif log_format == "csv":
             output = io.StringIO()
             writer = csv.writer(output)
             row = [timestamp, level_str, project, log_type, func, message]
-            if include_data_in_output and merged_kwargs:
-                row.append(merged_kwargs)
+            if include_data_in_output and safe_merged_kwargs:
+                row.append(safe_merged_kwargs)
             if duration is not None:
                 row.append(f"{duration:.5f}")
             writer.writerow(row)
@@ -325,8 +447,8 @@ class Logging:
         # logfmt
         elif log_format == "logfmt":
             msg = f"time={timestamp} level={level_str} project={project} fn_type={log_type} function={func} message=\"{message}\""
-            if include_data_in_output and merged_kwargs:
-                msg += f" data={json.dumps(merged_kwargs)}"
+            if include_data_in_output and safe_merged_kwargs:
+                msg += f" data={json.dumps(safe_merged_kwargs, ensure_ascii=False, allow_nan=False)}"
             if duration is not None:
                 msg += f" duration={duration:.5f}"
             return msg
@@ -341,7 +463,8 @@ class Logging:
             return msg
 
     @staticmethod
-    def log_info(
+    def _log_at_level(
+        level: str,
         message: str,
         fn_type: Optional[str] = None,
         function: Optional[str] = None,
@@ -356,7 +479,7 @@ class Logging:
             # In testing mode, capture logs with minimal overhead (no formatting).
             if Setup.is_testing_mode():
                 Setup.capture_log({
-                    "level": "INFO",
+                    "level": level,
                     "message": message,
                     "fn_type": fn_type,
                     "function": function,
@@ -365,7 +488,7 @@ class Logging:
                     "kwargs": merged_kwargs,
                 })
                 return
-            
+
             console_format = Logging._console_format or "color"
             file_format = Logging._file_format or "json"
 
@@ -376,18 +499,29 @@ class Logging:
 
             split = Logging._file_logging_enabled and not _formats_equal(console_format, file_format)
 
-            msg = Logging._format_message("INFO", message, fn_type, function, duration, _log_format=console_format, **merged_kwargs)
+            msg = Logging._format_message(level, message, fn_type, function, duration, _log_format=console_format, **merged_kwargs)
 
             logger = logging.getLogger("pyeztrace")
+            log_method = getattr(logger, level.lower())
             if split:
-                logger.info(msg, extra={"eztrace_managed": True, "eztrace_sink": "console"})
-                file_msg = Logging._format_message("INFO", message, fn_type, function, duration, _log_format=file_format, **merged_kwargs)
-                logger.info(file_msg, extra={"eztrace_managed": True, "eztrace_sink": "file"})
+                log_method(msg, extra={"eztrace_managed": True, "eztrace_sink": "console"})
+                file_msg = Logging._format_message(level, message, fn_type, function, duration, _log_format=file_format, **merged_kwargs)
+                log_method(file_msg, extra={"eztrace_managed": True, "eztrace_sink": "file"})
             else:
-                logger.info(msg)
+                log_method(msg)
         else:
-            raise Exception("Setup is not done. Cannot log info.")
-        
+            raise Exception(f"Setup is not done. Cannot log {level.lower()}.")
+
+    @staticmethod
+    def log_info(
+        message: str,
+        fn_type: Optional[str] = None,
+        function: Optional[str] = None,
+        duration: Optional[float] = None,
+        **kwargs: Any
+    ) -> None:
+        Logging._log_at_level("INFO", message, fn_type, function, duration, **kwargs)
+
     @staticmethod
     def log_error(
         message: str,
@@ -396,46 +530,8 @@ class Logging:
         duration: Optional[float] = None,
         **kwargs: Any
     ) -> None:
-        if Setup.is_setup_done():
-            # Get the current context and merge with kwargs
-            context = LogContext.get_current_context()
-            merged_kwargs = {**context, **kwargs}
+        Logging._log_at_level("ERROR", message, fn_type, function, duration, **kwargs)
 
-            # In testing mode, capture logs with minimal overhead (no formatting).
-            if Setup.is_testing_mode():
-                Setup.capture_log({
-                    "level": "ERROR",
-                    "message": message,
-                    "fn_type": fn_type,
-                    "function": function,
-                    "duration": duration,
-                    "formatted": None,
-                    "kwargs": merged_kwargs,
-                })
-                return
-            
-            console_format = Logging._console_format or "color"
-            file_format = Logging._file_format or "json"
-
-            def _formats_equal(a: Any, b: Any) -> bool:
-                if isinstance(a, str) and isinstance(b, str):
-                    return a == b
-                return a is b
-
-            split = Logging._file_logging_enabled and not _formats_equal(console_format, file_format)
-
-            msg = Logging._format_message("ERROR", message, fn_type, function, duration, _log_format=console_format, **merged_kwargs)
-
-            logger = logging.getLogger("pyeztrace")
-            if split:
-                logger.error(msg, extra={"eztrace_managed": True, "eztrace_sink": "console"})
-                file_msg = Logging._format_message("ERROR", message, fn_type, function, duration, _log_format=file_format, **merged_kwargs)
-                logger.error(file_msg, extra={"eztrace_managed": True, "eztrace_sink": "file"})
-            else:
-                logger.error(msg)
-        else:
-            raise Exception("Setup is not done. Cannot log error.")
-        
     @staticmethod
     def log_warning(
         message: str,
@@ -444,46 +540,8 @@ class Logging:
         duration: Optional[float] = None,
         **kwargs: Any
     ) -> None:
-        if Setup.is_setup_done():
-            # Get the current context and merge with kwargs
-            context = LogContext.get_current_context()
-            merged_kwargs = {**context, **kwargs}
+        Logging._log_at_level("WARNING", message, fn_type, function, duration, **kwargs)
 
-            # In testing mode, capture logs with minimal overhead (no formatting).
-            if Setup.is_testing_mode():
-                Setup.capture_log({
-                    "level": "WARNING",
-                    "message": message,
-                    "fn_type": fn_type,
-                    "function": function,
-                    "duration": duration,
-                    "formatted": None,
-                    "kwargs": merged_kwargs,
-                })
-                return
-            
-            console_format = Logging._console_format or "color"
-            file_format = Logging._file_format or "json"
-
-            def _formats_equal(a: Any, b: Any) -> bool:
-                if isinstance(a, str) and isinstance(b, str):
-                    return a == b
-                return a is b
-
-            split = Logging._file_logging_enabled and not _formats_equal(console_format, file_format)
-
-            msg = Logging._format_message("WARNING", message, fn_type, function, duration, _log_format=console_format, **merged_kwargs)
-
-            logger = logging.getLogger("pyeztrace")
-            if split:
-                logger.warning(msg, extra={"eztrace_managed": True, "eztrace_sink": "console"})
-                file_msg = Logging._format_message("WARNING", message, fn_type, function, duration, _log_format=file_format, **merged_kwargs)
-                logger.warning(file_msg, extra={"eztrace_managed": True, "eztrace_sink": "file"})
-            else:
-                logger.warning(msg)
-        else:
-            raise Exception("Setup is not done. Cannot log warning.")
-        
     @staticmethod
     def log_debug(
         message: str,
@@ -492,45 +550,7 @@ class Logging:
         duration: Optional[float] = None,
         **kwargs: Any
     ) -> None:
-        if Setup.is_setup_done():
-            # Get the current context and merge with kwargs
-            context = LogContext.get_current_context()
-            merged_kwargs = {**context, **kwargs}
-
-            # In testing mode, capture logs with minimal overhead (no formatting).
-            if Setup.is_testing_mode():
-                Setup.capture_log({
-                    "level": "DEBUG",
-                    "message": message,
-                    "fn_type": fn_type,
-                    "function": function,
-                    "duration": duration,
-                    "formatted": None,
-                    "kwargs": merged_kwargs,
-                })
-                return
-            
-            console_format = Logging._console_format or "color"
-            file_format = Logging._file_format or "json"
-
-            def _formats_equal(a: Any, b: Any) -> bool:
-                if isinstance(a, str) and isinstance(b, str):
-                    return a == b
-                return a is b
-
-            split = Logging._file_logging_enabled and not _formats_equal(console_format, file_format)
-
-            msg = Logging._format_message("DEBUG", message, fn_type, function, duration, _log_format=console_format, **merged_kwargs)
-
-            logger = logging.getLogger("pyeztrace")
-            if split:
-                logger.debug(msg, extra={"eztrace_managed": True, "eztrace_sink": "console"})
-                file_msg = Logging._format_message("DEBUG", message, fn_type, function, duration, _log_format=file_format, **merged_kwargs)
-                logger.debug(file_msg, extra={"eztrace_managed": True, "eztrace_sink": "file"})
-            else:
-                logger.debug(msg)
-        else:
-            raise Exception("Setup is not done. Cannot log debug.")
+        Logging._log_at_level("DEBUG", message, fn_type, function, duration, **kwargs)
 
     @staticmethod
     def log_critical(
@@ -540,45 +560,8 @@ class Logging:
         duration: Optional[float] = None,
         **kwargs: Any
     ) -> None:
-        if Setup.is_setup_done():
-            # Get the current context and merge with kwargs
-            context = LogContext.get_current_context()
-            merged_kwargs = {**context, **kwargs}
+        Logging._log_at_level("CRITICAL", message, fn_type, function, duration, **kwargs)
 
-            # In testing mode, capture logs with minimal overhead (no formatting).
-            if Setup.is_testing_mode():
-                Setup.capture_log({
-                    "level": "CRITICAL",
-                    "message": message,
-                    "fn_type": fn_type,
-                    "function": function,
-                    "duration": duration,
-                    "formatted": None,
-                    "kwargs": merged_kwargs,
-                })
-                return
-            
-            console_format = Logging._console_format or "color"
-            file_format = Logging._file_format or "json"
-
-            def _formats_equal(a: Any, b: Any) -> bool:
-                if isinstance(a, str) and isinstance(b, str):
-                    return a == b
-                return a is b
-
-            split = Logging._file_logging_enabled and not _formats_equal(console_format, file_format)
-
-            msg = Logging._format_message("CRITICAL", message, fn_type, function, duration, _log_format=console_format, **merged_kwargs)
-
-            logger = logging.getLogger("pyeztrace")
-            if split:
-                logger.critical(msg, extra={"eztrace_managed": True, "eztrace_sink": "console"})
-                file_msg = Logging._format_message("CRITICAL", message, fn_type, function, duration, _log_format=file_format, **merged_kwargs)
-                logger.critical(file_msg, extra={"eztrace_managed": True, "eztrace_sink": "file"})
-            else:
-                logger.critical(msg)
-        else:
-            raise Exception("Setup is not done. Cannot log critical.")
 
     @staticmethod
     def raise_exception_to_log(
@@ -589,10 +572,10 @@ class Logging:
         if Setup.is_setup_done():
             msg = message if message else str(exception)
             Logging.log_error(msg)
-            
+
             if stack:
                 stack_trace = traceback.format_exc()
-                
+
                 # In testing mode, capture the stack trace too
                 if Setup.is_testing_mode():
                     Setup.capture_log({
@@ -607,11 +590,11 @@ class Logging:
                 else:
                     logger = logging.getLogger("pyeztrace")
                     logger.error(stack_trace)
-                    
+
             raise exception
         else:
             raise Exception("Setup is not done. Cannot raise exception.")
-        
+
     @staticmethod
     def show_full_traceback() -> None:
         if Setup.is_setup_done():
@@ -631,68 +614,86 @@ class Logging:
         if Logging._file_logging_active():
             Logging._ensure_metrics_scheduler()
 
-        # Use thread-local storage for temporary metrics to reduce lock contention
+        # Keep per-thread batches to reduce contention on the global aggregate.
         thread_id = threading.get_ident()
-        if not hasattr(Logging, '_thread_metrics'):
-            Logging._thread_metrics = {}
-        
-        if thread_id not in Logging._thread_metrics:
-            Logging._thread_metrics[thread_id] = {}
-            
-        thread_metrics = Logging._thread_metrics[thread_id]
-        
-        if func_name not in thread_metrics:
-            thread_metrics[func_name] = {"count": 0, "total": 0.0}
-            
-        thread_metrics[func_name]["count"] += 1
-        thread_metrics[func_name]["total"] += duration
-        
-        # Periodically flush to global metrics (every 10 records)
-        if thread_metrics[func_name]["count"] % 10 == 0:
+        with Logging._thread_metrics_lock:
+            thread_metrics = Logging._thread_metrics.setdefault(thread_id, {})
+            metrics = thread_metrics.setdefault(func_name, {"count": 0, "total": 0.0})
+            metrics["count"] += 1
+            metrics["total"] += duration
+            batch_size = sum(item["count"] for item in thread_metrics.values())
+            should_flush = batch_size >= Logging._thread_metrics_max_batch
+            should_flush_all = len(Logging._thread_metrics) >= Logging._thread_metrics_max_threads
+
+        if should_flush_all:
+            Logging._flush_all_thread_metrics()
+        elif should_flush:
             Logging._flush_thread_metrics(thread_id)
 
     @staticmethod
     def _ensure_metrics_scheduler() -> None:
-        if Logging._metrics_scheduler_started:
-            return
+        with Logging._metrics_scheduler_lock:
+            if Logging._metrics_scheduler_started:
+                return
+            stop_event = Logging._metrics_stop_event
+            Logging._metrics_scheduler_started = True
 
-        Logging._metrics_scheduler_started = True
+            def _run_scheduler():
+                while not stop_event.wait(Logging._metrics_flush_interval):
+                    try:
+                        # Background snapshots are persisted to a sidecar file (when enabled),
+                        # not emitted as log lines to avoid console noise and mixed log schemas.
+                        Logging.log_metrics_summary()
+                    except Exception:
+                        continue
 
-        def _run_scheduler():
-            while not Logging._metrics_stop_event.wait(Logging._metrics_flush_interval):
-                try:
-                    # Background snapshots are persisted to a sidecar file (when enabled),
-                    # not emitted as log lines to avoid console noise and mixed log schemas.
-                    Logging.log_metrics_summary()
-                except Exception:
-                    continue
+            thread = threading.Thread(target=_run_scheduler, daemon=True)
+            Logging._metrics_thread = thread
+            try:
+                thread.start()
+            except Exception:
+                Logging._metrics_thread = None
+                Logging._metrics_scheduler_started = False
+                raise
+            if not Logging._metrics_atexit_registered:
+                atexit.register(Logging.stop_metrics_scheduler)
+                Logging._metrics_atexit_registered = True
 
-        Logging._metrics_thread = threading.Thread(target=_run_scheduler, daemon=True)
-        Logging._metrics_thread.start()
-        atexit.register(Logging.stop_metrics_scheduler)
-    
     @staticmethod
     def _flush_thread_metrics(thread_id):
         """Flush thread-local metrics to global metrics."""
-        if not hasattr(Logging, '_thread_metrics') or thread_id not in Logging._thread_metrics:
+        with Logging._thread_metrics_lock:
+            thread_metrics = Logging._thread_metrics.pop(thread_id, None)
+        if not thread_metrics:
             return
-            
+
         with Logging._metrics_lock:
-            for func_name, metrics in Logging._thread_metrics[thread_id].items():
+            for func_name, metrics in thread_metrics.items():
                 if func_name not in Logging._metrics:
                     Logging._metrics[func_name] = {"count": 0, "total": 0.0}
                 Logging._metrics[func_name]["count"] += metrics["count"]
                 Logging._metrics[func_name]["total"] += metrics["total"]
-            
-            # Clear thread metrics after flushing
-            Logging._thread_metrics[thread_id] = {}
+
+    @staticmethod
+    def _flush_all_thread_metrics() -> None:
+        """Move all bounded per-thread batches into the global aggregate."""
+        with Logging._thread_metrics_lock:
+            batches = list(Logging._thread_metrics.values())
+            Logging._thread_metrics.clear()
+        if not batches:
+            return
+
+        with Logging._metrics_lock:
+            for thread_metrics in batches:
+                for func_name, metrics in thread_metrics.items():
+                    aggregate = Logging._metrics.setdefault(func_name, {"count": 0, "total": 0.0})
+                    aggregate["count"] += metrics["count"]
+                    aggregate["total"] += metrics["total"]
 
     @staticmethod
     def _build_metrics_summary_snapshot() -> Optional[Dict[str, Any]]:
         # Flush any remaining thread-local metrics
-        if hasattr(Logging, '_thread_metrics'):
-            for thread_id in list(Logging._thread_metrics.keys()):
-                Logging._flush_thread_metrics(thread_id)
+        Logging._flush_all_thread_metrics()
 
         with Logging._metrics_lock:
             metrics_snapshot = {k: v.copy() for k, v in Logging._metrics.items()}
@@ -850,25 +851,27 @@ class Logging:
 
     @staticmethod
     def stop_metrics_scheduler() -> None:
-        Logging._metrics_stop_event.set()
-        thread = Logging._metrics_thread
-        if thread and thread.is_alive():
+        with Logging._metrics_scheduler_lock:
+            stop_event = Logging._metrics_stop_event
+            thread = Logging._metrics_thread
+            stop_event.set()
+            Logging._metrics_thread = None
+            Logging._metrics_scheduler_started = False
+            Logging._metrics_stop_event = threading.Event()
+        if thread and thread is not threading.current_thread() and thread.is_alive():
             thread.join(timeout=1.0)
-        Logging._metrics_thread = None
-        Logging._metrics_scheduler_started = False
-        Logging._metrics_stop_event = threading.Event()
 
 
     @staticmethod
     def disable_buffering():
         """Disable log buffering for immediate writes."""
         Logging._buffer_enabled = False
-        
+
     @staticmethod
     def enable_buffering():
         """Enable log buffering for better performance."""
         Logging._buffer_enabled = True
-        
+
     @staticmethod
     def flush_logs():
         """Force flush all buffered logs."""

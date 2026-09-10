@@ -2,9 +2,13 @@ import os
 import json
 import time
 import gzip
+import math
 import uuid
 import sys
+import threading
+from collections.abc import Mapping
 from contextlib import contextmanager
+from enum import Enum
 from typing import Any, Dict, Iterable, Optional, Set
 from urllib.parse import urlparse
 
@@ -36,6 +40,7 @@ _GCP_PROJECT_ENV_KEYS = (
     "GCP_PROJECT",
 )
 _DIAGNOSTIC_ONCE_KEYS: Set[str] = set()
+_INITIALIZE_LOCK = threading.Lock()
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
@@ -131,6 +136,7 @@ class _RefreshingGoogleBearerSpanExporter:
     def __init__(self, inner, credentials):
         self._inner = inner
         self._credentials = credentials
+        self._force_refresh = False
 
     def _set_authorization_header(self, token: str) -> None:
         authorization = f"Bearer {token}"
@@ -145,7 +151,7 @@ class _RefreshingGoogleBearerSpanExporter:
             session_headers["Authorization"] = authorization
 
     def export(self, spans: Iterable[Any]):
-        token, err = _refresh_google_access_token(self._credentials)
+        token, err = _refresh_google_access_token(self._credentials, force=self._force_refresh)
         if token is None:
             _state.error = f"Google bearer token refresh failed: {err}"
             _emit_diagnostic(
@@ -156,7 +162,16 @@ class _RefreshingGoogleBearerSpanExporter:
             return _span_export_result_failure()
 
         self._set_authorization_header(token)
-        return self._inner.export(spans)
+        result = self._inner.export(spans)
+
+        # If export failed, force a refresh on the next export in case token was revoked
+        try:
+            from opentelemetry.sdk.trace.export import SpanExportResult
+            self._force_refresh = (result != SpanExportResult.SUCCESS)
+        except Exception:
+            self._force_refresh = True
+
+        return result
 
     def shutdown(self):
         fn = getattr(self._inner, "shutdown", None)
@@ -259,14 +274,30 @@ def _build_google_authorized_session(credentials):
         return None, f"Unable to create Google AuthorizedSession: {e}"
 
 
-def _refresh_google_access_token(credentials):
+def _refresh_google_access_token(credentials, force=False):
+    if not force:
+        try:
+            if getattr(credentials, "valid", False):
+                token = getattr(credentials, "token", None)
+                if token:
+                    return token, None
+        except Exception:
+            pass
+
     try:
         from google.auth.transport.requests import Request
     except Exception as e:
         return None, f"Unable to create Google auth request transport: {e}"
 
+    class TimeoutRequest(Request):
+        def __call__(self, url, method="GET", body=None, headers=None, timeout=None, **kwargs):
+            # Enforce a max timeout of 10 seconds for credentials refresh
+            if timeout is None or timeout > 10:
+                timeout = 10
+            return super().__call__(url, method=method, body=body, headers=headers, timeout=timeout, **kwargs)
+
     try:
-        credentials.refresh(Request())
+        credentials.refresh(TimeoutRequest())
         token = getattr(credentials, "token", None)
         if not token:
             return None, "Google credentials did not provide an access token."
@@ -379,6 +410,27 @@ def _parse_headers(header_str: str) -> Dict[str, str]:
     return headers
 
 
+def _json_safe_otel_value(value: Any) -> Any:
+    """Convert OTEL SDK values and immutable mappings into JSON-safe values."""
+    if isinstance(value, Enum):
+        return value.name
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_otel_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe_otel_value(item) for item in value]
+    try:
+        json.dumps(value)
+        return value
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _span_to_dict(span) -> Dict[str, Any]:
     # Convert ReadableSpan to a JSONable dict (best-effort, stable subset)
     ctx = span.get_span_context()
@@ -387,8 +439,7 @@ def _span_to_dict(span) -> Dict[str, Any]:
         if span.attributes:
             for k, v in span.attributes.items():
                 try:
-                    json.dumps(v)
-                    attrs[str(k)] = v
+                    attrs[str(k)] = _json_safe_otel_value(v)
                 except Exception:
                     attrs[str(k)] = str(v)
     except Exception:
@@ -400,7 +451,7 @@ def _span_to_dict(span) -> Dict[str, Any]:
             events.append({
                 "name": getattr(ev, "name", "event"),
                 "timestamp": getattr(ev, "timestamp", 0),
-                "attributes": getattr(ev, "attributes", {}) or {}
+                "attributes": _json_safe_otel_value(getattr(ev, "attributes", {}) or {})
             })
     except Exception:
         pass
@@ -418,19 +469,23 @@ def _span_to_dict(span) -> Dict[str, Any]:
         "name": getattr(span, "name", ""),
         "start_time_unix_nano": getattr(span, "start_time", 0),
         "end_time_unix_nano": getattr(span, "end_time", 0),
-        "status": getattr(getattr(span, "status", None), "status_code", "UNSET"),
-        "kind": getattr(span, "kind", "INTERNAL"),
+        "status": _json_safe_otel_value(
+            getattr(getattr(span, "status", None), "status_code", "UNSET")
+        ),
+        "kind": _json_safe_otel_value(getattr(span, "kind", "INTERNAL")),
         "attributes": attrs,
         "events": events,
-        "resource": getattr(getattr(span, "resource", None), "attributes", {}) or {},
+        "resource": _json_safe_otel_value(
+            getattr(getattr(span, "resource", None), "attributes", {}) or {}
+        ),
         "instrumentation": {
             "name": "pyeztrace",
-            "version": "0.1.2",
+            "version": "0.1.3",
         },
     }
 
 
-def enable_from_env() -> bool:
+def _enable_from_env_unlocked() -> bool:
     """Enable OpenTelemetry if EZTRACE_OTEL_ENABLED is true. Idempotent."""
     _state.enabled = _env_bool("EZTRACE_OTEL_ENABLED", False)
     _state.error = None
@@ -460,7 +515,7 @@ def enable_from_env() -> bool:
         resource_attrs: Dict[str, Any] = {
             "service.name": service_name,
             "library.name": "pyeztrace",
-            "library.version": "0.1.2",
+            "library.version": "0.1.3",
         }
 
         if _should_use_gcp_auth(otlp_endpoint, resolved_exporter_name):
@@ -480,18 +535,23 @@ def enable_from_env() -> bool:
 
         exporter, err = _build_exporter(resolved_exporter_name)
         if exporter is None:
-            # If exporter fails, fallback to console if possible; otherwise disable
-            _emit_diagnostic(
-                f"Failed to initialize exporter '{resolved_exporter_name}': {err}. Falling back to console exporter.",
-                once_key=f"exporter-fallback:{resolved_exporter_name}:{err}",
-            )
-            exporter, err2 = _build_exporter("console")
-            if exporter is None:
-                _state.error = err or err2
+            _state.error = err
+            allow_console_fallback = _env_bool("EZTRACE_OTEL_FALLBACK_TO_CONSOLE", False)
+            if allow_console_fallback and resolved_exporter_name.lower() not in ("console", "stdout"):
                 _emit_diagnostic(
-                    f"OTEL disabled because no exporter could be initialized: {_state.error}",
+                    f"Failed to initialize exporter '{resolved_exporter_name}': {err}. "
+                    "EZTRACE_OTEL_FALLBACK_TO_CONSOLE is enabled; spans will be written to stdout.",
+                    once_key=f"exporter-fallback:{resolved_exporter_name}:{err}",
+                )
+                exporter, fallback_err = _build_exporter("console")
+                if exporter is None:
+                    _state.error = err or fallback_err
+            if exporter is None:
+                _emit_diagnostic(
+                    f"OTEL disabled because exporter '{resolved_exporter_name}' could not be initialized: "
+                    f"{_state.error}",
                     level="ERROR",
-                    once_key=f"exporter-fatal:{_state.error}",
+                    once_key=f"exporter-fatal:{resolved_exporter_name}:{_state.error}",
                 )
                 _state.enabled = False
                 return False
@@ -521,6 +581,12 @@ def enable_from_env() -> bool:
         _state.enabled = False
         _state.initialized = False
         return False
+
+
+def enable_from_env() -> bool:
+    """Thread-safe entry point for lazy OpenTelemetry initialization."""
+    with _INITIALIZE_LOCK:
+        return _enable_from_env_unlocked()
 
 
 def is_enabled() -> bool:
@@ -581,7 +647,7 @@ def start_span(name: str, attributes: Optional[Dict[str, Any]] = None):
 
         try:
             yield span
-        except Exception:
+        except BaseException:
             exc_type, exc_value, exc_tb = sys.exc_info()
             try:
                 span_cm.__exit__(exc_type, exc_value, exc_tb)

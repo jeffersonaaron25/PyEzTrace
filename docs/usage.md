@@ -271,6 +271,7 @@ export EZTRACE_OTEL_ENABLED=true
 export EZTRACE_OTEL_EXPORTER=otlp
 export EZTRACE_OTLP_ENDPOINT="http://localhost:4318/v1/traces"
 # optional: export EZTRACE_SERVICE_NAME="my-service"
+# optional, default false: export EZTRACE_OTEL_FALLBACK_TO_CONSOLE=true
 ```
 
 **Google Cloud Trace (OTLP + ADC):**
@@ -297,7 +298,7 @@ export EZTRACE_OTEL_EXPORTER=console
 
 **S3 / Azure:** Install `pyeztrace[s3]` or `pyeztrace[azure]`, set `EZTRACE_OTEL_EXPORTER=s3` or `azure`, and the bucket/container and credential env vars. See the [README OpenTelemetry section](https://github.com/jeffersonaaron25/pyeztrace#10-opentelemetry-spans-optional) for full S3/Azure options.
 
-The bridge is lazy-loaded; if OTEL packages are missing, the library still works without spans. Spans use function `__qualname__`; exceptions are recorded on the active span.
+The bridge is lazy-loaded; if OTEL packages are missing, the library still works without spans. Spans use function `__qualname__`; exceptions are recorded on the active span. Remote exporter initialization fails closed unless `EZTRACE_OTEL_FALLBACK_TO_CONSOLE=true` is explicitly set.
 
 For troubleshooting, enable OTEL diagnostics:
 

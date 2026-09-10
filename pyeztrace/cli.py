@@ -136,7 +136,9 @@ class LogAnalyzer:
             # Calculate depth from call hierarchy
             depth = 0
             current_id = call_id
-            while current_id and current_id in call_hierarchy:
+            visited = set()
+            while current_id and current_id in call_hierarchy and current_id not in visited:
+                visited.add(current_id)
                 depth += 1
                 current_id = call_hierarchy[current_id]
             level_indent = depth

@@ -23,3 +23,21 @@ def test_double_initialize_raises():
     setup.Setup.initialize("EZTRACER_TEST3", show_metrics=False)
     with pytest.raises(exceptions.SetupAlreadyDoneError):
         setup.Setup.initialize("EZTRACER_TEST3", show_metrics=False)
+
+
+def test_failed_initialization_is_transactional():
+    from pyeztrace.config import config
+
+    original_format = config.format
+    with pytest.raises(ValueError, match="Unsupported log level"):
+        setup.Setup.initialize(
+            "BROKEN",
+            log_format="json",
+            log_level="verbose",
+        )
+
+    assert setup.Setup.is_setup_done() is False
+    assert config.format == original_format
+
+    setup.Setup.initialize("RECOVERED", log_level="INFO")
+    assert setup.Setup.get_project() == "RECOVERED"

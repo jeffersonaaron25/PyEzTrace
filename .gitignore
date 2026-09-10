@@ -47,4 +47,4 @@ site/
 
 # Project specific
 app.log*
-
+PROGRESS.md

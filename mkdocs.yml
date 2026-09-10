@@ -1,7 +1,7 @@
 # PyEzTrace documentation - https://www.mkdocs.org/user-guide/configuration/
 site_name: PyEzTrace
 site_description: Lightweight Python tracing and logging with hierarchical output and an interactive viewer
-site_url: https://jeffersonaaron25.github.io/pyeztrace/
+site_url: https://jeffersonaaron25.github.io/PyEzTrace/
 repo_url: https://github.com/jeffersonaaron25/pyeztrace
 repo_name: jeffersonaaron25/pyeztrace
 edit_uri: edit/main/docs/

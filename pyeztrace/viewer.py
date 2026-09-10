@@ -20,6 +20,16 @@ class _TraceTreeBuilder:
         self._cached_offset = 0
         self._cached_inode: Optional[tuple[int, int]] = None
         self._cached_remainder = ""
+        self._pruned_count = 0
+        self._version = 0
+        self._tree_cache = None
+        self._tree_cache_version = -1
+        self._tree_cache_metrics_mtime = None
+        self._tree_cache_metrics_size = None
+        self._logs_cache = None
+        self._logs_cache_version = -1
+        self._logs_cache_limit = -1
+        self._logs_cache_preview = -1
 
     def _stat_inode(self) -> Optional[tuple[int, int]]:
         try:
@@ -31,22 +41,24 @@ class _TraceTreeBuilder:
     def _metrics_file(self) -> Path:
         return Path(str(self.log_file) + ".metrics")
 
-    def _read_lines(self) -> List[str]:
-        if not self.log_file.exists():
-            return []
+    def _metrics_stat(self) -> tuple[float, int]:
+        metrics_file = self._metrics_file()
         try:
-            with self.log_file.open('r', encoding='utf-8', errors='ignore') as f:
-                return f.readlines()
+            st = metrics_file.stat()
+            return (st.st_mtime, st.st_size)
         except Exception:
-            return []
+            return (0.0, 0)
 
     def _read_entries_cached(self) -> List[Dict[str, Any]]:
         with self._entries_lock:
             if not self.log_file.exists():
-                self._cached_entries = []
-                self._cached_offset = 0
-                self._cached_inode = None
-                self._cached_remainder = ""
+                if self._cached_entries:
+                    self._cached_entries = []
+                    self._cached_offset = 0
+                    self._cached_inode = None
+                    self._cached_remainder = ""
+                    self._pruned_count = 0
+                    self._version += 1
                 return []
 
             inode = self._stat_inode()
@@ -66,12 +78,21 @@ class _TraceTreeBuilder:
                 self._cached_entries = []
                 self._cached_offset = 0
                 self._cached_remainder = ""
+                self._pruned_count = 0
+                self._version += 1
 
             self._cached_inode = inode
 
             try:
                 with self.log_file.open("r", encoding="utf-8", errors="ignore") as f:
-                    if self._cached_offset > 0:
+                    if self._cached_offset == 0 and size_now > 50 * 1024 * 1024:
+                        # Large file initial load optimization: seek to the last 50MB
+                        f.seek(size_now - 50 * 1024 * 1024)
+                        # Discard first partial line
+                        f.readline()
+                        # Estimate self._pruned_count using average line size of 500 bytes
+                        self._pruned_count = (size_now - 50 * 1024 * 1024) // 500
+                    elif self._cached_offset > 0:
                         f.seek(self._cached_offset)
                     chunk = f.read()
                     self._cached_offset = f.tell()
@@ -91,6 +112,13 @@ class _TraceTreeBuilder:
             parsed = self._parse_json_lines(lines)
             if parsed:
                 self._cached_entries.extend(parsed)
+                self._version += 1
+                # Keep cache bounded in size to prevent memory exhaustion in production
+                max_cache_size = 100000
+                if len(self._cached_entries) > max_cache_size:
+                    prune_amount = len(self._cached_entries) - max_cache_size
+                    self._pruned_count += prune_amount
+                    self._cached_entries = self._cached_entries[prune_amount:]
 
             return list(self._cached_entries)
 
@@ -153,6 +181,12 @@ class _TraceTreeBuilder:
         entry_idx: int,
         payload_preview_chars: int = 1200,
     ) -> Dict[str, Any]:
+        cached = entry.get("_cached_record")
+        if isinstance(cached, dict) and cached.get("_preview_limit") == payload_preview_chars:
+            record = cached.copy()
+            record["id"] = entry_idx
+            return record
+
         data = entry.get("data")
         if not isinstance(data, dict):
             data = {}
@@ -169,7 +203,7 @@ class _TraceTreeBuilder:
         if ts_epoch is None:
             ts_epoch = self._to_epoch(entry.get("timestamp", ""))
 
-        return {
+        record = {
             "id": entry_idx,
             "timestamp": entry.get("timestamp"),
             "timestamp_epoch": ts_epoch,
@@ -190,32 +224,57 @@ class _TraceTreeBuilder:
             "payload_keys": sorted([str(k) for k in data.keys()])[:40],
         }
 
+        cache_copy = record.copy()
+        cache_copy["_preview_limit"] = payload_preview_chars
+        entry["_cached_record"] = cache_copy
+
+        return record
+
     def build_logs(self, limit: int = 2000, payload_preview_chars: int = 1200) -> Dict[str, Any]:
         entries = self._read_entries_cached()
-        total_entries = len(entries)
-        start_idx = 0
-        if limit > 0 and total_entries > limit:
-            start_idx = total_entries - limit
-            entries_window = entries[start_idx:]
+        with self._entries_lock:
+            if (self._logs_cache is not None
+                    and self._logs_cache_version == self._version
+                    and self._logs_cache_limit == limit
+                    and self._logs_cache_preview == payload_preview_chars):
+                res = self._logs_cache.copy()
+                res["generated_at"] = time.time()
+                return res
+
+        total_entries = len(entries) + self._pruned_count
+        if limit > 0 and len(entries) > limit:
+            entries_window = entries[-limit:]
+            start_logical_idx = total_entries - limit
         else:
             entries_window = entries
+            start_logical_idx = self._pruned_count
 
         records = [
-            self._build_log_record(entry, start_idx + i, payload_preview_chars=payload_preview_chars)
+            self._build_log_record(entry, start_logical_idx + i, payload_preview_chars=payload_preview_chars)
             for i, entry in enumerate(entries_window)
         ]
-        return {
+
+        res_to_cache = {
             "generated_at": time.time(),
             "log_file": str(self.log_file),
             "total_entries": total_entries,
             "logs": records,
         }
 
+        with self._entries_lock:
+            self._logs_cache = res_to_cache
+            self._logs_cache_version = self._version
+            self._logs_cache_limit = limit
+            self._logs_cache_preview = payload_preview_chars
+
+        return res_to_cache
+
     def get_log_payload(self, entry_idx: int) -> Optional[Dict[str, Any]]:
         entries = self._read_entries_cached()
-        if entry_idx < 0 or entry_idx >= len(entries):
+        local_idx = entry_idx - self._pruned_count
+        if local_idx < 0 or local_idx >= len(entries):
             return None
-        entry = entries[entry_idx]
+        entry = entries[local_idx]
         data = entry.get("data")
         if not isinstance(data, dict):
             data = {}
@@ -229,6 +288,16 @@ class _TraceTreeBuilder:
 
     def build_tree(self) -> Dict[str, Any]:
         entries = self._read_entries_cached()
+        mtime, size = self._metrics_stat()
+        with self._entries_lock:
+            if (self._tree_cache is not None
+                    and self._tree_cache_version == self._version
+                    and self._tree_cache_metrics_mtime == mtime
+                    and self._tree_cache_metrics_size == size):
+                res = self._tree_cache.copy()
+                res['generated_at'] = time.time()
+                return res
+
         nodes: Dict[str, Dict[str, Any]] = {}
         metrics_entries_from_log: List[Dict[str, Any]] = []
         roots: List[str] = []
@@ -328,15 +397,34 @@ class _TraceTreeBuilder:
                 seen_as_child.add(c)
         roots = [cid for cid, n in nodes.items() if not n.get('parent_id') or cid not in seen_as_child]
 
-        # Convert to nested structure
+        # Convert to nested structure with cycle detection to prevent RecursionError on corrupted logs
+        visited = set()
+        materialized_cids = set()
         def materialize(cid: str) -> Dict[str, Any]:
-            n = nodes[cid]
-            return {
-                **{k: v for k, v in n.items() if k != 'children'},
-                'children': [materialize(child) for child in n['children']]
-            }
+            materialized_cids.add(cid)
+            if cid in visited:
+                n = nodes[cid]
+                return {
+                    **{k: v for k, v in n.items() if k != 'children'},
+                    'children': [],
+                    'error': 'Circular reference detected'
+                }
+            visited.add(cid)
+            try:
+                n = nodes[cid]
+                return {
+                    **{k: v for k, v in n.items() if k != 'children'},
+                    'children': [materialize(child) for child in n['children']]
+                }
+            finally:
+                visited.remove(cid)
 
         tree = [materialize(cid) for cid in roots]
+
+        # Any remaining nodes that were not materialized form unreached cycles; materialize them as roots
+        for cid in list(nodes.keys()):
+            if cid not in materialized_cids:
+                tree.append(materialize(cid))
 
         sidecar_metrics = self._read_metrics_sidecar()
         metrics_entries: List[Dict[str, Any]] = []
@@ -346,13 +434,21 @@ class _TraceTreeBuilder:
         else:
             metrics_entries = metrics_entries_from_log
 
-        return {
+        res_to_cache = {
             'generated_at': time.time(),
             'log_file': str(self.log_file),
             'roots': tree,
             'total_nodes': len(nodes),
             'metrics': metrics_entries
         }
+
+        with self._entries_lock:
+            self._tree_cache = res_to_cache
+            self._tree_cache_version = self._version
+            self._tree_cache_metrics_mtime = mtime
+            self._tree_cache_metrics_size = size
+
+        return res_to_cache
 
 
 class TraceViewerServer:
@@ -413,7 +509,8 @@ class TraceViewerServer:
                 elif parsed.path == '/api/entries':
                     # raw entries for debugging
                     entries = outer._builder._read_entries_cached()
-                    self._send(200, json.dumps(entries[-1000:]).encode('utf-8'), 'application/json')
+                    clean_entries = [{k: v for k, v in e.items() if not k.startswith("_")} for e in entries[-1000:]]
+                    self._send(200, json.dumps(clean_entries).encode('utf-8'), 'application/json')
                 else:
                     self._send(404, b'Not Found', 'text/plain')
 
@@ -728,7 +825,7 @@ class TraceViewerServer:
 
     def _js_bundle(self) -> str:
         return (
-            """
+            r"""
 
 
 (function(){

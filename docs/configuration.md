@@ -43,6 +43,7 @@ export EZTRACE_BUFFER_FLUSH_INTERVAL="1.0" # Seconds between flushes when buffer
 export EZTRACE_SAMPLE_RATE="1.0" # Global fixed sampling rate in [0.0, 1.0]
 export EZTRACE_ADAPTIVE_SAMPLING="false" # Keep slow/error traces at 100%, sample normal traces
 export EZTRACE_ADAPTIVE_SLOW_THRESHOLD="1.0" # Seconds; slow traces are always kept when adaptive is enabled
+export EZTRACE_OTEL_FALLBACK_TO_CONSOLE="false" # Explicitly allow stdout fallback after remote exporter setup failure
 ```
 
 Set these **before** the first traced or logging use so they apply when the logger is created.

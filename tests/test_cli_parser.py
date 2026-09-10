@@ -58,3 +58,19 @@ def test_json_lines_are_preserved(tmp_log: Path):
     entries = analyzer.parse_logs()
 
     assert entries == [payload]
+
+
+def test_format_json_entry_handles_cyclic_call_hierarchy(tmp_log: Path):
+    analyzer = LogAnalyzer(tmp_log)
+    entry = {
+        "timestamp": "2025-11-20T17:51:59",
+        "level": "INFO",
+        "project": "MYAPP",
+        "function": "work",
+        "message": "called...",
+        "data": {"call_id": "A"},
+    }
+
+    formatted = analyzer.format_json_entry(entry, {"A": "B", "B": "A"})
+
+    assert "work called..." in formatted

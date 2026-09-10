@@ -12,8 +12,7 @@ class Setup:
     """
     __project = None
     __setup_done = False
-    __thread_level = threading.local()
-    __async_level = contextvars.ContextVar("async_level", default=0)
+    __level_var = contextvars.ContextVar("eztrace_setup_level", default=0)
     __show_metrics = False
     __disable_file_logging = None
     __lock = threading.Lock()
@@ -137,28 +136,40 @@ class Setup:
         with cls.__lock:
             if cls.__setup_done:
                 raise exceptions.SetupAlreadyDoneError("Setup is already done.")
+
+            previous_config = config._config.copy()
+            previous_explicit = config._explicit.copy()
+            try:
+                project_name = str(project).upper()
+                cls._apply_runtime_config_overrides(
+                    log_format=log_format,
+                    console_format=console_format,
+                    file_format=file_format,
+                    log_level=log_level,
+                    log_file=log_file,
+                    log_dir=log_dir,
+                    max_size=max_size,
+                    backup_count=backup_count,
+                    buffer_enabled=buffer_enabled,
+                    buffer_flush_interval=buffer_flush_interval,
+                )
+                resolved_disable_file_logging = (
+                    config.disable_file_logging
+                    if disable_file_logging is None
+                    else bool(disable_file_logging)
+                )
+                if show_metrics:
+                    cls._register_metrics_handler()
+            except Exception:
+                config._config = previous_config
+                config._explicit = previous_explicit
+                raise
+
             cls.__setup_done = True
-            cls.__thread_level.value = 0
-            cls.__project = project.upper()
-            cls.__show_metrics = show_metrics
-            cls._apply_runtime_config_overrides(
-                log_format=log_format,
-                console_format=console_format,
-                file_format=file_format,
-                log_level=log_level,
-                log_file=log_file,
-                log_dir=log_dir,
-                max_size=max_size,
-                backup_count=backup_count,
-                buffer_enabled=buffer_enabled,
-                buffer_flush_interval=buffer_flush_interval,
-            )
-            if disable_file_logging is None:
-                cls.__disable_file_logging = config.disable_file_logging
-            else:
-                cls.__disable_file_logging = disable_file_logging
-            if show_metrics:
-                cls._register_metrics_handler()
+            cls.__level_var.set(0)
+            cls.__project = project_name
+            cls.__show_metrics = bool(show_metrics)
+            cls.__disable_file_logging = resolved_disable_file_logging
 
     @classmethod
     def _register_metrics_handler(cls):
@@ -181,37 +192,20 @@ class Setup:
 
     @classmethod
     def increment_level(cls):
-        with cls.__lock:
-            if cls._in_async_task():
-                current = cls.__async_level.get()
-                cls.__async_level.set(current + 1)
-            else:
-                if not hasattr(cls.__thread_level, "value"):
-                    cls.__thread_level.value = 0
-                cls.__thread_level.value += 1
+        cls.__level_var.set(cls.__level_var.get() + 1)
 
     @classmethod
     def decrement_level(cls):
-        with cls.__lock:
-            if cls._in_async_task():
-                current = cls.__async_level.get()
-                cls.__async_level.set(current - 1)
-            else:
-                if not hasattr(cls.__thread_level, "value"):
-                    cls.__thread_level.value = 0
-                cls.__thread_level.value -= 1
+        cls.__level_var.set(cls.__level_var.get() - 1)
 
     @classmethod
     def get_level(cls):
-        with cls.__lock:
-            if cls._in_async_task():
-                return cls.__async_level.get()
-            return getattr(cls.__thread_level, "value", 0)
+        return cls.__level_var.get()
 
     @classmethod
     def get_project(cls):
-        with cls.__lock:
-            return cls.__project
+        return cls.__project
+
 
     # Async methods (asyncio-safe)
     @classmethod
@@ -221,7 +215,7 @@ class Setup:
                 if cls.__setup_done:
                     raise exceptions.SetupAlreadyDoneError("Setup is already done.")
                 cls.__setup_done = True
-                cls.__async_level.set(0)
+                cls.__level_var.set(0)
                 cls.__project = project.upper()
 
     @classmethod
@@ -240,21 +234,19 @@ class Setup:
     async def async_increment_level(cls):
         async with cls.__async_lock:
             with cls.__lock:
-                current = cls.__async_level.get()
-                cls.__async_level.set(current + 1)
+                cls.increment_level()
 
     @classmethod
     async def async_decrement_level(cls):
         async with cls.__async_lock:
             with cls.__lock:
-                current = cls.__async_level.get()
-                cls.__async_level.set(current - 1)
+                cls.decrement_level()
 
     @classmethod
     async def async_get_level(cls):
         async with cls.__async_lock:
             with cls.__lock:
-                return cls.__async_level.get()
+                return cls.get_level()
 
     @classmethod
     async def async_get_project(cls):
@@ -277,8 +269,7 @@ class Setup:
         """
         Get whether to show metrics or not.
         """
-        with cls.__lock:
-            return cls.__show_metrics
+        return cls.__show_metrics
 
     @classmethod
     def reset(cls):
@@ -286,10 +277,9 @@ class Setup:
         with cls.__lock:
             cls.__project = None
             cls.__setup_done = False
-            cls.__thread_level.value = 0
             cls.__show_metrics = False
             cls.__disable_file_logging = None
-        cls.__async_level.set(0)
+        cls.__level_var.set(0)
 
     @classmethod
     def set_project(cls, project: str) -> None:
@@ -305,10 +295,10 @@ class Setup:
 
     @classmethod
     def get_disable_file_logging(cls) -> bool:
-        with cls.__lock:
-            if cls.__disable_file_logging is None:
-                return config.disable_file_logging
-            return cls.__disable_file_logging
+        if cls.__disable_file_logging is None:
+            return config.disable_file_logging
+        return cls.__disable_file_logging
+
 
     @classmethod
     def set_disable_file_logging(cls, disable: bool) -> None:
