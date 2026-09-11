@@ -180,14 +180,62 @@ hide all of them.
 
 ## Async support
 
+`Setup.async_initialize()` accepts the same arguments as `Setup.initialize()`.
+Both use the same lock and configuration transaction: invalid options leave
+setup uninitialized so you can correct them and retry. A second successful
+initialization raises `SetupAlreadyDoneError`, including when sync and async
+callers mix.
+
 ```python
-@trace()
-async def async_handler():
-    await some_async_work()
-    log.log_info("Done")
+import asyncio
+from pyeztrace import trace
+from pyeztrace.setup import Setup
+from pyeztrace.custom_logging import Logging
+
+async def main():
+    await Setup.async_initialize(
+        "MyApp", disable_file_logging=False, file_format="json",
+        log_dir="logs", log_file="app.log", buffer_enabled=True,
+        buffer_flush_interval=0.5,
+    )
+    log = Logging()
+
+    @trace()
+    async def async_handler():
+        with log.with_context(request_id="123"):
+            await asyncio.sleep(0.01)
+            log.log_info("Done")
+
+    await async_handler()
+    Logging.flush_logs()
+
+asyncio.run(main())
 ```
 
-Setup and level tracking are async-safe.
+Log contexts restore the previous context on success, exceptions, and
+cancellation. A context-manager instance can be reused or nested across tasks
+and threads; its exit tokens belong to each execution context. Contexts should
+exit in reverse entry order. Mutable objects stored as context values remain
+caller-owned and are not deep-copied.
+
+Logging before setup raises `pyeztrace.exceptions.SetupNotDoneError` (a subclass
+of `Exception`). Existing messages still contain `Setup is not done` for callers
+that already recognize that condition. Calling `@trace()` retains its existing
+lazy-initialization behavior.
+
+### Flushing and shutdown
+
+`Logging.flush_logs()` drains queued records and flushes the target handlers.
+Python's normal logging shutdown also flushes buffered records at interpreter
+exit, including an unhandled Python exception or a handled `KeyboardInterrupt`.
+Applications own their signal handling: this does not install SIGTERM handlers
+or promise delivery after `SIGKILL`, `os._exit()`, or a machine failure. Finish
+worker tasks/threads before shutdown; flush explicitly when inspecting a file
+before the process exits.
+
+Run `python scripts/smoke_runtime.py` with the Python installation you want to
+validate. It exercises concurrent logging, async setup, cancellation, and normal,
+exceptional, and interrupted subprocess shutdown using temporary files.
 
 ## Redirecting `print` to logging
 

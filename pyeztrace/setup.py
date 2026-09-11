@@ -209,14 +209,36 @@ class Setup:
 
     # Async methods (asyncio-safe)
     @classmethod
-    async def async_initialize(cls, project="eztracer"):
-        async with cls.__async_lock:
-            with cls.__lock:
-                if cls.__setup_done:
-                    raise exceptions.SetupAlreadyDoneError("Setup is already done.")
-                cls.__setup_done = True
-                cls.__level_var.set(0)
-                cls.__project = project.upper()
+    async def async_initialize(
+        cls,
+        project="eztracer",
+        show_metrics=False,
+        disable_file_logging=None,
+        *,
+        log_format: Optional[str] = None,
+        console_format: Optional[str] = None,
+        file_format: Optional[str] = None,
+        log_level: Optional[str] = None,
+        log_file: Optional[str] = None,
+        log_dir: Optional[str] = None,
+        max_size: Optional[int] = None,
+        backup_count: Optional[int] = None,
+        buffer_enabled: Optional[bool] = None,
+        buffer_flush_interval: Optional[float] = None,
+    ):
+        """Initialize with the same options and atomic state changes as initialize.
+
+        Setup only applies in-memory configuration; it does not perform I/O or
+        need a second event-loop-specific lock.
+        """
+        return cls.initialize(
+            project, show_metrics, disable_file_logging,
+            log_format=log_format, console_format=console_format,
+            file_format=file_format, log_level=log_level, log_file=log_file,
+            log_dir=log_dir, max_size=max_size, backup_count=backup_count,
+            buffer_enabled=buffer_enabled,
+            buffer_flush_interval=buffer_flush_interval,
+        )
 
     @classmethod
     async def async_is_setup_done(cls):
