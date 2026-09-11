@@ -15,6 +15,7 @@ import hashlib
 import math
 import warnings
 from pyeztrace.setup import Setup
+from pyeztrace.exceptions import SetupNotDoneError
 from pyeztrace.config import config
 
 from typing import Any, Callable, Optional, Union, Dict
@@ -84,6 +85,7 @@ def _positive_float_env(name: str, default: float) -> float:
 class LogContext:
     """Async-safe context management for logging."""
     _context_stack = contextvars.ContextVar("eztrace_log_context_stack", default=None)
+    _context_tokens = contextvars.ContextVar("eztrace_log_context_tokens", default=())
 
     @classmethod
     def get_current_context(cls) -> Dict:
@@ -101,11 +103,19 @@ class LogContext:
         if stack is None:
             stack = [{}]
         new_stack = stack + [{**stack[-1], **self.context}]
-        self._token = self.__class__._context_stack.set(new_stack)
+        cls = self.__class__
+        token = cls._context_stack.set(new_stack)
+        cls._context_tokens.set(cls._context_tokens.get() + ((self, token),))
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.__class__._context_stack.reset(self._token)
+        cls = self.__class__
+        tokens = cls._context_tokens.get()
+        if not tokens or tokens[-1][0] is not self:
+            raise RuntimeError("Log contexts must exit in reverse entry order")
+        # Reset first: a token from another task must fail without consuming it.
+        cls._context_stack.reset(tokens[-1][1])
+        cls._context_tokens.set(tokens[:-1])
 
 
 class BufferedHandler(logging.Handler):
@@ -167,6 +177,7 @@ class BufferedHandler(logging.Handler):
                             self.handleError(record)
                     except queue.Empty:
                         break
+                self.target_handler.flush()
             finally:
                 self.target_handler.release()
             self.last_flush = time.time()
@@ -236,7 +247,7 @@ class Logging:
         log_format: 'color', 'plain', 'json', 'csv', 'logfmt', or a callable
         """
         if not Setup.is_setup_done():
-            raise Exception("Setup is not done. Cannot initialize logging.")
+            raise SetupNotDoneError("Setup is not done. Cannot initialize logging.")
 
         env_buffer_enabled = os.environ.get("EZTRACE_BUFFER_ENABLED")
         env_flush_interval = os.environ.get("EZTRACE_BUFFER_FLUSH_INTERVAL")
@@ -510,7 +521,7 @@ class Logging:
             else:
                 log_method(msg)
         else:
-            raise Exception(f"Setup is not done. Cannot log {level.lower()}.")
+            raise SetupNotDoneError(f"Setup is not done. Cannot log {level.lower()}.")
 
     @staticmethod
     def log_info(
@@ -593,7 +604,7 @@ class Logging:
 
             raise exception
         else:
-            raise Exception("Setup is not done. Cannot raise exception.")
+            raise SetupNotDoneError("Setup is not done. Cannot raise exception.")
 
     @staticmethod
     def show_full_traceback() -> None:
@@ -602,7 +613,7 @@ class Logging:
             logger = logging.getLogger("pyeztrace")
             logger.error(traceback.format_exc())
         else:
-            raise Exception("Setup is not done. Cannot show full traceback.")
+            raise SetupNotDoneError("Setup is not done. Cannot show full traceback.")
 
     @staticmethod
     def record_metric(func_name: str, duration: float) -> None:

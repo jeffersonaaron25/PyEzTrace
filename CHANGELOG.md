@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.5
+- Made async setup accept the same options and use the same transactional initialization as synchronous setup.
+- Raised `SetupNotDoneError` consistently from uninitialized logging calls while preserving existing error messages.
+- Fixed logging-context token cleanup when one context instance is nested or shared across tasks and threads.
+- Made buffered-handler flushes reach the target handler, including targets with their own buffers.
+- Added cancellation, context-reuse, and real-process shutdown regressions.
+
 ## v0.1.4
 - Added optional browser opening, guided startup states, connection status, explicit retry, and separate read/trace timestamps to the live viewer.
 - Added running-call badges and elapsed timers; excluded unfinished calls from outcome rates and displayed unavailable resource metrics explicitly.
