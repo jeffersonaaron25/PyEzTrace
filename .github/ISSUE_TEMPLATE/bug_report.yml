@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a reproducible problem with tracing, logging, the CLI, or the viewer.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues first. Use synthetic examples and remove secrets, credentials, and personal data from code and logs.
+  - type: input
+    id: version
+    attributes:
+      label: PyEzTrace version
+      description: Run `python -m pip show pyeztrace` in the affected environment.
+      placeholder: "0.1.5"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Python and operating system
+      placeholder: "Python 3.12, macOS 15; Chrome for viewer issues"
+    validations:
+      required: true
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Setup and relevant configuration
+      description: Include Setup.initialize options, relevant EZTRACE variables, and installed extras. For OTEL, include exporter type and diagnostics with credentials removed.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include a small runnable example and the exact commands or viewer steps. For async or threading issues, include how tasks or workers start and stop.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and output
+      description: Include the traceback, CLI exit status, or a small sanitized log sample when relevant.
+    validations:
+      required: true

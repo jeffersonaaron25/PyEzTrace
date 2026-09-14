@@ -10,10 +10,20 @@ from collections import Counter
 from datetime import datetime
 from functools import wraps
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from socketserver import TCPServer
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 import time
+
+
+class _ViewerHTTPServer(ThreadingHTTPServer):
+    """Bind without reverse DNS: the viewer only needs its numeric address."""
+
+    def server_bind(self):
+        TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
 
 
 def _synchronized(method):
@@ -3374,7 +3384,7 @@ class TraceViewerServer:
 
     def serve_forever(self, open_browser: bool = False) -> None:
         try:
-            self._httpd = ThreadingHTTPServer((self.host, self.port), self._handler_factory())
+            self._httpd = _ViewerHTTPServer((self.host, self.port), self._handler_factory())
             self.port = self._httpd.server_address[1]
         except OSError as exc:
             import errno

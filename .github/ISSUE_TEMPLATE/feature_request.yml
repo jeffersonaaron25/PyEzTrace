@@ -1,0 +1,34 @@
+name: Feature request
+description: Explain a debugging problem and the improvement that would help.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues first. PyEzTrace focuses on tracing, logging, local inspection, and optional OTEL export with a dependency-free core.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow
+      description: What are you trying to understand or debug, and where does the current behavior fall short?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Show an example API call, CLI command, or viewer interaction and its expected result.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround or alternatives
+      description: What have you tried? Explain why existing options are insufficient.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Compatibility and dependencies
+      description: Note any API changes, optional packages, or external services the proposal would require, if known.

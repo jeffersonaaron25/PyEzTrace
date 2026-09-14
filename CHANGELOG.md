@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.6
+- Removed reverse-DNS lookup from viewer startup to avoid blocking on local hostname resolution.
+- Exported lazy `get_otel_status()` diagnostics and reported existing OTEL provider conflicts without replacing the host provider.
+- Added scoped Ruff checks, CI coverage summaries, a security policy, and a complete environment-variable reference.
+- Added a real-Collector OTLP smoke script verifying async span relationships, errors, and shutdown export.
+- Added guides for choosing standard logging, PyEzTrace, and the optional OpenTelemetry bridge.
+- Added structured bug-report and feature-request forms.
+- Set the GitHub homepage to the documentation site and added logging, tracing, OpenTelemetry, and observability topics.
+- Linked the decision guides from the README, documentation navigation, and LLM documentation index.
+- Corrected storage-exporter installation examples to include the required OTEL extra.
+
 ## v0.1.5
 - Made async setup accept the same options and use the same transactional initialization as synchronous setup.
 - Raised `SetupNotDoneError` consistently from uninitialized logging calls while preserving existing error messages.

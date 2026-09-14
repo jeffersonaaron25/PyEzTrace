@@ -513,6 +513,17 @@ def _enable_from_env_unlocked() -> bool:
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+        # A provider is process-global and cannot be replaced once installed.
+        # Do not report our exporter as active while spans use another provider.
+        if not isinstance(ot_trace.get_tracer_provider(), ot_trace.ProxyTracerProvider):
+            _state.error = (
+                "An OpenTelemetry tracer provider is already installed. "
+                "PyEzTrace cannot configure its exporter; use one provider owner."
+            )
+            _state.enabled = False
+            _emit_diagnostic(_state.error, level="ERROR", once_key="provider-already-installed")
+            return False
+
         resource_attrs: Dict[str, Any] = {
             "service.name": service_name,
             "library.name": "pyeztrace",

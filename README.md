@@ -10,6 +10,12 @@ A dependency-free, lightweight Python tracing and logging library with hierarchi
 
 Requires Python 3.9 or newer.
 
+## Is PyEzTrace right for this task?
+
+- [Standard logging and PyEzTrace](https://jeffersonaaron25.github.io/PyEzTrace/standard-logging/): messages, call trees, and how they fit together.
+- [When to use OpenTelemetry](https://jeffersonaaron25.github.io/PyEzTrace/opentelemetry/): local inspection or optional span export.
+- [Report a bug or suggest a feature](https://github.com/jeffersonaaron25/PyEzTrace/issues/new/choose).
+
 ## Features
 
 - **Hierarchical Logging**: Visualize nested operations with tree-style output
@@ -41,10 +47,10 @@ pip install "pyeztrace[otel]"
 pip install "pyeztrace[otel,gcp]"
 
 # S3 exporter
-pip install "pyeztrace[s3]"
+pip install "pyeztrace[otel,s3]"
 
 # Azure Blob exporter
-pip install "pyeztrace[azure]"
+pip install "pyeztrace[otel,azure]"
 
 # Everything
 pip install "pyeztrace[all]"
@@ -456,7 +462,7 @@ export EZTRACE_OTEL_EXPORTER=console
 Export span batches to S3 as JSONL (gzipped by default) without a collector:
 
 ```bash
-pip install "pyeztrace[s3]"
+pip install "pyeztrace[otel,s3]"
 export EZTRACE_OTEL_ENABLED=true
 export EZTRACE_OTEL_EXPORTER=s3
 export EZTRACE_S3_BUCKET="my-trace-bucket"
@@ -468,7 +474,7 @@ export EZTRACE_COMPRESS=true                      # optional, default true
 Export span batches to Azure Blob Storage:
 
 ```bash
-pip install "pyeztrace[azure]"
+pip install "pyeztrace[otel,azure]"
 export EZTRACE_OTEL_ENABLED=true
 export EZTRACE_OTEL_EXPORTER=azure
 export EZTRACE_AZURE_CONTAINER="trace-container"
@@ -485,7 +491,7 @@ Notes:
 - Exceptions are recorded on the active span when OTEL is enabled.
 - Set `EZTRACE_OTEL_DEBUG=true` to emit one-time OTEL diagnostics to stderr (startup status and no-op reasons).
 - Remote exporter initialization fails closed by default. Set `EZTRACE_OTEL_FALLBACK_TO_CONSOLE=true` only when stdout fallback is intentional.
-- Inspect runtime OTEL state with `from pyeztrace import otel; print(otel.get_otel_status())` (available in newer builds after `0.1.1`).
+- Inspect runtime OTEL state with `from pyeztrace import get_otel_status; print(get_otel_status())` (top-level export available since `0.1.6`).
 
 ## Advanced Usage
 

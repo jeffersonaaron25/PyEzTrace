@@ -67,7 +67,10 @@ plugins:
           - index.md: Project overview and quick start.
           - getting-started.md: Installation and initialization guide.
           - usage.md: Tracing, logging, and viewer usage.
+          - standard-logging.md: Choosing PyEzTrace or standard logging.
+          - opentelemetry.md: When to enable the optional OpenTelemetry bridge.
           - configuration.md: Configuration reference.
+          - environment.md: Complete environment variable reference.
           - contributing.md: Contribution workflow.
   - copy-to-llm:
       repo_url: "https://raw.githubusercontent.com/jeffersonaaron25/pyeztrace/main/"
@@ -84,7 +87,11 @@ nav:
   - Home: index.md
   - Getting Started: getting-started.md
   - Usage: usage.md
+  - Choosing a tool:
+      - Standard logging and PyEzTrace: standard-logging.md
+      - When to use OpenTelemetry: opentelemetry.md
   - Configuration: configuration.md
+  - Environment variables: environment.md
   - Contributing: contributing.md
 
 extra:
