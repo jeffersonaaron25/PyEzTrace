@@ -1,6 +1,8 @@
 # Configuration
 
-All options can be set via **environment variables** or **code**. Precedence: `Setup.initialize(...)` kwargs &gt; env vars &gt; defaults.
+Logging setup options can be set via **environment variables** or **code**. Precedence: `Setup.initialize(...)` kwargs &gt; env vars &gt; defaults.
+
+See the [complete environment reference](environment.md) for all logging, viewer, redaction, sampling, and exporter settings, including those without setup arguments.
 
 ## Via `Setup.initialize()`
 

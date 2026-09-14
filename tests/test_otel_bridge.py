@@ -699,3 +699,29 @@ def test_otlp_exporter_google_bearer_fallback_refreshes_after_failure(monkeypatc
 
     assert export_headers == ["Bearer initial-token", "Bearer refreshed-token-1"]
     assert created["credentials"].refresh_calls == 1
+
+
+def test_existing_provider_is_preserved_and_conflict_reported(monkeypatch):
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from pyeztrace import get_otel_status
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    ot_trace.set_tracer_provider(provider)
+    monkeypatch.setenv('EZTRACE_OTEL_ENABLED', 'true')
+    monkeypatch.setenv('EZTRACE_OTEL_EXPORTER', 'console')
+    try:
+        assert otel.enable_from_env() is False
+        status = get_otel_status()
+        assert not status['enabled'] and not status['initialized']
+        assert status['exporter'] is None
+        assert 'already installed' in status['error']
+        assert ot_trace.get_tracer_provider() is provider
+        with ot_trace.get_tracer('host-app').start_as_current_span('host-span'):
+            pass
+        assert [span.name for span in exporter.get_finished_spans()] == ['host-span']
+    finally:
+        provider.shutdown()

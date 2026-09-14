@@ -63,3 +63,6 @@ pyeztrace serve logs/app.log --open
 - [Getting Started](getting-started.md) - Installation and initialization
 - [Usage](usage.md) - Tracing, context, formats, viewer, and async support
 - [Configuration](configuration.md) - Environment variables and `Setup.initialize()` options
+
+- [Standard logging and PyEzTrace](standard-logging.md) - Choose based on your debugging question
+- [When to use OpenTelemetry](opentelemetry.md) - Decide whether to export spans

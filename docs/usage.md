@@ -381,6 +381,8 @@ Use `--level`, `--since`, `--until` to filter. `--analyze` shows performance met
 
 ## OpenTelemetry (optional)
 
+Start with [When to use OpenTelemetry](opentelemetry.md) for a runnable console example and guidance on local inspection versus span export.
+
 Install: `pip install "pyeztrace[otel]"`. Enable with environment variables.
 
 **OTLP (collector):**
@@ -415,7 +417,7 @@ export EZTRACE_OTEL_ENABLED=true
 export EZTRACE_OTEL_EXPORTER=console
 ```
 
-**S3 / Azure:** Install `pyeztrace[s3]` or `pyeztrace[azure]`, set `EZTRACE_OTEL_EXPORTER=s3` or `azure`, and the bucket/container and credential env vars. See the [README OpenTelemetry section](https://github.com/jeffersonaaron25/pyeztrace#10-opentelemetry-spans-optional) for full S3/Azure options.
+**S3 / Azure:** Install `pyeztrace[otel,s3]` or `pyeztrace[otel,azure]`, set `EZTRACE_OTEL_EXPORTER=s3` or `azure`, and the bucket/container and credential env vars. See the [README OpenTelemetry section](https://github.com/jeffersonaaron25/pyeztrace#10-opentelemetry-spans-optional) for full S3/Azure options.
 
 The bridge is lazy-loaded; if OTEL packages are missing, the library still works without spans. Spans use function `__qualname__`; exceptions are recorded on the active span. Remote exporter initialization fails closed unless `EZTRACE_OTEL_FALLBACK_TO_CONSOLE=true` is explicitly set.
 
@@ -428,11 +430,11 @@ export EZTRACE_OTEL_DEBUG=true
 And inspect runtime OTEL state in code:
 
 ```python
-from pyeztrace import otel
-print(otel.get_otel_status())
+from pyeztrace import get_otel_status
+print(get_otel_status())
 ```
 
-`otel.get_otel_status()` is available in newer builds after `0.1.1`.
+The top-level `get_otel_status()` export is available since 0.1.6. It reports current bridge state without initializing OTEL or importing its SDK; `enabled` and `initialized` can remain false before the first traced call even when the environment enables tracing. The existing `pyeztrace.otel.get_otel_status()` path still works.
 
 ## Scripted and agent-driven CLI use
 
