@@ -82,6 +82,13 @@ def test_polling_races_and_unavailable_metrics(tmp_path):
     assert(elapsedIsLive(), 'timer did not resume after recovery');
     assert(parseSecs(elapsedHtml(node)) >= frozenSecs, 'timer went backwards after recovery');
 
+    statusFilter = 'all'; minDurationMs = 0; fnTypeFilter = 'all';
+    const malicious = '<img src=x onerror=alert(1)>';
+    const flame = buildFlameGraph([{call_id:'x', function:malicious,
+      status:'success', duration:1, start_time:1, end_time:2, children:[]}], '');
+    assert(!flame.includes('<img'), 'flame graph interpolated HTML from a trace');
+    assert(flame.includes('&lt;img'), 'flame graph dropped escaped trace text');
+
     console.log('PASS: pause race, status count, frozen timer, retry, unavailable metrics, monotonic elapsed');
   })().catch(err=>{ console.error(err); process.exitCode=1; });
 })();

@@ -386,6 +386,7 @@ class Logging:
         # Merge context with kwargs
         context = LogContext.get_current_context()
         merged_kwargs = {**context, **kwargs}
+        record_envelope = merged_kwargs.pop("_eztrace_envelope", None)
         forced_level = merged_kwargs.pop("_eztrace_level_override", None)
         safe_merged_kwargs = _json_safe(merged_kwargs)
         include_data_in_output = Logging._show_data_in_cli
@@ -441,6 +442,8 @@ class Logging:
                 "message": message,
                 "data": safe_merged_kwargs,
             }
+            if record_envelope is not None:
+                payload.update(record_envelope)
             if duration is not None:
                 payload["duration"] = _json_safe(duration)
             return json.dumps(payload, ensure_ascii=False, allow_nan=False)
@@ -499,6 +502,11 @@ class Logging:
                     "kwargs": merged_kwargs,
                 })
                 return
+
+            from pyeztrace.events import envelope
+            event = merged_kwargs.get("event", "")
+            kind = "run" if str(event).startswith("run_") else ("call" if merged_kwargs.get("call_id") else "log")
+            merged_kwargs["_eztrace_envelope"] = envelope("llm" if merged_kwargs.get("kind") == "llm" else kind)
 
             console_format = Logging._console_format or "color"
             file_format = Logging._file_format or "json"

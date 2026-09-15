@@ -530,3 +530,18 @@ def test_same_size_in_place_rewrite_is_detected(tmp_path):
     assert after["generation"] != before["generation"]
     assert after["record_count"] == 1
     assert [n["call_id"] for n in builder.build_tree()["roots"]] == ["BBBB"]
+
+
+def test_viewer_rejects_foreign_host_and_origin(running_server):
+    base, log = running_server
+    for headers in ({'Host': 'attacker.example'}, {'Origin': 'https://attacker.example'}, {'Origin': 'null'}):
+        request = urllib.request.Request(base + '/api/tree', headers=headers)
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        assert error.value.code == 403
+    with urllib.request.urlopen(base + '/') as response:
+        assert response.headers['X-Content-Type-Options'] == 'nosniff'
+        assert response.headers['Cache-Control'] == 'no-store'
+        policy = response.headers['Content-Security-Policy']
+        assert "frame-ancestors 'none'" in policy
+        assert "script-src 'self' 'sha256-" in policy

@@ -280,6 +280,9 @@ def _port(value):
 
 def main():
     """Main entry point for the pyeztrace CLI command."""
+    from pyeztrace.agent_cli import COMMANDS, main as inspect_main
+    if len(sys.argv) > 1 and sys.argv[1] in COMMANDS:
+        return inspect_main(sys.argv[1:])
     parser = argparse.ArgumentParser(
         description="PyEzTrace Log Analyzer and Viewer",
         prog="pyeztrace", allow_abbrev=False
@@ -293,6 +296,8 @@ def main():
     )
     
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    for command in sorted(COMMANDS):
+        subparsers.add_parser(command, help='Bounded JSON trace inspection (use ' + command + ' --help)')
 
     # Analyze / print subcommand (default)
     parser_print = subparsers.add_parser('print', help='Print or analyze logs', allow_abbrev=False)

@@ -594,3 +594,10 @@ Contributions are welcome! Please read our [Contributing Guidelines](CONTRIBUTIN
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+### 0.2.0 development
+
+The development branch adds [agent inspection commands](docs/agent-cli.md) and
+[optional local LLM tracing](docs/llm-tracing.md). SDKs remain optional; the core
+has no required dependencies. See the [development contract](docs/design/0.2.0.md)
+for scope and release gates. These additions are not part of published 0.1.6.
