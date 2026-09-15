@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0.dev0 (unreleased)
+## 0.2.0.dev0
 - Added versioned JSON event envelopes and explicit run scopes.
 - Added bounded JSON runs/tree/call/path/errors/payload inspection with structured errors and snapshot cursors.
 - Added optional OpenAI Chat Completions/Responses, Anthropic Messages, and LangChain adapters with local content capture, redaction, usage, and streaming lifecycle tracking.
