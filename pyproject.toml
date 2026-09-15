@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyeztrace"
-version = "0.1.6"
+version = "0.2.0.dev0"
 description = "A dependency-free, lightweight Python tracing and logging library"
 readme = "README.md"
 authors = [{ name = "Jefferson Nelsson", email = "jefferson.nelsson@gmail.com" }]
@@ -39,6 +39,10 @@ exclude = ["tests*"]
 
 [project.optional-dependencies]
 # Keep default install dependency-free. Users can opt-in to extras below.
+openai = ["openai>=3.13.0"]
+anthropic = ["anthropic>=1.5.0"]
+langchain = ["langchain-core>=1.6.3"]
+llm = ["pyeztrace[openai,anthropic,langchain]"]
 otel = [
     "opentelemetry-api>=1.23.0",
     "opentelemetry-sdk>=1.23.0",
