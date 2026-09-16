@@ -63,7 +63,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install optional SDKs and test tools
-        run: python -m pip install -e '.[llm]' pytest pytest-asyncio pip-audit
+        run: |
+          python -m pip install --upgrade "setuptools>=83"
+          python -m pip install -e '.[llm]' pytest pytest-asyncio pip-audit
       - name: Test SDK adapters with synthetic transports
         run: python -m pytest -q tests/test_llm.py tests/test_llm_sdks.py
       - name: Audit installed dependencies
