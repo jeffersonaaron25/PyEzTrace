@@ -1,0 +1,17 @@
+# PyEzTrace
+
+> Lightweight Python tracing and logging with hierarchical output and an interactive viewer
+
+Lightweight Python tracing and logging documentation for PyEzTrace.
+
+## Documentation
+
+- [Home](https://jeffersonaaron25.github.io/PyEzTrace/index.md): Project overview and quick start.
+- [Getting Started](https://jeffersonaaron25.github.io/PyEzTrace/getting-started/index.md): Installation and initialization guide.
+- [Usage](https://jeffersonaaron25.github.io/PyEzTrace/usage/index.md): Tracing, logging, and viewer usage.
+- [Standard logging and PyEzTrace](https://jeffersonaaron25.github.io/PyEzTrace/standard-logging/index.md): Choosing PyEzTrace or standard logging.
+- [When to use OpenTelemetry](https://jeffersonaaron25.github.io/PyEzTrace/opentelemetry/index.md): When to enable the optional OpenTelemetry bridge.
+- [Configuration](https://jeffersonaaron25.github.io/PyEzTrace/configuration/index.md): Configuration reference.
+- [Environment variables](https://jeffersonaaron25.github.io/PyEzTrace/environment/index.md): Complete environment variable reference.
+- [Contributing](https://jeffersonaaron25.github.io/PyEzTrace/contributing/index.md): Contribution workflow.
+
