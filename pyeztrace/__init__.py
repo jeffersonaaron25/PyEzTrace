@@ -1,9 +1,12 @@
 """PyEzTrace package exports."""
 
-__all__ = ["Logging", "trace", "set_global_redaction", "print", "get_otel_status"]
+__all__ = ["Logging", "trace", "set_global_redaction", "print", "get_otel_status", "Run"]
 
 
 def __getattr__(name):
+    if name == "Run":
+        from .events import Run
+        return Run
     if name == "Logging":
         from .custom_logging import Logging
         return Logging

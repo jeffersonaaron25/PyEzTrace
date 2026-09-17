@@ -67,6 +67,8 @@ plugins:
           - index.md: Project overview and quick start.
           - getting-started.md: Installation and initialization guide.
           - usage.md: Tracing, logging, and viewer usage.
+          - agent-cli.md: Bounded machine-readable run and call inspection.
+          - llm-tracing.md: Optional local LLM SDK adapters and capture controls.
           - standard-logging.md: Choosing PyEzTrace or standard logging.
           - opentelemetry.md: When to enable the optional OpenTelemetry bridge.
           - configuration.md: Configuration reference.
@@ -87,6 +89,9 @@ nav:
   - Home: index.md
   - Getting Started: getting-started.md
   - Usage: usage.md
+  - Agent CLI: agent-cli.md
+  - Local LLM tracing: llm-tracing.md
+  - 0.2.0 development contract: design/0.2.0.md
   - Choosing a tool:
       - Standard logging and PyEzTrace: standard-logging.md
       - When to use OpenTelemetry: opentelemetry.md

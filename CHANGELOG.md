@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0.dev0
+- Added versioned JSON event envelopes and explicit run scopes.
+- Added bounded JSON runs/tree/call/path/errors/payload inspection with structured errors and snapshot cursors.
+- Added optional OpenAI Chat Completions/Responses, Anthropic Messages, and LangChain adapters with local content capture, redaction, usage, and streaming lifecycle tracking.
+- Added run/LLM details to the viewer and hardened HTML rendering and local HTTP access.
+- Kept required core dependencies empty; SDKs install only through optional extras.
+
 ## v0.1.6
 - Removed reverse-DNS lookup from viewer startup to avoid blocking on local hostname resolution.
 - Exported lazy `get_otel_status()` diagnostics and reported existing OTEL provider conflicts without replacing the host provider.

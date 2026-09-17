@@ -1,4 +1,6 @@
 import hashlib
+import base64
+import re
 import json
 import math
 import os
@@ -531,6 +533,9 @@ class _TraceTreeBuilder:
                 'status': status if status is not None else node.get('status'),
                 'level': node.get('level') or e.get('level'),
                 'project': node.get('project') or e.get('project'),
+                'run_id': e.get('run_id') or node.get('run_id'),
+                'kind': data.get('kind') or node.get('kind') or 'call',
+                'llm': data.get('llm') or node.get('llm'),
             })
 
             if parent_id:
@@ -646,10 +651,30 @@ class TraceViewerServer:
                 self.send_response(code)
                 self.send_header('Content-Type', ctype)
                 self.send_header('Content-Length', str(len(body)))
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Referrer-Policy', 'no-referrer')
+                self.send_header('X-Frame-Options', 'DENY')
+                if ctype.startswith('text/html'):
+                    inline = re.findall(r'<script>(.*?)</script>', body.decode('utf-8'), re.S)
+                    hashes = ' '.join("'sha256-" + base64.b64encode(hashlib.sha256(script.encode()).digest()).decode() + "'" for script in inline)
+                    self.send_header('Content-Security-Policy', "default-src 'none'; script-src 'self' " + hashes + "; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
                 self.end_headers()
                 self.wfile.write(body)
 
             def do_GET(self):  # noqa: N802 (keep stdlib name)
+                # Reject DNS rebinding and cross-origin reads of local trace data.
+                try:
+                    host = urlparse('//'+self.headers.get('Host', '')).hostname
+                    allowed = {outer.host.lower(), 'localhost', '127.0.0.1', '::1', self.connection.getsockname()[0]}
+                    origin = self.headers.get('Origin')
+                    parsed_origin = urlparse(origin) if origin else None
+                    if host not in allowed or (parsed_origin and (parsed_origin.scheme != 'http' or parsed_origin.hostname != host or (parsed_origin.port or 80) != self.server.server_port)):
+                        self._send(403, b'{"error":"origin_not_allowed"}')
+                        return
+                except ValueError:
+                    self._send(403, b'{"error":"invalid_origin"}')
+                    return
                 parsed = urlparse(self.path)
                 query = parse_qs(parsed.query)
                 if parsed.path == '/':
@@ -1911,7 +1936,7 @@ class TraceViewerServer:
   }
 
   function matchFilter(node, q){
-    const hay = [node.function||'', node.error||'', node.call_id||'', node.parent_id||'', node.status||''].join(' ').toLowerCase();
+    const hay = [node.function||'', node.error||'', node.call_id||'', node.parent_id||'', node.status||'', node.run_id||'', node.kind||'', (node.llm||{}).model||''].join(' ').toLowerCase();
     return hay.includes(q);
   }
   function passesStatus(node){
@@ -2108,7 +2133,7 @@ class TraceViewerServer:
       const label = `${n.function || n.call_id} (${fmtDuration(n.duration)})`;
       const isError = n.error || n.status === 'error';
       const text = width > 9 ? cleanFnName(n.function || n.call_id) : '';
-      return `<div class="flame-bar ${isError ? 'error' : ''}" style="left:${left}%;width:${width}%;top:${top}px;" title="${label}">${text}</div>`;
+      return `<div class="flame-bar ${isError ? 'error' : ''}" style="left:${left}%;width:${width}%;top:${top}px;" title="${escapeAttr(label)}">${escapeHtml(text)}</div>`;
     }).join('');
     return `
       <div class="insight-panel traces-panel">
@@ -2808,6 +2833,8 @@ class TraceViewerServer:
         <div class="kv ${hasError ? 'error-kv' : ''}"><strong>Status:</strong> ${escapeHtml(node.status || '-')} ${running ? runningPill() : ''}</div>
         <div class="kv"><strong>Call ID:</strong> ${escapeHtml(node.call_id || '-')}</div>
         <div class="kv"><strong>Parent ID:</strong> ${escapeHtml(node.parent_id || '-')}</div>
+        <div class="kv"><strong>Run ID:</strong> ${escapeHtml(node.run_id || 'legacy')}</div>
+        <div class="kv"><strong>Kind:</strong> ${escapeHtml(node.kind || 'call')}</div>
         <div class="kv"><strong>Start:</strong> ${fmtTime(node.start_time)} • <strong>End:</strong> ${running ? 'in progress' : fmtTime(node.end_time)}</div>
         ${running
           ? `<div class="kv"><strong>Elapsed:</strong> ${elapsedHtml(node) || '-'} • <strong>CPU:</strong> pending • <strong>Mem&#916;:</strong> pending • <strong>Mem mode:</strong> ${escapeHtml(node.mem_mode || 'pending')}</div>
@@ -2815,6 +2842,7 @@ class TraceViewerServer:
           : `<div class="kv"><strong>Duration:</strong> ${fmtDuration(node.duration)} • <strong>CPU:</strong> ${node.cpu_time == null ? '-' : fmt(node.cpu_time) + 's'} • <strong>Mem&#916;:</strong> ${node.mem_delta_kb ?? '-'} • <strong>Mem mode:</strong> ${escapeHtml(node.mem_mode || '-')}</div>`}
         ${error}
       </div>
+      ${node.llm ? `<div class="detail-block"><div class="detail-title">LLM operation</div><div class="kv">${escapeHtml(JSON.stringify(node.llm, null, 2))}</div></div>` : ''}
       <div class="detail-block"><div class="detail-title">Args</div><div class="kv">${escapeHtml(args)}</div></div>
       <div class="detail-block"><div class="detail-title">Kwargs</div><div class="kv">${escapeHtml(kwargs)}</div></div>
       <div class="detail-block"><div class="detail-title">Result</div><div class="kv">${escapeHtml(result)}</div></div>

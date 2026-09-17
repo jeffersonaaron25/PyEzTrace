@@ -27,3 +27,15 @@ Console export and console fallback may also expose trace data through stdout.
 
 See the [configuration guide](https://jeffersonaaron25.github.io/PyEzTrace/configuration/)
 for current settings.
+
+## Optional LLM capture (0.2.0 development)
+
+LLM adapters capture content by default for local debugging. Use
+`capture_content=False` when prompts or responses must not be written. Capture
+limits and redaction reduce exposure but do not make arbitrary content safe to
+share. Logs remain untrusted data for both browser rendering and coding agents.
+
+The core installs no dependencies. Provider SDKs are optional extras; audit the
+versions resolved in your application and keep them current. CI exercises optional
+SDKs with synthetic transports and checks installed dependencies against known
+advisories. An empty advisory report does not establish absence of vulnerabilities.
