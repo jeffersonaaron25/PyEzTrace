@@ -920,6 +920,7 @@ class TraceViewerServer:
     .detail-error .detail-error-title { display: flex; align-items: center; gap: 6px; color: #fecaca; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; font-weight: 700; }
     .kv.error-kv { border-color: rgba(239,68,68,0.6); background: rgba(239,68,68,0.14); color: #ffe4e6; white-space: pre-wrap; word-break: break-word; }
     #trace-details { min-height: 0; flex: 1; overflow: auto; padding-right: 4px; }
+    .llm-preview { white-space: pre-wrap; max-height: 11rem; overflow: auto; }
     .logs-wrap { display: grid; grid-template-columns: minmax(380px, 1fr) minmax(380px, 1fr); gap: 12px; }
     .logs-controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
     .logs-list-wrap { height: 70vh; max-height: 70vh; min-height: 320px; border: 1px solid var(--border); border-radius: 8px; background: rgba(17,24,39,0.45); overflow: hidden; }
@@ -2809,7 +2810,7 @@ class TraceViewerServer:
       // A running call has no duration yet - show live elapsed time instead of a
       // dash, and never imply the call took 0ms.
       const duration = running ? (elapsedHtml(n) || 'running') : (n.duration != null ? fmtDuration(n.duration) : '-');
-      const shortId = (n.call_id || '-').slice(0, 8);
+      const shortId = escapeHtml((n.call_id || '-').slice(0, 8));
       const start = n.start_time ? new Date(n.start_time*1000).toLocaleTimeString() : '-';
       return `
         <div class="trace-row ${isSelected ? 'selected' : ''} ${hasError ? 'error' : ''}" data-action="select-call" data-call-id="${escapeAttr(n.call_id || '')}" style="padding-left:${depthPad}px;" title="call_id=${escapeAttr(n.call_id || '')} parent_id=${escapeAttr(n.parent_id || '-')}">
@@ -2826,6 +2827,30 @@ class TraceViewerServer:
       `;
     }).join('') || '<div class="muted">No trace nodes found for current filters.</div>';
     renderSelectionStrip();
+  }
+
+  function renderLlmDetails(llm){
+    function preview(title, capture){
+      if(typeof capture?.text !== 'string') return '';
+      let content = capture.text;
+      try { content = JSON.stringify(JSON.parse(content), null, 2); } catch {}
+      return `<div class="detail-title">${title}${capture.truncated ? ' (truncated)' : ''}</div>
+              <div class="kv llm-preview">${escapeHtml(content)}</div>`;
+    }
+    const usage = Object.entries(llm.usage || {}).map(([key, value]) =>
+      `${escapeHtml(key.replace(/_/g, ' '))}: ${escapeHtml(String(value))}`).join(' · ');
+    const tools = Array.isArray(llm.tool_calls) ? llm.tool_calls.map(tool =>
+      `${escapeHtml(tool?.name || 'tool')} (${escapeHtml(tool?.id || '-')})`).join(', ') : '';
+    const output = Array.isArray(llm.output) ? llm.output : [];
+    return `<div class="detail-block">
+      <div class="detail-title">LLM operation</div>
+      <div class="kv"><strong>Provider:</strong> ${escapeHtml(llm.provider || '-')} · <strong>Model:</strong> ${escapeHtml(llm.model || '-')}</div>
+      ${usage ? `<div class="kv"><strong>Usage:</strong> ${usage}</div>` : ''}
+      ${tools ? `<div class="kv"><strong>Requested tools:</strong> ${tools}</div>` : ''}
+      ${llm.error_type ? `<div class="kv"><strong>Error type:</strong> ${escapeHtml(llm.error_type)}</div>` : ''}
+      ${preview('Input', llm.input)}
+      ${output.map(capture => preview('Output', capture)).join('')}
+    </div>`;
   }
 
   function renderTraceDetails(activeTree){
@@ -2848,6 +2873,7 @@ class TraceViewerServer:
       </div>
     ` : '';
     traceDetailsEl.innerHTML = `
+      ${node.llm ? renderLlmDetails(node.llm) : ''}
       <div class="detail-block">
         <div class="detail-title ${hasError ? 'error' : ''}">Overview</div>
         <div class="kv"><strong>Function:</strong> ${escapeHtml(cleanFnName(node.function || '-'))}</div>
@@ -2863,10 +2889,10 @@ class TraceViewerServer:
           : `<div class="kv"><strong>Duration:</strong> ${fmtDuration(node.duration)} • <strong>CPU:</strong> ${node.cpu_time == null ? '-' : fmt(node.cpu_time) + 's'} • <strong>Mem&#916;:</strong> ${node.mem_delta_kb ?? '-'} • <strong>Mem mode:</strong> ${escapeHtml(node.mem_mode || '-')}</div>`}
         ${error}
       </div>
-      ${node.llm ? `<div class="detail-block"><div class="detail-title">LLM operation</div><div class="kv">${escapeHtml(JSON.stringify(node.llm, null, 2))}</div></div>` : ''}
-      <div class="detail-block"><div class="detail-title">Args</div><div class="kv">${escapeHtml(args)}</div></div>
-      <div class="detail-block"><div class="detail-title">Kwargs</div><div class="kv">${escapeHtml(kwargs)}</div></div>
-      <div class="detail-block"><div class="detail-title">Result</div><div class="kv">${escapeHtml(result)}</div></div>
+      ${node.llm ? '' : `
+        <div class="detail-block"><div class="detail-title">Args</div><div class="kv">${escapeHtml(args)}</div></div>
+        <div class="detail-block"><div class="detail-title">Kwargs</div><div class="kv">${escapeHtml(kwargs)}</div></div>
+        <div class="detail-block"><div class="detail-title">Result</div><div class="kv">${escapeHtml(result)}</div></div>`}
       <div class="detail-block">
         <div class="detail-title">Linked logs (${relatedLogs.length})</div>
         ${relatedLogs.length ? relatedLogs.map(l=>`

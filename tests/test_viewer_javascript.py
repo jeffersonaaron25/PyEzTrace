@@ -16,6 +16,16 @@ def test_polling_races_and_unavailable_metrics(tmp_path):
     start = bundle.rindex('  loadState();')
     bundle = bundle[:start] + r'''
   (async()=>{
+    const llm = renderLlmDetails({
+      provider: '<em>fixture</em>', input: {text: '{"prompt":"<b>Hi</b>"}'},
+      output: [{text: 'Sample answer'}], usage: {input_tokens: 12},
+    });
+    assert(llm.includes('&lt;b&gt;Hi&lt;/b&gt;') && !llm.includes('<em>fixture</em>'),
+           'LLM capture rendered as HTML');
+    assert(llm.includes('Sample answer') && llm.includes('input tokens: 12'),
+           'LLM capture details are missing');
+    assert(getPathSet(new Map([['a', 'b'], ['b', 'a']]), 'a').size === 2,
+           'path selection loops on a cyclic log');
     render = ()=>{}; renderStatusBar = ()=>{}; renderEmptyState = ()=>{};
     rebuildCallToRunMap = ()=>{}; renderFnTypeOptions = ()=>{};
     scheduleRefresh = ()=>{};
