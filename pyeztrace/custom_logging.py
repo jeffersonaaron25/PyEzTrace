@@ -26,8 +26,10 @@ def _open_private_file(path, flags):
 
 
 class _PrivateRotatingFileHandler(RotatingFileHandler):
+    _open_with_permissions = staticmethod(open)
+
     def _open(self):
-        return self._builtin_open(
+        return self._open_with_permissions(
             self.baseFilename, self.mode, encoding=self.encoding, errors=self.errors,
             opener=_open_private_file,
         )
