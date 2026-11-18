@@ -96,6 +96,52 @@ def test_console_exporter_emits_span(monkeypatch):
     assert "test" in output
 
 
+def test_provider_error_preserves_identity_without_exporting_details(monkeypatch, tmp_path):
+    from opentelemetry.sdk.trace.export import ConsoleSpanExporter
+
+    from pyeztrace import trace
+    from pyeztrace.custom_logging import Logging
+    from pyeztrace.integrations.sdk import trace_openai
+
+    sensitive = "private-provider-detail"
+    failure = RuntimeError(sensitive)
+    monkeypatch.setenv("EZTRACE_OTEL_ENABLED", "true")
+    monkeypatch.setenv("EZTRACE_OTEL_EXPORTER", "console")
+    exported = io.StringIO()
+    monkeypatch.setattr(otel, "_build_exporter",
+                        lambda *args: (ConsoleSpanExporter(out=exported), None))
+    monkeypatch.setattr(Logging, "_configured", False)
+    Setup.disable_testing_mode()
+    log_path = tmp_path / "privacy.jsonl"
+    Setup.initialize("PRIVACY", log_dir=tmp_path, log_file=log_path.name,
+                     file_format="json", disable_file_logging=False)
+    Logging()
+
+    def create(**kwargs):
+        raise failure
+
+    client = trace_openai(types.SimpleNamespace(
+        responses=types.SimpleNamespace(create=create)), capture_content=False)
+
+    @trace(stack=True)
+    def support_request():
+        return client.responses.create(model="fixture", input="support ticket")
+
+    with pytest.raises(RuntimeError) as caught:
+        support_request()
+    assert caught.value is failure
+    Logging.flush_logs()
+    assert otel._state.span_processor.force_flush(timeout_millis=5000)
+    log = log_path.read_text()
+    assert "Error: RuntimeError" in log
+    assert sensitive not in log
+    span = json.loads(exported.getvalue())
+    assert span["status"]["status_code"] == "ERROR"
+    assert [event["attributes"] for event in span["events"]] == [
+        {"exception.type": "RuntimeError"}
+    ]
+
+
 def test_otlp_exporter_sends_data_to_local_collector(monkeypatch):
     received = queue.Queue()
 
@@ -370,7 +416,9 @@ def test_start_span_closes_context_for_base_exceptions(monkeypatch):
             exit_args.append(args)
 
     class FakeTracer:
-        def start_as_current_span(self, _name, attributes=None):
+        def start_as_current_span(self, _name, **kwargs):
+            assert kwargs["record_exception"] is False
+            assert kwargs["set_status_on_exception"] is False
             return FakeSpanContext()
 
     otel._state.enabled = True

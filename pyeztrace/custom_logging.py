@@ -21,6 +21,18 @@ from pyeztrace.config import config
 from typing import Any, Callable, Optional, Union, Dict
 
 
+def _open_private_file(path, flags):
+    return os.open(path, flags, 0o600)
+
+
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    def _open(self):
+        return self._builtin_open(
+            self.baseFilename, self.mode, encoding=self.encoding, errors=self.errors,
+            opener=_open_private_file,
+        )
+
+
 def _json_safe(value: Any, *, _seen: Optional[set] = None, _depth: int = 0) -> Any:
     """Return a bounded, JSON-safe representation without raising into application code."""
     if value is None or isinstance(value, (bool, int, str)):
@@ -330,7 +342,7 @@ class Logging:
                         logger.removeHandler(handler)
 
 
-                file_handler = RotatingFileHandler(
+                file_handler = _PrivateRotatingFileHandler(
                     filename=str(log_path),
                     maxBytes=config.max_size,
                     backupCount=config.backup_count,
@@ -789,7 +801,7 @@ class Logging:
                 parent_dir = os.path.dirname(os.fspath(metrics_path))
                 if parent_dir:
                     os.makedirs(parent_dir, exist_ok=True)
-                with open(metrics_path, "a", encoding="utf-8") as f:
+                with open(metrics_path, "a", encoding="utf-8", opener=_open_private_file) as f:
                     f.write(json.dumps(snapshot) + "\n")
                 Logging._last_metrics_sidecar_fingerprint = fingerprint
             except Exception:

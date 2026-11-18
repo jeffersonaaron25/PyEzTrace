@@ -5,6 +5,8 @@
 - Added bounded JSON runs/tree/call/path/errors/payload inspection with structured errors and snapshot cursors.
 - Added optional OpenAI Chat Completions/Responses, Anthropic Messages, and LangChain adapters with local content capture, redaction, usage, and streaming lifecycle tracking.
 - Added run/LLM details to the viewer and hardened HTML rendering and local HTTP access.
+- Kept provider exception details out of enclosing trace logs and OpenTelemetry spans. New local log files default to owner-only access on POSIX.
+- Preserved both LLM input and output in the viewer and bounded reads of oversized or malformed trace sources.
 - Kept required core dependencies empty; SDKs install only through optional extras.
 
 ## v0.1.6

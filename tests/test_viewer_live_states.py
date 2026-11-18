@@ -7,6 +7,7 @@ poll time as data freshness, and must never present a running call as a
 zero-duration one.
 """
 import json
+import os
 import threading
 import time
 import urllib.error
@@ -53,6 +54,23 @@ def test_missing_file_is_reported_as_waiting(tmp_path):
     assert state["file_exists"] is False
     assert state["record_count"] == 0
     assert state["newest_event_at"] is None
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFO")
+def test_viewer_rejects_fifo_without_waiting(tmp_path):
+    path = tmp_path / "pipe.log"
+    os.mkfifo(path)
+    state = _TraceTreeBuilder(path).source_state()
+    assert state["status"] == "read_error"
+
+
+def test_llm_details_keep_both_capture_events(tmp_path):
+    path = tmp_path / "llm.log"
+    _append(path, _record("call", "start", llm={"model": "fixture", "input": {"text": "Question"}}),
+            _record("call", "end", llm={"usage": {"output_tokens": 2}, "output": [{"text": "Answer"}]}))
+    details = _TraceTreeBuilder(path).build_tree()["roots"][0]["llm"]
+    assert details["input"]["text"] == "Question"
+    assert details["output"][0]["text"] == "Answer"
 
 
 def test_empty_file_is_distinct_from_missing_file(tmp_path):
@@ -399,7 +417,7 @@ def test_unreadable_source_preserves_records(tmp_path, monkeypatch):
     builder.build_tree()
     def denied(*args, **kwargs):
         raise PermissionError('permission denied')
-    monkeypatch.setattr(Path, 'open', denied)
+    monkeypatch.setattr('pyeztrace.viewer.open_regular_file', denied)
     state = builder.source_state()
     assert state['status'] == 'read_error'
     assert state['record_count'] == 1

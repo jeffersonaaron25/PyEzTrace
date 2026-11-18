@@ -638,7 +638,10 @@ def start_span(name: str, attributes: Optional[Dict[str, Any]] = None):
             attributes = {}
 
         try:
-            span_cm = tracer.start_as_current_span(name, attributes=attributes)
+            # Trace wrappers record the exception explicitly after applying privacy policy.
+            span_cm = tracer.start_as_current_span(
+                name, attributes=attributes, record_exception=False, set_status_on_exception=False
+            )
         except Exception as e:
             _emit_diagnostic(
                 f"start_span('{name}') degraded to no-op: unable to create span context manager ({e}).",
@@ -661,6 +664,8 @@ def start_span(name: str, attributes: Optional[Dict[str, Any]] = None):
             yield span
         except BaseException:
             exc_type, exc_value, exc_tb = sys.exc_info()
+            if not isinstance(exc_value, Exception):
+                record_exception(span, exc_value, hide_details=True)
             try:
                 span_cm.__exit__(exc_type, exc_value, exc_tb)
             except Exception as e:
@@ -694,14 +699,17 @@ def start_span(name: str, attributes: Optional[Dict[str, Any]] = None):
         yield None
 
 
-def record_exception(span, exc: BaseException):
+def record_exception(span, exc: BaseException, *, hide_details=False):
     try:
         if span is None:
             return
         # Record exception and mark status as error
         from opentelemetry.trace.status import Status, StatusCode
         try:
-            span.record_exception(exc)
+            if hide_details:
+                span.add_event("exception", {"exception.type": type(exc).__qualname__})
+            else:
+                span.record_exception(exc)
         except Exception:
             pass
         try:

@@ -8,6 +8,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 import types
 import uuid
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ except Exception:
     resource = None  # type: ignore
 from pyeztrace.setup import Setup
 from pyeztrace.custom_logging import Logging
+from pyeztrace.exceptions import has_private_exception_details, protect_exception_details
 from pyeztrace.otel import start_span, record_exception, is_enabled
 from pyeztrace.config import config
 
@@ -210,6 +212,25 @@ def _resolve_redaction(
         return _global_redaction_override
 
     return _redaction_from_env()
+
+
+def _trace_exception_details(exc, span=None, *, include_stack=False):
+    # An exception or a source line in its traceback can flatten fields into
+    # free text. The structured redactor cannot reliably apply key rules here.
+    private = _resolve_redaction() is not None or has_private_exception_details(exc)
+    if private:
+        protect_exception_details(exc)
+    record_exception(span, exc, hide_details=private)
+    if private:
+        return type(exc).__qualname__, None
+    return str(exc), traceback.format_exc() if include_stack else None
+
+
+def _print_trace_failure(func, exc):
+    message, stack_trace = _trace_exception_details(exc, include_stack=True)
+    print(f"TRACE ERROR: {func.__qualname__} - {message}")
+    if stack_trace is not None:
+        print(stack_trace, end="", file=sys.stderr)
 
 
 def _get_start_cpu() -> Optional[float]:
@@ -898,8 +919,9 @@ def child_trace_decorator(func: F) -> F:
                     _sampled_record_metric(func.__qualname__, duration)
                     return result
                 except Exception as e:
+                    error_message, _ = _trace_exception_details(e, _span)
                     _sampled_log_error(
-                        f"Error: {str(e)}",
+                        f"Error: {error_message}",
                         fn_type="child",
                         function=func.__qualname__,
                         event="error",
@@ -908,7 +930,6 @@ def child_trace_decorator(func: F) -> F:
                         parent_id=parent_id,
                         time_epoch=time.time()
                     )
-                    record_exception(_span, e)
                     setattr(e, "_eztrace_logged", True)
                     raise
                 finally:
@@ -975,8 +996,9 @@ def child_trace_decorator(func: F) -> F:
                                 yield item
                         completed = True
                     except Exception as exc:
+                        error_message, _ = _trace_exception_details(exc, span)
                         _sampled_log_error(
-                            f"Error: {str(exc)}",
+                            f"Error: {error_message}",
                             fn_type="child",
                             function=func.__qualname__,
                             event="error",
@@ -985,7 +1007,6 @@ def child_trace_decorator(func: F) -> F:
                             parent_id=parent_id,
                             time_epoch=time.time(),
                         )
-                        record_exception(span, exc)
                         setattr(exc, "_eztrace_logged", True)
                         raise
 
@@ -1071,8 +1092,9 @@ def child_trace_decorator(func: F) -> F:
                             generator_result = yield from func(*args, **kwargs)
                         completed = True
                     except Exception as exc:
+                        error_message, _ = _trace_exception_details(exc, span)
                         _sampled_log_error(
-                            f"Error: {str(exc)}",
+                            f"Error: {error_message}",
                             fn_type="child",
                             function=func.__qualname__,
                             event="error",
@@ -1081,7 +1103,6 @@ def child_trace_decorator(func: F) -> F:
                             parent_id=parent_id,
                             time_epoch=time.time(),
                         )
-                        record_exception(span, exc)
                         setattr(exc, "_eztrace_logged", True)
                         raise
 
@@ -1201,8 +1222,9 @@ def child_trace_decorator(func: F) -> F:
                     _sampled_record_metric(func.__qualname__, duration)
                     return result
                 except Exception as e:
+                    error_message, _ = _trace_exception_details(e, _span)
                     _sampled_log_error(
-                        f"Error: {str(e)}",
+                        f"Error: {error_message}",
                         fn_type="child",
                         function=func.__qualname__,
                         event="error",
@@ -1211,7 +1233,6 @@ def child_trace_decorator(func: F) -> F:
                         parent_id=parent_id,
                         time_epoch=time.time()
                     )
-                    record_exception(_span, e)
                     setattr(e, "_eztrace_logged", True)
                     raise
                 finally:
@@ -1551,7 +1572,9 @@ def trace(
                                 end = time.time()
                                 trace_duration = end - start
                                 trace_had_error = True
-                                error_message = f"{message} -> {str(e)}" if message else str(e)
+                                error_message, stack_trace = _trace_exception_details(e, _span, include_stack=stack)
+                                if message:
+                                    error_message = f"{message} -> {error_message}"
                                 _sampled_log_error(
                                     f"Error: {error_message}",
                                     fn_type="parent",
@@ -1563,12 +1586,10 @@ def trace(
                                     parent_id=parent_id,
                                     time_epoch=end
                                 )
-                                record_exception(_span, e)
                                 setattr(e, "_eztrace_logged", True)
-                                if stack:
-                                    import traceback
+                                if stack_trace is not None:
                                     _sampled_log_error(
-                                        traceback.format_exc(),
+                                        stack_trace,
                                         fn_type="parent",
                                         function=func.__qualname__,
                                         event="stack",
@@ -1593,9 +1614,7 @@ def trace(
                     if getattr(e, "_eztrace_logged", False):
                         raise
                     # Fallback for catastrophic tracer setup failures only.
-                    print(f"TRACE ERROR: {func.__qualname__} - {str(e)}")
-                    import traceback
-                    traceback.print_exc()
+                    _print_trace_failure(func, e)
                     raise
                 finally:
                     try:
@@ -1721,7 +1740,9 @@ def trace(
                         end = time.time()
                         trace_duration = end - start
                         trace_had_error = True
-                        error_message = f"{message} -> {str(e)}" if message else str(e)
+                        error_message, stack_trace = _trace_exception_details(e, _span, include_stack=stack)
+                        if message:
+                            error_message = f"{message} -> {error_message}"
                         _sampled_log_error(
                             f"Error: {error_message}",
                             fn_type="parent",
@@ -1733,12 +1754,10 @@ def trace(
                             parent_id=parent_id,
                             time_epoch=end
                         )
-                        record_exception(_span, e)
                         setattr(e, "_eztrace_logged", True)
-                        if stack:
-                            import traceback
+                        if stack_trace is not None:
                             _sampled_log_error(
-                                traceback.format_exc(),
+                                stack_trace,
                                 fn_type="parent",
                                 function=func.__qualname__,
                                 event="stack",
@@ -1755,9 +1774,7 @@ def trace(
                         raise
                     if getattr(e, "_eztrace_logged", False):
                         raise
-                    print(f"TRACE ERROR: {func.__qualname__} - {str(e)}")
-                    import traceback
-                    traceback.print_exc()
+                    _print_trace_failure(func, e)
                     raise
                 finally:
                     # Clean up context managers even if an exception occurs
@@ -1886,7 +1903,9 @@ def trace(
                         end = time.time()
                         trace_duration = end - start
                         trace_had_error = True
-                        error_message = f"{message} -> {str(e)}" if message else str(e)
+                        error_message, stack_trace = _trace_exception_details(e, _span, include_stack=stack)
+                        if message:
+                            error_message = f"{message} -> {error_message}"
                         _sampled_log_error(
                             f"Error: {error_message}",
                             fn_type="parent",
@@ -1898,12 +1917,10 @@ def trace(
                             parent_id=parent_id,
                             time_epoch=end
                         )
-                        record_exception(_span, e)
                         setattr(e, "_eztrace_logged", True)
-                        if stack:
-                            import traceback
+                        if stack_trace is not None:
                             _sampled_log_error(
-                                traceback.format_exc(),
+                                stack_trace,
                                 fn_type="parent",
                                 function=func.__qualname__,
                                 event="stack",
@@ -1920,9 +1937,7 @@ def trace(
                         raise
                     if getattr(e, "_eztrace_logged", False):
                         raise
-                    print(f"TRACE ERROR: {func.__qualname__} - {str(e)}")
-                    import traceback
-                    traceback.print_exc()
+                    _print_trace_failure(func, e)
                     raise
                 finally:
                     # Clean up context managers even if an exception occurs
@@ -2060,7 +2075,9 @@ def trace(
                                 duration = end - start
                                 trace_duration = duration
                                 trace_had_error = True
-                                error_message = f"{message} -> {str(e)}" if message else str(e)
+                                error_message, stack_trace = _trace_exception_details(e, _span, include_stack=stack)
+                                if message:
+                                    error_message = f"{message} -> {error_message}"
                                 _sampled_log_error(
                                     f"Error: {error_message}",
                                     fn_type="parent",
@@ -2072,12 +2089,10 @@ def trace(
                                     parent_id=parent_id,
                                     time_epoch=end
                                 )
-                                record_exception(_span, e)
                                 setattr(e, "_eztrace_logged", True)
-                                if stack:
-                                    import traceback
+                                if stack_trace is not None:
                                     _sampled_log_error(
-                                        traceback.format_exc(),
+                                        stack_trace,
                                         fn_type="parent",
                                         function=func.__qualname__,
                                         event="stack",
@@ -2102,9 +2117,7 @@ def trace(
                     if getattr(e, "_eztrace_logged", False):
                         raise
                     # Fallback for catastrophic tracer setup failures only.
-                    print(f"TRACE ERROR: {func.__qualname__} - {str(e)}")
-                    import traceback
-                    traceback.print_exc()
+                    _print_trace_failure(func, e)
                     raise
                 finally:
                     try:
