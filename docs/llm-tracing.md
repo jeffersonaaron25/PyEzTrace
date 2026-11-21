@@ -1,4 +1,4 @@
-# Local LLM tracing (0.2.0 development)
+# Local LLM tracing
 
 LLM tracing is optional. `pip install pyeztrace` still installs no runtime
 dependencies. Install only the SDK you use:
@@ -104,8 +104,8 @@ and traceback, including in exported OpenTelemetry spans. Ordinary decorated
 functions also omit exception details when tracer redaction is configured.
 Request headers and client state are outside the adapter's capture surface.
 Metadata-only mode affects LLM records. Review argument and return previews on
-surrounding decorators separately, and use redaction where they carry sensitive
-data.
+surrounding decorators separately. Messages your application logs explicitly
+are written as supplied, so sanitize sensitive data before logging it.
 
 On POSIX platforms, new trace files and files created after rotation default to
 owner-only access. Review existing file permissions before reusing a log path.

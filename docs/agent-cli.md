@@ -1,4 +1,4 @@
-# Agent inspection (0.2.0 development)
+# Agent inspection
 
 The new inspection commands read one local JSON log snapshot and return JSON on
 stdout. Existing `print` and `serve` commands retain their existing behavior.
