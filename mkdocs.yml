@@ -91,7 +91,7 @@ nav:
   - Usage: usage.md
   - Agent CLI: agent-cli.md
   - Local LLM tracing: llm-tracing.md
-  - 0.2.0 development contract: design/0.2.0.md
+  - 0.2.0 implementation contract: design/0.2.0.md
   - Choosing a tool:
       - Standard logging and PyEzTrace: standard-logging.md
       - When to use OpenTelemetry: opentelemetry.md

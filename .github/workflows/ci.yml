@@ -8,7 +8,7 @@ on:
 
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-22.04' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -63,10 +63,20 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install optional SDKs and test tools
+        id: llm-env
         run: |
-          python -m pip install --upgrade "setuptools>=83"
-          python -m pip install -e '.[llm]' pytest pytest-asyncio pip-audit
+          python -m pip install --upgrade pip "setuptools>=84.1"
+          python -m pip install -e '.[llm]' pytest pytest-asyncio
+          echo "site=$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" >> "$GITHUB_OUTPUT"
       - name: Test SDK adapters with synthetic transports
         run: python -m pytest -q tests/test_llm.py tests/test_llm_sdks.py
+      - name: Set up a separate Python for the audit tool
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - name: Audit installed dependencies
-        run: python -m pip_audit --skip-editable
+        env:
+          AUDIT_SITE_PACKAGES: ${{ steps.llm-env.outputs.site }}
+        run: |
+          python -m pip install --upgrade pip pip-audit "filelock>=4.2.1"
+          python -m pip_audit --path "$AUDIT_SITE_PACKAGES" --skip-editable

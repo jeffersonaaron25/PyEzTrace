@@ -5,7 +5,6 @@ import json
 import math
 import os
 import shlex
-import stat
 import sys
 import threading
 from collections import Counter
@@ -17,6 +16,8 @@ from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 import time
+
+from pyeztrace.inspection import InspectionError, MAX_RECORD_BYTES, open_regular_file
 
 
 class _ViewerHTTPServer(ThreadingHTTPServer):
@@ -59,6 +60,7 @@ class _TraceTreeBuilder:
         self._cached_offset = 0
         self._cached_inode: Optional[tuple[int, int]] = None
         self._cached_remainder = b""
+        self._discard_partial_line = False
         self._pruned_count = 0
         self._version = 0
         # Source-state tracking. These let the UI distinguish "no file yet",
@@ -107,6 +109,7 @@ class _TraceTreeBuilder:
         self._cached_offset = 0
         self._cached_inode = None
         self._cached_remainder = b""
+        self._discard_partial_line = False
         self._pruned_count = 0
         self._unparsed_lines = 0
         self._newest_event_at = None
@@ -119,6 +122,7 @@ class _TraceTreeBuilder:
         self._version += 1
 
     _HEAD_SCAN_BYTES = 65536
+    _MAX_READ_BYTES = 50 * 1024 * 1024
 
     def _read_head_key(self, handle) -> Optional[str]:
         """Hash the log's first COMPLETE line, or None if there isn't one yet.
@@ -149,16 +153,14 @@ class _TraceTreeBuilder:
         elif len(head) < self._HEAD_SCAN_BYTES:
             # Nothing written yet, or the first line is still incomplete.
             return None
-        return hashlib.sha1(head).hexdigest()[:16]
+        return hashlib.sha256(head).hexdigest()[:16]
 
     @_synchronized
     def _read_entries_cached(self) -> List[Dict[str, Any]]:
         self._read_error = None
         try:
-            with self.log_file.open("rb") as f:
+            with open_regular_file(self.log_file) as f:
                 st = os.fstat(f.fileno())
-                if not stat.S_ISREG(st.st_mode):
-                    raise OSError("Trace source must be a regular file")
                 inode = (st.st_dev, st.st_ino)
                 self._file_exists = True
                 self._file_size = st.st_size
@@ -184,14 +186,14 @@ class _TraceTreeBuilder:
                 # and discards the user's selection.
                 self._generation_head = head_key
                 self._generation = "empty" if head_key is None else f"{inode[0]}-{inode[1]}-{head_key}"
-                if self._cached_offset == 0 and st.st_size > 50 * 1024 * 1024:
-                    f.seek(st.st_size - 50 * 1024 * 1024)
-                    f.readline()
+                if self._cached_offset == 0 and st.st_size > self._MAX_READ_BYTES:
+                    f.seek(st.st_size - self._MAX_READ_BYTES)
+                    self._discard_partial_line = True
                     self._pruned_count = f.tell() // 500
                     self._count_is_estimate = True
                 else:
                     f.seek(self._cached_offset)
-                chunk = f.read()
+                chunk = f.read(self._MAX_READ_BYTES)
                 self._cached_offset = f.tell()
         except FileNotFoundError:
             if self._cached_inode is not None:
@@ -200,13 +202,23 @@ class _TraceTreeBuilder:
             self._file_size = 0
             self._file_mtime = None
             return []
-        except OSError as exc:
+        except (OSError, InspectionError) as exc:
             self._read_error = str(exc)
             return list(self._cached_entries)
         if not chunk:
             return list(self._cached_entries)
+        if self._discard_partial_line:
+            split_at = chunk.find(b"\n")
+            if split_at == -1:
+                return list(self._cached_entries)
+            chunk = chunk[split_at + 1:]
+            self._discard_partial_line = False
         lines = (self._cached_remainder + chunk).split(b"\n")
         self._cached_remainder = lines.pop()
+        if len(self._cached_remainder) > MAX_RECORD_BYTES:
+            self._cached_remainder = b""
+            self._discard_partial_line = True
+            self._unparsed_lines += 1
         parsed, skipped = self._parse_json_lines(lines)
         self._unparsed_lines += skipped
         for entry in parsed:
@@ -244,6 +256,9 @@ class _TraceTreeBuilder:
         entries = []
         skipped = 0
         for line in lines:
+            if len(line) > MAX_RECORD_BYTES:
+                skipped += 1
+                continue
             s = line.strip()
             if not s:
                 continue
@@ -271,7 +286,11 @@ class _TraceTreeBuilder:
         if not metrics_file.exists():
             return []
         try:
-            lines = metrics_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+            with open_regular_file(metrics_file) as source:
+                raw = source.read(self._MAX_READ_BYTES + 1)
+            if len(raw) > self._MAX_READ_BYTES:
+                return []
+            lines = raw.splitlines()
         except Exception:
             return []
 
@@ -535,13 +554,11 @@ class _TraceTreeBuilder:
                 'project': node.get('project') or e.get('project'),
                 'run_id': e.get('run_id') or node.get('run_id'),
                 'kind': data.get('kind') or node.get('kind') or 'call',
-                'llm': data.get('llm') or node.get('llm'),
             })
-
+            if isinstance(data.get('llm'), dict):
+                node['llm'] = {**node.get('llm', {}), **data['llm']}
             if parent_id:
-                parent = ensure_node(parent_id)
-                if call_id not in parent['children']:
-                    parent['children'].append(call_id)
+                ensure_node(parent_id)
 
             # Timestamps and metrics
             if event == 'start':
@@ -564,13 +581,15 @@ class _TraceTreeBuilder:
                 node['error'] = e.get('message')
                 node['status'] = status or 'error'
                 node['end_time'] = self._event_epoch(e)
+                node['duration'] = _finite_number(e.get('duration'))
 
         # Determine roots
-        seen_as_child = set()
-        for n in nodes.values():
-            for c in n['children']:
-                seen_as_child.add(c)
-        roots = [cid for cid, n in nodes.items() if not n.get('parent_id') or cid not in seen_as_child]
+        for cid, node in nodes.items():
+            parent = node['parent_id']
+            if parent:
+                nodes[parent]['children'].append(cid)
+            else:
+                roots.append(cid)
 
         # Convert to nested structure with cycle detection to prevent RecursionError on corrupted logs
         visited = set()
@@ -901,6 +920,7 @@ class TraceViewerServer:
     .detail-error .detail-error-title { display: flex; align-items: center; gap: 6px; color: #fecaca; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; font-weight: 700; }
     .kv.error-kv { border-color: rgba(239,68,68,0.6); background: rgba(239,68,68,0.14); color: #ffe4e6; white-space: pre-wrap; word-break: break-word; }
     #trace-details { min-height: 0; flex: 1; overflow: auto; padding-right: 4px; }
+    .llm-preview { white-space: pre-wrap; max-height: 11rem; overflow: auto; }
     .logs-wrap { display: grid; grid-template-columns: minmax(380px, 1fr) minmax(380px, 1fr); gap: 12px; }
     .logs-controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
     .logs-list-wrap { height: 70vh; max-height: 70vh; min-height: 320px; border: 1px solid var(--border); border-radius: 8px; background: rgba(17,24,39,0.45); overflow: hidden; }
@@ -2730,7 +2750,7 @@ class TraceViewerServer:
   function getPathSet(parentMap, targetId){
     const s = new Set();
     let cur = targetId;
-    while(cur && parentMap.has(cur)){
+    while(cur && parentMap.has(cur) && !s.has(cur)){
       s.add(cur);
       cur = parentMap.get(cur);
     }
@@ -2746,8 +2766,10 @@ class TraceViewerServer:
       return;
     }
     const path = [];
+    const seen = new Set();
     let cur = node;
-    while(cur){
+    while(cur && !seen.has(cur.call_id)){
+      seen.add(cur.call_id);
       path.push(cleanFnName(cur.function || cur.call_id || '?'));
       cur = traceMap.get(cur.parent_id);
     }
@@ -2788,7 +2810,7 @@ class TraceViewerServer:
       // A running call has no duration yet - show live elapsed time instead of a
       // dash, and never imply the call took 0ms.
       const duration = running ? (elapsedHtml(n) || 'running') : (n.duration != null ? fmtDuration(n.duration) : '-');
-      const shortId = (n.call_id || '-').slice(0, 8);
+      const shortId = escapeHtml((n.call_id || '-').slice(0, 8));
       const start = n.start_time ? new Date(n.start_time*1000).toLocaleTimeString() : '-';
       return `
         <div class="trace-row ${isSelected ? 'selected' : ''} ${hasError ? 'error' : ''}" data-action="select-call" data-call-id="${escapeAttr(n.call_id || '')}" style="padding-left:${depthPad}px;" title="call_id=${escapeAttr(n.call_id || '')} parent_id=${escapeAttr(n.parent_id || '-')}">
@@ -2805,6 +2827,30 @@ class TraceViewerServer:
       `;
     }).join('') || '<div class="muted">No trace nodes found for current filters.</div>';
     renderSelectionStrip();
+  }
+
+  function renderLlmDetails(llm){
+    function preview(title, capture){
+      if(typeof capture?.text !== 'string') return '';
+      let content = capture.text;
+      try { content = JSON.stringify(JSON.parse(content), null, 2); } catch {}
+      return `<div class="detail-title">${title}${capture.truncated ? ' (truncated)' : ''}</div>
+              <div class="kv llm-preview">${escapeHtml(content)}</div>`;
+    }
+    const usage = Object.entries(llm.usage || {}).map(([key, value]) =>
+      `${escapeHtml(key.replace(/_/g, ' '))}: ${escapeHtml(String(value))}`).join(' · ');
+    const tools = Array.isArray(llm.tool_calls) ? llm.tool_calls.map(tool =>
+      `${escapeHtml(tool?.name || 'tool')} (${escapeHtml(tool?.id || '-')})`).join(', ') : '';
+    const output = Array.isArray(llm.output) ? llm.output : [];
+    return `<div class="detail-block">
+      <div class="detail-title">LLM operation</div>
+      <div class="kv"><strong>Provider:</strong> ${escapeHtml(llm.provider || '-')} · <strong>Model:</strong> ${escapeHtml(llm.model || '-')}</div>
+      ${usage ? `<div class="kv"><strong>Usage:</strong> ${usage}</div>` : ''}
+      ${tools ? `<div class="kv"><strong>Requested tools:</strong> ${tools}</div>` : ''}
+      ${llm.error_type ? `<div class="kv"><strong>Error type:</strong> ${escapeHtml(llm.error_type)}</div>` : ''}
+      ${preview('Input', llm.input)}
+      ${output.map(capture => preview('Output', capture)).join('')}
+    </div>`;
   }
 
   function renderTraceDetails(activeTree){
@@ -2827,6 +2873,7 @@ class TraceViewerServer:
       </div>
     ` : '';
     traceDetailsEl.innerHTML = `
+      ${node.llm ? renderLlmDetails(node.llm) : ''}
       <div class="detail-block">
         <div class="detail-title ${hasError ? 'error' : ''}">Overview</div>
         <div class="kv"><strong>Function:</strong> ${escapeHtml(cleanFnName(node.function || '-'))}</div>
@@ -2842,10 +2889,10 @@ class TraceViewerServer:
           : `<div class="kv"><strong>Duration:</strong> ${fmtDuration(node.duration)} • <strong>CPU:</strong> ${node.cpu_time == null ? '-' : fmt(node.cpu_time) + 's'} • <strong>Mem&#916;:</strong> ${node.mem_delta_kb ?? '-'} • <strong>Mem mode:</strong> ${escapeHtml(node.mem_mode || '-')}</div>`}
         ${error}
       </div>
-      ${node.llm ? `<div class="detail-block"><div class="detail-title">LLM operation</div><div class="kv">${escapeHtml(JSON.stringify(node.llm, null, 2))}</div></div>` : ''}
-      <div class="detail-block"><div class="detail-title">Args</div><div class="kv">${escapeHtml(args)}</div></div>
-      <div class="detail-block"><div class="detail-title">Kwargs</div><div class="kv">${escapeHtml(kwargs)}</div></div>
-      <div class="detail-block"><div class="detail-title">Result</div><div class="kv">${escapeHtml(result)}</div></div>
+      ${node.llm ? '' : `
+        <div class="detail-block"><div class="detail-title">Args</div><div class="kv">${escapeHtml(args)}</div></div>
+        <div class="detail-block"><div class="detail-title">Kwargs</div><div class="kv">${escapeHtml(kwargs)}</div></div>
+        <div class="detail-block"><div class="detail-title">Result</div><div class="kv">${escapeHtml(result)}</div></div>`}
       <div class="detail-block">
         <div class="detail-title">Linked logs (${relatedLogs.length})</div>
         ${relatedLogs.length ? relatedLogs.map(l=>`

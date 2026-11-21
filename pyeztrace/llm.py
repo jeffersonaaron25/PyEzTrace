@@ -7,6 +7,8 @@ import time
 import uuid
 from contextlib import contextmanager
 
+from pyeztrace.exceptions import protect_exception_details
+
 _SECRET_KEY = re.compile(r'api.?key|authorization|password|secret|cookie|access.?token|refresh.?token', re.I)
 _SECRET_VALUE = re.compile(r'\b(?:sk-[\w-]+|Bearer\s+[\w.\-/+=]+)', re.I)
 _FIELDS = ('id', 'type', 'role', 'text', 'content', 'choices', 'message', 'delta',
@@ -208,6 +210,7 @@ class Operation:
             self.remaining -= len(part.encode('utf-8'))
 
     def finish(self, status='success', error=None):
+        protect_exception_details(error)
         if self.done:
             return
         self.done = True
@@ -272,6 +275,9 @@ class Stream:
         try:
             close = getattr(self._stream, 'close', None)
             return close() if close else None
+        except Exception as exc:
+            self._operation.finish('error', exc)
+            raise
         finally:
             self._operation.finish('cancelled')
 
@@ -282,20 +288,31 @@ class Stream:
                 result = close()
                 if inspect.isawaitable(result):
                     await result
+        except Exception as exc:
+            self._operation.finish('error', exc)
+            raise
         finally:
             self._operation.finish('cancelled')
 
     def __enter__(self):
-        if hasattr(self._stream, '__enter__'):
-            self._stream.__enter__()
+        try:
+            if hasattr(self._stream, '__enter__'):
+                self._stream.__enter__()
+        except Exception as exc:
+            self._operation.finish('error', exc)
+            raise
         return self
 
     def __exit__(self, *args):
         self.close()
 
     async def __aenter__(self):
-        if hasattr(self._stream, '__aenter__'):
-            await self._stream.__aenter__()
+        try:
+            if hasattr(self._stream, '__aenter__'):
+                await self._stream.__aenter__()
+        except Exception as exc:
+            self._operation.finish('error', exc)
+            raise
         return self
 
     async def __aexit__(self, *args):

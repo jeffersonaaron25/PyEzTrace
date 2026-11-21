@@ -4,6 +4,7 @@ import random
 import time
 import io
 import math
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -155,6 +156,8 @@ def test_file_logging_enabled_by_default(tmp_path, reset_logging_state, restore_
     log_path = config.get_log_path()
     assert log_path.exists()
     assert log_path.read_text().strip()
+    if os.name == "posix":
+        assert log_path.stat().st_mode & 0o077 == 0
 
 def test_default_console_color_file_json(tmp_path, reset_logging_state, restore_config, monkeypatch):
     config.log_dir = str(tmp_path / "logs")

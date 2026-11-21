@@ -1,12 +1,15 @@
 """Bounded, snapshot-based inspection shared by machine-facing consumers."""
 import base64
 import hashlib
+import io
 import json
+import math
 import os
 import stat
 from pathlib import Path
 
 MAX_FILE_BYTES = 64 * 1024 * 1024
+MAX_RECORD_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 256 * 1024
 
 
@@ -20,12 +23,27 @@ def encoded(value):
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf-8')
 
 
+def open_regular_file(path):
+    # Opening a FIFO in blocking mode would hang before we can check its type.
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))
+    source = os.fdopen(fd, 'rb')
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise InspectionError('invalid_source', 'Source must be a regular file')
+    except BaseException:
+        source.close()
+        raise
+    return source
+
+
+def finite_float(value):
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
 class Snapshot:
     def __init__(self, path):
-        fd = os.open(Path(path), os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))
-        with os.fdopen(fd, 'rb') as source:
-            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                raise InspectionError('invalid_source', 'Source must be a regular file')
+        with open_regular_file(Path(path)) as source:
             raw = source.read(MAX_FILE_BYTES + 1)
         if len(raw) > MAX_FILE_BYTES:
             raise InspectionError('source_too_large', 'Source exceeds 64 MiB; select a smaller log segment')
@@ -37,13 +55,13 @@ class Snapshot:
         self.runs = {}
         malformed = 0
         legacy_run = 'legacy'
-        for number, line in enumerate(raw.splitlines(), 1):
+        for number, line in enumerate(io.BytesIO(raw), 1):
             if number > 100000:
                 raise InspectionError("too_many_records", "Source exceeds 100,000 records")
-            if len(line) > 1024 * 1024:
+            if len(line.rstrip(b'\r\n')) > MAX_RECORD_BYTES:
                 raise InspectionError("record_too_large", "A record exceeds 1 MiB")
             try:
-                row = json.loads(line, parse_constant=lambda v: None)
+                row = json.loads(line, parse_constant=lambda v: None, parse_float=finite_float)
                 if not isinstance(row, dict) or not isinstance(row.get('data', {}), dict):
                     raise ValueError()
             except (ValueError, UnicodeError, RecursionError):
